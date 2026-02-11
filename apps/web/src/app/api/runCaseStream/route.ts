@@ -4,6 +4,10 @@ import { buildEvidenceTable } from "@/components/targetgraph/evidence";
 import { rankTargetsFallback } from "@/server/openai/ranking";
 import { searchDiseases } from "@/server/mcp/opentargets";
 import {
+  inferDiseaseFromQuery,
+  resolveSemanticConcepts,
+} from "@/server/entity/semantic-entity-mapper";
+import {
   chooseBestDiseaseCandidate,
   type DiseaseCandidate,
 } from "@/server/openai/disease-resolver";
@@ -115,6 +119,12 @@ function extractDiseasePhrase(query: string): string {
     " showing ",
     " after ",
     " given ",
+    " refractory to ",
+    " resistant to ",
+    " treated with ",
+    " failed ",
+    " relapse ",
+    " progressing on ",
   ];
 
   for (const splitter of splitters) {
@@ -188,8 +198,19 @@ function generateBriefSections(options: {
   nodeMap: Map<string, GraphNode>;
   edgeMap: Map<string, GraphEdge>;
   sourceHealth: SourceHealth;
+  semanticConceptMentions: string[];
+  semanticTargetSymbols: string[];
+  hasInterventionConcept: boolean;
 }) {
-  const { ranking, nodeMap, edgeMap, sourceHealth } = options;
+  const {
+    ranking,
+    nodeMap,
+    edgeMap,
+    sourceHealth,
+    semanticConceptMentions,
+    semanticTargetSymbols,
+    hasInterventionConcept,
+  } = options;
   const nodes = [...nodeMap.values()];
   const edges = [...edgeMap.values()];
 
@@ -223,18 +244,47 @@ function generateBriefSections(options: {
     };
   }
 
-  const top = resolvedRanking.rankedTargets[0];
-  const pathways = top?.pathwayHooks ?? [];
+  const semanticTargetSet = new Set(
+    semanticTargetSymbols.map((value) => value.toUpperCase()),
+  );
+  const boostedRanking = [...resolvedRanking.rankedTargets]
+    .map((item) => ({
+      item,
+      boost: semanticTargetSet.has(item.symbol.toUpperCase()) ? 0.06 : 0,
+    }))
+    .sort((a, b) => b.item.score + b.boost - (a.item.score + a.boost))
+    .map((row, index) => ({
+      ...row.item,
+      rank: index + 1,
+    }));
+
+  const baselineTop = boostedRanking[0];
+  const matchedQueryTarget = boostedRanking.find((item) =>
+    semanticTargetSet.has(item.symbol.toUpperCase()),
+  );
+
+  const shouldAnchorToQuery =
+    hasInterventionConcept &&
+    !!matchedQueryTarget &&
+    (matchedQueryTarget.score >= 0.32 || matchedQueryTarget.rank <= 12) &&
+    (baselineTop?.score ?? 0) - matchedQueryTarget.score <= 0.26;
+
+  const selectedTop = shouldAnchorToQuery ? matchedQueryTarget : baselineTop;
+
+  const pathways = selectedTop?.pathwayHooks ?? [];
   const dataGaps = resolvedRanking.systemSummary.dataGaps;
 
-  const alternatives = resolvedRanking.rankedTargets.slice(1, 6).map((item) => ({
-    symbol: item.symbol,
-    score: item.score,
-    reason: item.reasons[0] ?? "not provided",
-    caveat: item.caveats[0] ?? "not provided",
-  }));
+  const alternatives = boostedRanking
+    .filter((item) => item.symbol !== selectedTop?.symbol)
+    .slice(0, 5)
+    .map((item) => ({
+      symbol: item.symbol,
+      score: item.score,
+      reason: item.reasons[0] ?? "not provided",
+      caveat: item.caveats[0] ?? "not provided",
+    }));
 
-  const evidenceTrace = resolvedRanking.rankedTargets.slice(0, 8).map((item) => ({
+  const evidenceTrace = boostedRanking.slice(0, 8).map((item) => ({
     symbol: item.symbol,
     score: item.score,
     refs: item.evidenceRefs,
@@ -245,7 +295,24 @@ function generateBriefSections(options: {
     .map(([source]) => source);
 
   const caveats = [
-    ...(top?.caveats?.slice(0, 2) ?? []),
+    ...(selectedTop?.caveats?.slice(0, 2) ?? []),
+    ...(shouldAnchorToQuery &&
+    matchedQueryTarget &&
+    baselineTop &&
+    matchedQueryTarget.symbol !== baselineTop.symbol
+      ? [
+          `Query-anchored recommendation selected (${matchedQueryTarget.symbol}) while baseline top was ${baselineTop.symbol}; compare both before nomination.`,
+        ]
+      : []),
+    ...(semanticTargetSet.size > 0 &&
+    selectedTop &&
+    !semanticTargetSet.has(selectedTop.symbol.toUpperCase())
+      ? [
+          `Query concept mismatch: requested target/intervention mentions (${semanticConceptMentions.join(
+            ", ",
+          )}) were not top-ranked in this disease graph.`,
+        ]
+      : []),
     ...dataGaps.slice(0, 2),
     ...(degradedSources.length > 0
       ? [`Degraded inputs during this run: ${degradedSources.join(", ")}.`] 
@@ -253,24 +320,77 @@ function generateBriefSections(options: {
   ];
 
   const nextActions = [
-    `Validate perturbation of ${top?.symbol ?? "top target"} in pathway-relevant assay.`,
+    `Validate perturbation of ${selectedTop?.symbol ?? "top target"} in pathway-relevant assay.`,
     "Compare top 3 alternatives for tractability and mechanistic orthogonality.",
     "Run Deep mode for richer interaction and literature context before program decision.",
   ];
 
+  const queryAlignment: {
+    status: "matched" | "anchored" | "mismatch" | "none";
+    requestedMentions: string[];
+    requestedTargetSymbols: string[];
+    matchedTarget?: string;
+    baselineTop?: string;
+    note: string;
+  } = semanticConceptMentions.length
+    ? semanticTargetSet.size > 0
+      ? matchedQueryTarget
+        ? shouldAnchorToQuery
+          ? {
+              status: matchedQueryTarget.symbol === baselineTop?.symbol ? "matched" : "anchored",
+              requestedMentions: semanticConceptMentions,
+              requestedTargetSymbols: [...semanticTargetSet],
+              matchedTarget: matchedQueryTarget.symbol,
+              baselineTop: baselineTop?.symbol,
+              note:
+                matchedQueryTarget.symbol === baselineTop?.symbol
+                  ? `Query concept aligns with the strongest ranked target (${matchedQueryTarget.symbol}).`
+                  : `Recommendation anchored to query concept target (${matchedQueryTarget.symbol}) with explicit caveats.`,
+            }
+          : {
+              status: "mismatch",
+              requestedMentions: semanticConceptMentions,
+              requestedTargetSymbols: [...semanticTargetSet],
+              matchedTarget: matchedQueryTarget.symbol,
+              baselineTop: baselineTop?.symbol,
+              note: `Requested concept target (${matchedQueryTarget.symbol}) was found but not selected as top recommendation.`,
+            }
+        : {
+            status: "mismatch",
+            requestedMentions: semanticConceptMentions,
+            requestedTargetSymbols: [...semanticTargetSet],
+            baselineTop: baselineTop?.symbol,
+            note: "Requested concept target was not present in ranked disease evidence.",
+          }
+      : {
+          status: "none",
+          requestedMentions: semanticConceptMentions,
+          requestedTargetSymbols: [],
+          baselineTop: baselineTop?.symbol,
+          note: "No explicit target-level concept extracted from query.",
+        }
+    : {
+        status: "none",
+        requestedMentions: [],
+        requestedTargetSymbols: [],
+        baselineTop: baselineTop?.symbol,
+        note: "No semantic query concepts extracted.",
+      };
+
   return {
     recommendation: {
-      target: top?.symbol ?? "not provided",
-      score: top?.score ?? 0,
-      why: top?.reasons?.[0] ?? "not provided",
+      target: selectedTop?.symbol ?? "not provided",
+      score: selectedTop?.score ?? 0,
+      why: selectedTop?.reasons?.[0] ?? "not provided",
       pathway: pathways[0] ?? "not provided",
-      drugHook: top?.drugHooks?.[0] ?? "not provided",
-      interactionHook: top?.interactionHooks?.[0] ?? "not provided",
+      drugHook: selectedTop?.drugHooks?.[0] ?? "not provided",
+      interactionHook: selectedTop?.interactionHooks?.[0] ?? "not provided",
     },
     alternatives,
     evidenceTrace,
     caveats,
     nextActions,
+    queryAlignment,
   };
 }
 
@@ -322,10 +442,14 @@ export async function GET(request: NextRequest) {
         }
       };
 
-      try {
-        emit("status", {
-          phase: "P0",
-          message: "Resolving disease entity",
+        try {
+          const semanticConceptPromise = resolveSemanticConcepts(query).catch(
+            () => [],
+          );
+
+          emit("status", {
+            phase: "P0",
+            message: "Resolving disease entity",
           pct: 2,
         });
 
@@ -347,6 +471,18 @@ export async function GET(request: NextRequest) {
                 name: item.name,
                 description: item.description,
               }));
+          }
+        }
+
+        if (candidates.length === 0) {
+          const inferred = await inferDiseaseFromQuery(query);
+          if (inferred) {
+            candidates = [
+              {
+                id: inferred.id,
+                name: inferred.name,
+              },
+            ];
           }
         }
 
@@ -499,11 +635,34 @@ export async function GET(request: NextRequest) {
               } else if (parsed.event === "error") {
                 emit("error", payload);
               } else if (parsed.event === "done") {
+                const semanticConcepts = await semanticConceptPromise;
+                const semanticTargetSymbols = semanticConcepts
+                  .filter(
+                    (concept) =>
+                      concept.selected?.entityType === "target" &&
+                      concept.selected?.name,
+                  )
+                  .map((concept) => concept.selected!.name);
+                const semanticConceptMentions = semanticConcepts
+                  .filter(
+                    (concept) =>
+                      concept.type === "target" ||
+                      concept.type === "drug" ||
+                      concept.type === "intervention",
+                  )
+                  .map((concept) => concept.mention);
+                const hasInterventionConcept = semanticConcepts.some(
+                  (concept) => concept.type === "intervention",
+                );
+
                 const brief = generateBriefSections({
                   ranking,
                   nodeMap,
                   edgeMap,
                   sourceHealth,
+                  semanticConceptMentions,
+                  semanticTargetSymbols,
+                  hasInterventionConcept,
                 });
 
                 emit("brief_section", {

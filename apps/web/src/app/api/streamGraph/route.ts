@@ -35,9 +35,28 @@ type SourceHealthState = Record<SourceName, "green" | "yellow" | "red">;
 const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
 
 function cleanText(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length > 0 ? normalized : undefined;
+  if (typeof value === "string") {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const cleaned = cleanText(item);
+      if (cleaned) return cleaned;
+    }
+    return undefined;
+  }
+
+  if (value && typeof value === "object") {
+    const maybeNamed = value as { name?: unknown; displayName?: unknown };
+    const cleanedName = cleanText(maybeNamed.name);
+    if (cleanedName) return cleanedName;
+    const cleanedDisplay = cleanText(maybeNamed.displayName);
+    if (cleanedDisplay) return cleanedDisplay;
+  }
+
+  return undefined;
 }
 
 function compactLabel(value: string, max = 32): string {
@@ -422,7 +441,7 @@ export async function GET(request: NextRequest) {
                     score: 0.6,
                     size: 22,
                     meta: {
-                      displayName: pathway.name,
+                      displayName: cleanText(pathway.name) ?? pathway.id,
                       species: pathway.species,
                       stage: "P2",
                     },

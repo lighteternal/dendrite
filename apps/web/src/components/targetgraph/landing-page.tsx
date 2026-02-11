@@ -2,53 +2,61 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Search, Sparkles } from "lucide-react";
-import { APP_QUESTION, PRESET_DISEASES } from "@/components/targetgraph/constants";
+import { ArrowRight, Search } from "lucide-react";
+import { APP_QUESTION } from "@/components/targetgraph/constants";
 import { LandingMoleculeBackground } from "@/components/targetgraph/landing-molecule-background";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
 type RunMode = "fast" | "balanced" | "deep";
+type ConceptType = "disease" | "target" | "drug" | "intervention" | "pathway";
 
-type DiseaseSuggestion = {
+type CanonicalEntity = {
+  entityType: "disease" | "target" | "drug";
   id: string;
   name: string;
   description?: string;
+  score: number;
 };
 
-type SuggestResponse = {
-  results: DiseaseSuggestion[];
+type ResolvedConcept = {
+  mention: string;
+  type: ConceptType;
+  selected: CanonicalEntity | null;
+  alternatives: CanonicalEntity[];
+};
+
+type SuggestEntitiesResponse = {
+  concepts: ResolvedConcept[];
 };
 
 const modeDescription: Record<RunMode, string> = {
   fast: "Fast first-pass mechanism brief.",
-  balanced: "Default depth with interaction context.",
-  deep: "Full-depth run including literature/trials.",
+  balanced: "Balanced depth for translational review.",
+  deep: "Maximum depth with broader evidence context.",
 };
+
+function conceptTone(type: ConceptType) {
+  if (type === "disease") return "border-[#b7dcff] bg-[#eaf5ff] text-[#155a97]";
+  if (type === "target") return "border-[#c9bbff] bg-[#f1ecff] text-[#4a3da1]";
+  if (type === "drug") return "border-[#ffd7b0] bg-[#fff4e8] text-[#9a5a12]";
+  if (type === "intervention") return "border-[#cfd9ff] bg-[#eef2ff] text-[#304f9a]";
+  return "border-[#d7d2ff] bg-[#f7f5ff] text-[#5b56a1]";
+}
 
 export function LandingPage() {
   const router = useRouter();
 
-  const [query, setQuery] = useState(
-    "For Alzheimer's disease, what target-pathway-drug mechanism appears most actionable with strong evidence?",
-  );
+  const [query, setQuery] = useState("");
   const [mode, setMode] = useState<RunMode>("balanced");
-
-  const [diseaseInput, setDiseaseInput] = useState("");
-  const [diseaseSuggestions, setDiseaseSuggestions] = useState<DiseaseSuggestion[]>([]);
-  const [selectedDisease, setSelectedDisease] = useState<DiseaseSuggestion | null>(null);
+  const [concepts, setConcepts] = useState<ResolvedConcept[]>([]);
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [isSuggesting, setIsSuggesting] = useState(false);
 
   useEffect(() => {
-    if (selectedDisease && diseaseInput.trim() !== selectedDisease.name) {
-      setSelectedDisease(null);
-    }
-  }, [diseaseInput, selectedDisease]);
-
-  useEffect(() => {
-    const trimmed = diseaseInput.trim();
+    const trimmed = query.trim();
     if (trimmed.length < 2) {
-      setDiseaseSuggestions([]);
+      setConcepts([]);
       return;
     }
 
@@ -57,25 +65,43 @@ export function LandingPage() {
       setIsSuggesting(true);
       try {
         const response = await fetch(
-          `/api/suggestDisease?query=${encodeURIComponent(trimmed)}`,
+          `/api/suggestEntities?query=${encodeURIComponent(trimmed)}`,
           { signal: controller.signal },
         );
-        const payload = (await response.json()) as SuggestResponse;
-        setDiseaseSuggestions(payload.results ?? []);
+        const payload = (await response.json()) as SuggestEntitiesResponse;
+        setConcepts(payload.concepts ?? []);
       } catch {
-        setDiseaseSuggestions([]);
+        setConcepts([]);
       } finally {
         setIsSuggesting(false);
       }
-    }, 140);
+    }, 120);
 
     return () => {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [diseaseInput]);
+  }, [query]);
 
-  const runDisabled = useMemo(() => query.trim().length < 8, [query]);
+  const selectedDisease = useMemo(
+    () =>
+      concepts.find(
+        (concept) => concept.selected?.entityType === "disease" && concept.selected?.id,
+      )?.selected ?? null,
+    [concepts],
+  );
+
+  const hoverEntity = useMemo(() => {
+    if (hoveredIndex === null) return null;
+    const concept = concepts[hoveredIndex];
+    if (!concept?.selected) return null;
+    return {
+      concept,
+      entity: concept.selected,
+    };
+  }, [concepts, hoveredIndex]);
+
+  const canRun = query.trim().length >= 8;
 
   const run = () => {
     const trimmedQuery = query.trim();
@@ -103,101 +129,91 @@ export function LandingPage() {
           <div className="flex flex-wrap items-center gap-2">
             <Badge className="rounded-full bg-[#5b57e6] px-3 py-1 text-white">TargetGraph</Badge>
             <Badge className="rounded-full border border-[#c6c3ff] bg-white/88 text-[#332c89]">
-              Translational mechanism brief
+              Target nomination brief
             </Badge>
           </div>
 
-          <h1 className="max-w-4xl text-4xl font-semibold leading-tight tracking-tight text-[#2a2574] md:text-6xl">
-            Ask one disease question. Get one evidence-anchored mechanism brief.
+          <h1 className="max-w-4xl text-4xl font-semibold leading-tight tracking-tight text-[#24206d] md:text-6xl">
+            Ask one disease question. Receive one ranked mechanism brief.
           </h1>
 
-          <p className="max-w-4xl text-sm leading-7 text-[#3d3a7e] md:text-base">
-            {APP_QUESTION}
-          </p>
+          <p className="max-w-4xl text-sm leading-7 text-[#2f2b74] md:text-base">{APP_QUESTION}</p>
 
           <div className="inline-flex rounded-full border border-[#f2c38b] bg-[#fff6e8] px-4 py-2 text-xs font-medium text-[#9a5510]">
-            Research evidence summary — not clinical guidance.
+            Preclinical evidence synthesis only; not for clinical decision-making.
           </div>
         </header>
 
-        <section className="grid gap-4 xl:grid-cols-[1.3fr_0.9fr]">
-          <article className="tg-panel-rise space-y-4 rounded-2xl border border-[#cecfff] bg-white/92 p-5 shadow-[0_20px_80px_rgba(75,56,158,0.14)] backdrop-blur">
+        <section className="grid gap-4 xl:grid-cols-[1.34fr_0.86fr]">
+          <article className="tg-panel-rise space-y-4 rounded-2xl border border-[#cecfff] bg-white/94 p-5 shadow-[0_20px_80px_rgba(75,56,158,0.14)] backdrop-blur">
             <div className="text-xs font-semibold uppercase tracking-[0.22em] text-[#5550a5]">
-              Question
+              Ask question
             </div>
 
-            <textarea
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Example: For rheumatoid arthritis refractory to TNF inhibitors, what pathway-target-drug thread looks most tractable?"
-              className="min-h-[136px] w-full resize-y rounded-xl border border-[#c5c7fc] bg-[#f7f7ff] px-3 py-2.5 text-sm text-[#221f62] outline-none ring-[#5b57e6] placeholder:text-[#6e6aa9] focus:ring-2"
-            />
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-3.5 h-4 w-4 text-[#6a66b4]" />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") run();
+                }}
+                placeholder="Type a free-text biomedical question"
+                className="h-12 w-full rounded-xl border border-[#c5c7fc] bg-[#f7f7ff] pl-9 pr-3 text-sm text-[#221f62] outline-none ring-[#5b57e6] placeholder:text-[#6e6aa9] focus:ring-2"
+              />
+            </div>
 
-            <div className="space-y-2">
-              <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6f69af]">
-                Optional disease pin (fast autocomplete)
+            <div className="space-y-2 rounded-xl border border-[#ddd9ff] bg-[#f8f8ff] p-3">
+              <div className="flex items-center justify-between">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#5f59a1]">
+                  Semantic entity mapping
+                </div>
+                <div className="text-[11px] text-[#6d68ac]">
+                  {isSuggesting ? "Updating..." : `${concepts.length} concept(s)`}
+                </div>
               </div>
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-3 top-3.5 h-4 w-4 text-[#6a66b4]" />
-                <input
-                  value={diseaseInput}
-                  onChange={(event) => setDiseaseInput(event.target.value)}
-                  placeholder="Type disease name to lock entity (optional)"
-                  className="h-11 w-full rounded-xl border border-[#c5c7fc] bg-[#f7f7ff] pl-9 pr-3 text-sm text-[#221f62] outline-none ring-[#5b57e6] placeholder:text-[#6e6aa9] focus:ring-2"
-                />
-              </div>
 
-              {isSuggesting ? (
-                <div className="text-xs text-[#6e69ac]">Searching disease entities...</div>
-              ) : null}
-
-              {diseaseSuggestions.length > 0 && diseaseInput.trim().length >= 2 ? (
-                <div className="max-h-[180px] overflow-auto rounded-xl border border-[#d9dbff] bg-[#f8f8ff] p-1.5">
-                  {diseaseSuggestions.slice(0, 8).map((item) => (
+              {concepts.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {concepts.map((concept, index) => (
                     <button
-                      key={item.id}
+                      key={`${concept.mention}-${index}`}
                       type="button"
-                      onClick={() => {
-                        setSelectedDisease(item);
-                        setDiseaseInput(item.name);
-                        setDiseaseSuggestions([]);
-                      }}
-                      className={`mb-1 block w-full rounded-lg border px-2.5 py-2 text-left text-xs ${
-                        selectedDisease?.id === item.id
-                          ? "border-[#5b57e6] bg-[#ebe8ff] text-[#3a347f]"
-                          : "border-[#e0dcff] bg-white text-[#4f4a91] hover:bg-[#f2f0ff]"
-                      }`}
+                      onMouseEnter={() => setHoveredIndex(index)}
+                      onMouseLeave={() => setHoveredIndex(null)}
+                      className={`rounded-full border px-2.5 py-1 text-[11px] ${conceptTone(concept.type)}`}
                     >
-                      <div className="font-semibold">{item.name}</div>
-                      <div className="mt-0.5 text-[11px] text-[#736eaf]">{item.id}</div>
+                      {concept.mention}
                     </button>
                   ))}
                 </div>
-              ) : null}
+              ) : (
+                <div className="text-xs text-[#726eaf]">
+                  Write a disease question. Concepts are mapped live (disease/target/drug/intervention).
+                </div>
+              )}
 
-              <div className="text-xs text-[#6d68ac]">
-                Submit anytime. Disease entity resolution happens during the streamed run.
-              </div>
+              {hoverEntity ? (
+                <div className="rounded-lg border border-[#d9dbff] bg-white px-2.5 py-2 text-xs text-[#4f4a91]">
+                  <div className="font-semibold text-[#362f7c]">
+                    {hoverEntity.entity.name}
+                  </div>
+                  <div className="text-[#6e69ac]">
+                    {hoverEntity.entity.entityType.toUpperCase()} • {hoverEntity.entity.id}
+                  </div>
+                  <div className="mt-1 text-[#6e69ac]">
+                    {hoverEntity.entity.description ?? "Canonical entity metadata not provided."}
+                  </div>
+                </div>
+              ) : null}
             </div>
 
-            <div className="flex flex-wrap gap-2">
-              {PRESET_DISEASES.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  className="rounded-full border border-[#cfccff] bg-[#f1efff] px-3 py-1 text-xs font-medium text-[#3a347f] transition hover:-translate-y-0.5 hover:bg-[#e7e2ff]"
-                  onClick={() => {
-                    setQuery(`For ${item}, what mechanism thread is strongest from disease to target to drug?`);
-                    setDiseaseInput(item);
-                  }}
-                >
-                  {item}
-                </button>
-              ))}
+            <div className="text-xs text-[#6d68ac]">
+              Matching uses semantic extraction + ontology search. It avoids alpha/beta family swaps.
             </div>
           </article>
 
-          <aside className="tg-panel-rise space-y-4 rounded-2xl border border-[#cecfff] bg-white/92 p-5 shadow-[0_20px_80px_rgba(75,56,158,0.14)] backdrop-blur">
+          <aside className="tg-panel-rise space-y-4 rounded-2xl border border-[#cecfff] bg-white/94 p-5 shadow-[0_20px_80px_rgba(75,56,158,0.14)] backdrop-blur">
             <div className="text-xs font-semibold uppercase tracking-[0.22em] text-[#5550a5]">
               Run profile
             </div>
@@ -214,7 +230,13 @@ export function LandingPage() {
                   }`}
                   onClick={() => setMode(item)}
                 >
-                  <div className="font-semibold capitalize">{item}</div>
+                  <div className="font-semibold capitalize">
+                    {item === "fast"
+                      ? "Triage"
+                      : item === "balanced"
+                        ? "Program review"
+                        : "Due diligence"}
+                  </div>
                   <div className="mt-0.5 text-xs text-[#6863aa]">{modeDescription[item]}</div>
                 </button>
               ))}
@@ -223,31 +245,28 @@ export function LandingPage() {
             <Button
               className="h-11 w-full bg-[#5b57e6] text-white hover:bg-[#4941ce]"
               onClick={run}
-              disabled={runDisabled}
+              disabled={!canRun}
             >
-              Run decision brief <ArrowRight className="ml-1 h-4 w-4" />
+              Generate evidence brief <ArrowRight className="ml-1 h-4 w-4" />
             </Button>
 
             <div className="rounded-xl border border-[#f3d1ab] bg-[#fff7ec] p-3 text-xs text-[#8a4e16]">
-              You get one ranked recommendation thread with explicit caveats, alternatives, and evidence references.
+              Expected runtime: ~20–30s in Program Review mode.
             </div>
           </aside>
         </section>
 
         <section className="grid gap-3 md:grid-cols-2">
           <div className="tg-panel-rise rounded-2xl border border-[#d3d5ff] bg-white/88 p-4 shadow-sm">
-            <div className="mb-2 flex items-center gap-2 text-[#5049ad]">
-              <Sparkles className="h-4 w-4" />
-              <div className="text-sm font-semibold">While it runs</div>
-            </div>
+            <div className="mb-2 text-sm font-semibold text-[#5049ad]">What happens next</div>
             <p className="text-xs leading-6 text-[#464187]">
-              The app streams each phase in plain language: entity resolution, target enrichment, pathway/drug traversal, interaction context, and ranking.
+              The run streams entity resolution, then target/pathway/drug/interaction retrieval, and returns a ranked mechanism with explicit caveats.
             </p>
           </div>
           <div className="tg-panel-rise rounded-2xl border border-[#f3d1ab] bg-white/88 p-4 shadow-sm">
-            <div className="mb-2 text-sm font-semibold text-[#b36218]">What you can export</div>
+            <div className="mb-2 text-sm font-semibold text-[#b36218]">Deliverable</div>
             <p className="text-xs leading-6 text-[#5c4a3a]">
-              A decision brief JSON with recommendation, evidence trace, caveats, and next experiments for team review.
+              Exportable brief JSON for program review with recommendation rationale, alternatives, and evidence references.
             </p>
           </div>
         </section>

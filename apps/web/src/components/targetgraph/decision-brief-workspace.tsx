@@ -21,7 +21,11 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { useCaseRunStream, type RunMode } from "@/hooks/useCaseRunStream";
+import {
+  useCaseRunStream,
+  type RunMode,
+  type StatusUpdate,
+} from "@/hooks/useCaseRunStream";
 
 type Props = {
   initialQuery: string;
@@ -33,15 +37,15 @@ type Props = {
 type SourceHealth = Record<string, "green" | "yellow" | "red">;
 
 const modeLabel: Record<RunMode, string> = {
-  fast: "Fast",
-  balanced: "Balanced",
-  deep: "Deep",
+  fast: "Triage",
+  balanced: "Program Review",
+  deep: "Due Diligence",
 };
 
 const modeDescription: Record<RunMode, string> = {
-  fast: "Core mechanism brief quickly (targets + pathways + drugs).",
-  balanced: "Adds interactions for better mechanistic context.",
-  deep: "Full-depth context including literature/trials enrichment.",
+  fast: "Fast first-pass mechanism brief.",
+  balanced: "Balanced translational depth with interaction context.",
+  deep: "Maximum depth with broader evidence context.",
 };
 
 const phaseOrder = ["P0", "P1", "P2", "P3", "P4", "P5", "P6"];
@@ -115,6 +119,14 @@ export function DecisionBriefWorkspace({
     return reached;
   }, [stream.statuses]);
 
+  const phaseStatusMap = useMemo(() => {
+    const map = new Map<string, StatusUpdate>();
+    for (const update of stream.statuses) {
+      map.set(update.phase, update);
+    }
+    return map;
+  }, [stream.statuses]);
+
   const recommendation = stream.finalBrief?.recommendation ?? stream.recommendation;
   const naturalLanguageBrief = useMemo(() => {
     if (!recommendation) {
@@ -137,6 +149,74 @@ export function DecisionBriefWorkspace({
     stream.finalBrief?.recommendation?.drugHook,
     stream.finalBrief?.recommendation?.pathway,
   ]);
+
+  const decisionCard = useMemo(() => {
+    const score = recommendation?.score ?? 0;
+    const caveats = stream.finalBrief?.caveats ?? [];
+    const penalty = caveats.reduce((acc, item) => {
+      const lowered = item.toLowerCase();
+      if (lowered.includes("degraded")) return acc + 2;
+      if (lowered.includes("query concept mismatch")) return acc + 2;
+      if (lowered.includes("no literature")) return acc + 1;
+      if (lowered.includes("no trial")) return acc + 1;
+      return acc;
+    }, 0);
+
+    if (!recommendation) {
+      return {
+        action: "Pending decision",
+        confidence: "Calibrating",
+        rationale: "Waiting for ranking to complete.",
+      };
+    }
+
+    if (score >= 0.78 && penalty <= 1) {
+      return {
+        action: "Advance to validation",
+        confidence: "High confidence",
+        rationale: "Strong evidence score with limited data penalties.",
+      };
+    }
+
+    if (score >= 0.65) {
+      return {
+        action: "Hold + validate",
+        confidence: penalty >= 3 ? "Moderate confidence" : "Medium confidence",
+        rationale: "Signal is usable but requires focused de-risking experiments.",
+      };
+    }
+
+    return {
+      action: "Exploratory only",
+      confidence: "Low confidence",
+      rationale: "Weak or incomplete signal for decision-grade nomination.",
+    };
+  }, [recommendation, stream.finalBrief?.caveats]);
+
+  const scoreBreakdown = useMemo(() => {
+    const target = recommendation?.target;
+    if (!target) return [];
+    const trace = stream.finalBrief?.evidenceTrace?.find((item) => item.symbol === target);
+    if (!trace) return [];
+
+    const preferredFields = [
+      "openTargetsEvidence",
+      "drugActionability",
+      "networkCentrality",
+      "literatureSupport",
+      "drugCount",
+      "interactionCount",
+    ];
+
+    const entries = trace.refs
+      .filter((ref) => preferredFields.includes(ref.field))
+      .slice(0, 6)
+      .map((ref) => ({
+        label: ref.field,
+        value: String(ref.value),
+      }));
+    return entries;
+  }, [recommendation?.target, stream.finalBrief?.evidenceTrace]);
 
   const runBrief = () => {
     const trimmed = query.trim();
@@ -202,20 +282,20 @@ export function DecisionBriefWorkspace({
               onChange={(event) => setMode(event.target.value as RunMode)}
               className="h-10 rounded-lg border border-[#d6d1ff] bg-[#faf9ff] px-3 text-sm text-[#352f79]"
             >
-              <option value="fast">Fast</option>
-              <option value="balanced">Balanced</option>
-              <option value="deep">Deep</option>
+              <option value="fast">Triage</option>
+              <option value="balanced">Program Review</option>
+              <option value="deep">Due Diligence</option>
             </select>
 
             <Button className="h-10 bg-[#5b57e6] text-white hover:bg-[#4a42ce]" onClick={runBrief}>
-              {stream.isRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} Run brief
+              {stream.isRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} Generate evidence brief
             </Button>
           </div>
         </div>
 
         <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[#6863aa]">
           <span className="rounded-full border border-[#dfdbff] bg-[#f7f5ff] px-3 py-1">
-            Decision brief mode: {modeLabel[mode]}
+            Brief mode: {modeLabel[mode]}
           </span>
           <span className="rounded-full border border-[#dfdbff] bg-[#f7f5ff] px-3 py-1">
             {modeDescription[mode]}
@@ -231,6 +311,10 @@ export function DecisionBriefWorkspace({
           {phaseOrder.map((phase) => {
             const reached = phaseProgress.has(phase);
             const active = stream.status?.phase === phase;
+            const phaseStatus = phaseStatusMap.get(phase);
+            const phaseMessage = active
+              ? stream.status?.message
+              : phaseStatus?.message ?? (reached ? "completed" : "pending");
             return (
               <div key={phase} className="rounded-lg border border-[#ddd9ff] bg-[#fefeff] px-2.5 py-2 text-[11px]">
                 <div className="flex items-center justify-between gap-2 font-semibold text-[#3a347f]">
@@ -243,7 +327,7 @@ export function DecisionBriefWorkspace({
                     <Circle className="h-3 w-3 text-[#918bc9]" />
                   )}
                 </div>
-                <div className="mt-1 text-[#6f6aad]">{active ? stream.status?.message : "pending"}</div>
+                <div className="mt-1 text-[#6f6aad]">{phaseMessage}</div>
               </div>
             );
           })}
@@ -254,7 +338,7 @@ export function DecisionBriefWorkspace({
         <aside className="order-2 space-y-3 xl:order-1 xl:sticky xl:top-[210px] xl:self-start">
           <Card className="border-[#d7d2ff] bg-white/95">
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm text-[#342f7b]">How We Found It</CardTitle>
+              <CardTitle className="text-sm text-[#342f7b]">Evidence Provenance</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2 text-xs text-[#58539a]">
               <div className="rounded-lg border border-[#e0dcff] bg-[#f7f5ff] p-2">
@@ -342,7 +426,7 @@ export function DecisionBriefWorkspace({
         <section className="order-1 space-y-3 xl:order-2">
           <Card className="border-[#d7d2ff] bg-white/95">
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm text-[#342f7b]">Decision Brief</CardTitle>
+              <CardTitle className="text-sm text-[#342f7b]">Mechanism Recommendation Brief</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2.5 text-xs text-[#59539a]">
               <div className="grid gap-2 md:grid-cols-[1.3fr_1fr_1fr]">
@@ -373,9 +457,77 @@ export function DecisionBriefWorkspace({
 
               <div className="rounded-lg border border-[#f3d1ab] bg-[#fff7ec] px-2.5 py-2.5 text-sm leading-6 text-[#7f5129]">
                 <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#a7692a]">
-                  Natural language brief
+                  Summary
                 </div>
                 {naturalLanguageBrief}
+              </div>
+
+              <div className="rounded-lg border border-[#ddd9ff] bg-[#f7f5ff] px-2.5 py-2 text-sm text-[#524d95]">
+                <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6e68ae]">
+                  Decision state
+                </div>
+                <div className="font-semibold text-[#3f397f]">
+                  {decisionCard.action}
+                </div>
+                <div className="text-[#6863aa]">{decisionCard.confidence}</div>
+                <div className="mt-1 text-[#6e69ac]">{decisionCard.rationale}</div>
+              </div>
+
+              {recommendation && stream.finalBrief?.alternatives?.[0] ? (
+                <div className="rounded-lg border border-[#ddd9ff] bg-[#f8f7ff] px-2.5 py-2.5 text-sm text-[#565198]">
+                  <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6f69af]">
+                    Why #1 outranks #2
+                  </div>
+                  <div className="font-medium text-[#3f397f]">
+                    {recommendation.target} ({recommendation.score.toFixed(3)}) vs{" "}
+                    {stream.finalBrief.alternatives[0].symbol} (
+                    {stream.finalBrief.alternatives[0].score.toFixed(3)})
+                  </div>
+                  <div className="mt-1 text-[#6d68ad]">
+                    Lead rationale: {recommendation.why}
+                  </div>
+                  <div className="mt-1 text-[#6d68ad]">
+                    Runner-up caveat: {stream.finalBrief.alternatives[0].caveat}
+                  </div>
+                </div>
+              ) : null}
+
+              {stream.finalBrief?.queryAlignment ? (
+                <div className="rounded-lg border border-[#ddd9ff] bg-[#f8f7ff] px-2.5 py-2.5 text-sm text-[#565198]">
+                  <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6f69af]">
+                    Query alignment
+                  </div>
+                  <div className="font-medium text-[#3f397f] capitalize">
+                    {stream.finalBrief.queryAlignment.status}
+                  </div>
+                  <div className="mt-1 text-[#6d68ad]">{stream.finalBrief.queryAlignment.note}</div>
+                  {stream.finalBrief.queryAlignment.requestedMentions.length > 0 ? (
+                    <div className="mt-1 text-[11px] text-[#6d68ad]">
+                      Requested concepts: {stream.finalBrief.queryAlignment.requestedMentions.join(", ")}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="rounded-lg border border-[#ddd9ff] bg-[#f8f7ff] px-2.5 py-2 text-sm text-[#565198]">
+                <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6f69af]">
+                  Why this score
+                </div>
+                {scoreBreakdown.length > 0 ? (
+                  <div className="grid gap-1 md:grid-cols-2">
+                    {scoreBreakdown.map((entry) => (
+                      <div
+                        key={`${entry.label}-${entry.value}`}
+                        className="rounded-md border border-[#e2ddff] bg-white px-2 py-1.5 text-[11px]"
+                      >
+                        <div className="font-semibold text-[#3e387f]">{entry.label}</div>
+                        <div className="text-[#6b65a9]">{entry.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-[#7a75b6]">Component metrics appear after ranking stage.</div>
+                )}
               </div>
 
               {stream.finalBrief?.caveats?.length ? (
@@ -395,7 +547,7 @@ export function DecisionBriefWorkspace({
 
           <Card className="border-[#d7d2ff] bg-white/95">
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm text-[#342f7b]">Mechanism Path Graph</CardTitle>
+              <CardTitle className="text-sm text-[#342f7b]">Mechanism Network View</CardTitle>
             </CardHeader>
             <CardContent>
               <PathFirstGraph
@@ -461,7 +613,7 @@ export function DecisionBriefWorkspace({
 
               <div className="rounded-lg border border-[#e0dcff] bg-[#f7f5ff] p-2 text-xs text-[#5c56a0]">
                 <div className="mb-1 flex items-center gap-1 font-semibold text-[#3e387f]">
-                  <Sparkles className="h-3.5 w-3.5" /> Next experiments
+                  <Sparkles className="h-3.5 w-3.5" /> Decision-gating experiments
                 </div>
                 {stream.finalBrief?.nextActions?.length ? (
                   <ol className="space-y-1">
@@ -485,7 +637,7 @@ export function DecisionBriefWorkspace({
             <CardContent className="space-y-2 text-xs text-[#575299]">
               <div className="rounded-lg border border-[#e0dcff] bg-[#f7f5ff] p-2">
                 <div className="flex items-center gap-1 font-semibold text-[#433d87]">
-                  <Clock3 className="h-3.5 w-3.5" /> Current status
+                  <Clock3 className="h-3.5 w-3.5" /> Run status
                 </div>
                 <div className="mt-1 text-[#6b65a9]">{stream.status?.message ?? "initializing"}</div>
               </div>
@@ -586,7 +738,7 @@ export function DecisionBriefWorkspace({
       </div>
 
       <footer className="px-6 pt-4 text-[11px] text-[#6f6aad]">
-        <div>Research evidence summary — not clinical guidance.</div>
+        <div>Preclinical evidence synthesis only; not for clinical decision-making.</div>
       </footer>
     </main>
   );

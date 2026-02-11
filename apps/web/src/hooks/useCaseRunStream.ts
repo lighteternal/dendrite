@@ -62,6 +62,14 @@ export type FinalBriefSection = {
   }>;
   caveats: string[];
   nextActions: string[];
+  queryAlignment?: {
+    status: "matched" | "anchored" | "mismatch" | "none";
+    requestedMentions: string[];
+    requestedTargetSymbols: string[];
+    matchedTarget?: string;
+    baselineTop?: string;
+    note: string;
+  };
 };
 
 export type StatusUpdate = {

@@ -2,12 +2,12 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import type { ForceGraphMethods, LinkObject, NodeObject } from "react-force-graph-2d";
+import type { Core, ElementDefinition } from "cytoscape";
 import { Camera, LocateFixed, Maximize2, Minimize2 } from "lucide-react";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
 import { Button } from "@/components/ui/button";
 
-const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
+const CytoscapeComponent = dynamic(() => import("react-cytoscapejs"), {
   ssr: false,
 });
 
@@ -18,6 +18,7 @@ type Props = {
   onSelectNode: (node: GraphNode | null) => void;
   highlightedNodeIds?: Set<string>;
   highlightedEdgeIds?: Set<string>;
+  dimUnfocused?: boolean;
   hiddenSummary?: {
     hiddenNodes: number;
     hiddenEdges: number;
@@ -25,50 +26,56 @@ type Props = {
   };
 };
 
-type RenderNode = NodeObject & {
-  id: string;
-  type: GraphNode["type"];
-  label: string;
-  displayLabel: string;
-  size: number;
-  score: number;
-  degree: number;
-  color: string;
-};
-
-type RenderLink = LinkObject<RenderNode> & {
-  id: string;
-  source: string | RenderNode;
-  target: string | RenderNode;
-  type: GraphEdge["type"];
-  weight: number;
-  color: string;
-};
-
-type LabelRect = {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-};
-
 const nodeColors: Record<GraphNode["type"], string> = {
-  disease: "#ef4444",
+  disease: "#ef5f66",
   target: "#5b57e6",
-  pathway: "#06b6d4",
-  drug: "#f08b2e",
-  interaction: "#8b95b5",
+  pathway: "#22b8d8",
+  drug: "#ef9232",
+  interaction: "#8f98bb",
 };
 
 const edgeColors: Record<GraphEdge["type"], string> = {
-  disease_target: "#8b95b5",
+  disease_target: "#8f98bb",
   target_pathway: "#2ea6d6",
-  target_drug: "#f08b2e",
-  target_target: "#7c3aed",
+  target_drug: "#ef9232",
+  target_target: "#7550ef",
   pathway_drug: "#27a4bb",
 };
 
-const shortestPath = (startId: string, endId: string, adjacency: Map<string, string[]>) => {
+const MIN_ZOOM = 0.34;
+const MAX_ZOOM = 1.9;
+
+function shortLabel(value: string, max = 28): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(8, max - 1))}\u2026`;
+}
+
+function informativeNodeLabel(node: GraphNode): string {
+  const readMaybeLabel = (value: unknown): string | undefined => {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === "string" && item.trim().length > 0) {
+          return item.trim();
+        }
+      }
+    }
+    return undefined;
+  };
+
+  const displayName = readMaybeLabel(node.meta.displayName);
+  const targetSymbol =
+    typeof node.meta.targetSymbol === "string" && node.meta.targetSymbol.trim().length > 0
+      ? node.meta.targetSymbol.trim()
+      : undefined;
+
+  if (node.type === "target") return targetSymbol ?? displayName ?? node.label;
+  return displayName ?? node.label;
+}
+
+function shortestPath(startId: string, endId: string, adjacency: Map<string, string[]>) {
   if (startId === endId) return [startId];
 
   const queue: string[] = [startId];
@@ -83,111 +90,43 @@ const shortestPath = (startId: string, endId: string, adjacency: Map<string, str
       if (visited.has(next)) continue;
       visited.add(next);
       parent.set(next, current);
+
       if (next === endId) {
         const path = [endId];
-        let node = endId;
-        while (parent.has(node)) {
-          node = parent.get(node)!;
-          path.unshift(node);
+        let cursor = endId;
+        while (parent.has(cursor)) {
+          cursor = parent.get(cursor)!;
+          path.unshift(cursor);
         }
         return path;
       }
+
       queue.push(next);
     }
   }
 
   return [];
-};
-
-function drawNode(ctx: CanvasRenderingContext2D, node: RenderNode, radius: number) {
-  switch (node.type) {
-    case "disease": {
-      ctx.beginPath();
-      ctx.arc(0, 0, radius * 1.14, 0, 2 * Math.PI, false);
-      ctx.fill();
-      break;
-    }
-    case "target": {
-      const w = radius * 2.2;
-      const h = radius * 1.3;
-      ctx.beginPath();
-      ctx.roundRect(-w / 2, -h / 2, w, h, 4);
-      ctx.fill();
-      break;
-    }
-    case "pathway": {
-      const w = radius * 2.3;
-      const h = radius * 1.2;
-      ctx.beginPath();
-      ctx.roundRect(-w / 2, -h / 2, w, h, h / 2);
-      ctx.fill();
-      break;
-    }
-    case "drug": {
-      ctx.beginPath();
-      ctx.moveTo(0, -radius * 1.1);
-      ctx.lineTo(radius * 1.1, 0);
-      ctx.lineTo(0, radius * 1.1);
-      ctx.lineTo(-radius * 1.1, 0);
-      ctx.closePath();
-      ctx.fill();
-      break;
-    }
-    case "interaction":
-    default: {
-      ctx.beginPath();
-      ctx.arc(0, 0, radius * 0.92, 0, 2 * Math.PI, false);
-      ctx.fill();
-      break;
-    }
-  }
 }
 
-function shortLabel(value: string, max = 24): string {
-  if (value.length <= max) return value;
-  return `${value.slice(0, Math.max(8, max - 1))}\u2026`;
+function buildDegreeMap(edges: GraphEdge[]): Map<string, number> {
+  const degree = new Map<string, number>();
+  for (const edge of edges) {
+    degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
+    degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
+  }
+  return degree;
 }
 
-function hashLabelAngle(value: string): number {
-  let hash = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash * 33 + value.charCodeAt(i)) >>> 0;
-  }
-  return (hash % 360) * (Math.PI / 180);
+function nodeSize(node: GraphNode): number {
+  if (node.type === "disease") return 46;
+  if (node.type === "target") return Math.max(24, Math.min(38, (node.size ?? 20) * 0.8));
+  if (node.type === "pathway") return 26;
+  if (node.type === "drug") return 24;
+  return 18;
 }
 
-function informativeNodeLabel(node: GraphNode): string {
-  const displayName =
-    typeof node.meta.displayName === "string" && node.meta.displayName.trim().length > 0
-      ? node.meta.displayName.trim()
-      : undefined;
-  const targetSymbol =
-    typeof node.meta.targetSymbol === "string" && node.meta.targetSymbol.trim().length > 0
-      ? node.meta.targetSymbol.trim()
-      : undefined;
-
-  if (node.type === "target") {
-    return targetSymbol ?? displayName ?? node.label;
-  }
-
-  if (node.type === "pathway") {
-    return displayName ?? node.label;
-  }
-
-  if (node.type === "drug") {
-    return displayName ?? node.label;
-  }
-
-  return displayName ?? node.label;
-}
-
-function collides(a: LabelRect, b: LabelRect, pad = 3): boolean {
-  return !(
-    a.right + pad < b.left ||
-    a.left - pad > b.right ||
-    a.bottom + pad < b.top ||
-    a.top - pad > b.bottom
-  );
+function clampZoom(value: number): number {
+  return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
 }
 
 export function GraphCanvas({
@@ -197,200 +136,412 @@ export function GraphCanvas({
   onSelectNode,
   highlightedNodeIds,
   highlightedEdgeIds,
+  dimUnfocused = true,
   hiddenSummary,
 }: Props) {
-  const fgRef = useRef<ForceGraphMethods<NodeObject, LinkObject> | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const hasFittedRef = useRef(false);
-  const lastAutoFitNodeCountRef = useRef(0);
-  const labelRectsRef = useRef<LabelRect[]>([]);
-
   const [width, setWidth] = useState(1000);
   const [fullscreen, setFullscreen] = useState(false);
-  const [hoverNodeId, setHoverNodeId] = useState<string | null>(null);
+  const [cy, setCy] = useState<Core | null>(null);
   const [pathAnchorNodeId, setPathAnchorNodeId] = useState<string | null>(null);
   const [localFocusNodeIds, setLocalFocusNodeIds] = useState<Set<string>>(new Set());
   const [localFocusEdgeIds, setLocalFocusEdgeIds] = useState<Set<string>>(new Set());
 
-  useEffect(() => {
-    const root = containerRef.current;
-    if (!root) return;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const nextWidth = Math.max(360, Math.floor(entry.contentRect.width));
-      setWidth(nextWidth);
-    });
-    observer.observe(root);
-    return () => observer.disconnect();
-  }, []);
-
   const nodeMap = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const degreeMap = useMemo(() => buildDegreeMap(edges), [edges]);
+  const diseaseRootId = useMemo(
+    () => nodes.find((node) => node.type === "disease")?.id ?? null,
+    [nodes],
+  );
+  const layoutSignature = useMemo(() => {
+    const nodeIds = nodes.map((node) => node.id).sort().join("|");
+    const edgeIds = edges.map((edge) => edge.id).sort().join("|");
+    return `${nodeIds}::${edgeIds}`;
+  }, [edges, nodes]);
 
   const adjacency = useMemo(() => {
     const map = new Map<string, string[]>();
     for (const edge of edges) {
-      const source = edge.source;
-      const target = edge.target;
-      map.set(source, [...(map.get(source) ?? []), target]);
-      map.set(target, [...(map.get(target) ?? []), source]);
+      map.set(edge.source, [...(map.get(edge.source) ?? []), edge.target]);
+      map.set(edge.target, [...(map.get(edge.target) ?? []), edge.source]);
     }
     return map;
   }, [edges]);
 
-  const nodeDegree = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const edge of edges) {
-      map.set(edge.source, (map.get(edge.source) ?? 0) + 1);
-      map.set(edge.target, (map.get(edge.target) ?? 0) + 1);
-    }
-    return map;
-  }, [edges]);
+  useEffect(() => {
+    const root = containerRef.current;
+    if (!root) return;
 
-  const renderNodes = useMemo<RenderNode[]>(
-    () =>
-      nodes.map((node) => ({
-        id: node.id,
-        type: node.type,
-        label: node.label,
-        displayLabel: informativeNodeLabel(node),
-        size: node.size ?? 18,
-        score: node.score ?? 0,
-        degree: nodeDegree.get(node.id) ?? 0,
-        color: nodeColors[node.type],
-      })),
-    [nodeDegree, nodes],
-  );
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setWidth(Math.max(360, Math.floor(entry.contentRect.width)));
+    });
 
-  const renderLinks = useMemo<RenderLink[]>(
-    () =>
-      edges.map((edge) => ({
-        id: edge.id,
-        source: edge.source,
-        target: edge.target,
-        type: edge.type,
-        weight: edge.weight ?? 0.4,
-        color: edgeColors[edge.type],
-      })),
-    [edges],
-  );
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, []);
 
   const activeNodeSet = useMemo(
     () =>
-      highlightedNodeIds && highlightedNodeIds.size > 0 ? highlightedNodeIds : localFocusNodeIds,
+      highlightedNodeIds && highlightedNodeIds.size > 0
+        ? highlightedNodeIds
+        : localFocusNodeIds,
     [highlightedNodeIds, localFocusNodeIds],
   );
 
   const activeEdgeSet = useMemo(
     () =>
-      highlightedEdgeIds && highlightedEdgeIds.size > 0 ? highlightedEdgeIds : localFocusEdgeIds,
+      highlightedEdgeIds && highlightedEdgeIds.size > 0
+        ? highlightedEdgeIds
+        : localFocusEdgeIds,
     [highlightedEdgeIds, localFocusEdgeIds],
   );
 
-  const hasFocusedSubset = activeNodeSet.size > 0 || activeEdgeSet.size > 0;
+  const hasFocusedSubset = dimUnfocused && (activeNodeSet.size > 0 || activeEdgeSet.size > 0);
 
   const autoLabelNodeIds = useMemo(() => {
-    const pick = (type: GraphNode["type"], count: number, field: "score" | "degree") =>
-      [...renderNodes]
+    const rankBy = (type: GraphNode["type"], count: number, field: "score" | "degree") =>
+      [...nodes]
         .filter((node) => node.type === type)
-        .sort((a, b) => (b[field] ?? 0) - (a[field] ?? 0))
+        .sort((a, b) => {
+          const aValue = field === "score" ? (a.score ?? 0) : degreeMap.get(a.id) ?? 0;
+          const bValue = field === "score" ? (b.score ?? 0) : degreeMap.get(b.id) ?? 0;
+          return bValue - aValue;
+        })
         .slice(0, count)
         .map((node) => node.id);
 
     return new Set<string>([
-      ...pick("disease", 2, "score"),
-      ...pick("target", 6, "score"),
-      ...pick("pathway", 5, "degree"),
-      ...pick("drug", 5, "degree"),
+      ...rankBy("disease", 1, "score"),
+      ...rankBy("target", 6, "score"),
+      ...rankBy("pathway", 4, "degree"),
+      ...rankBy("drug", 4, "degree"),
     ]);
-  }, [renderNodes]);
+  }, [degreeMap, nodes]);
+
+  const elements = useMemo<ElementDefinition[]>(() => {
+    const nodeElements = nodes.map((node) => {
+      const labelSource = informativeNodeLabel(node);
+      const shouldShowLabel =
+        node.type === "disease" ||
+        nodes.length <= 22 ||
+        selectedNodeId === node.id ||
+        activeNodeSet.has(node.id) ||
+        autoLabelNodeIds.has(node.id);
+
+      const classes = [
+        hasFocusedSubset && !activeNodeSet.has(node.id) ? "is-faded" : "",
+        activeNodeSet.has(node.id) ? "is-focused" : "",
+        selectedNodeId === node.id ? "is-selected" : "",
+        shouldShowLabel ? "" : "label-hidden",
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      return {
+        data: {
+          id: node.id,
+          type: node.type,
+          label: shortLabel(
+            labelSource,
+            node.type === "target" ? 16 : node.type === "pathway" ? 28 : 24,
+          ),
+          rawSize: nodeSize(node),
+          color: nodeColors[node.type],
+        },
+        classes,
+      } satisfies ElementDefinition;
+    });
+
+    const edgeElements = edges.map((edge) => {
+      const classes = [
+        hasFocusedSubset && !activeEdgeSet.has(edge.id) ? "is-faded" : "",
+        activeEdgeSet.has(edge.id) ? "is-focused" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      return {
+        data: {
+          id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          type: edge.type,
+          weight: edge.weight ?? 0.4,
+          color: edgeColors[edge.type],
+        },
+        classes,
+      } satisfies ElementDefinition;
+    });
+
+    return [...nodeElements, ...edgeElements];
+  }, [
+    activeEdgeSet,
+    activeNodeSet,
+    autoLabelNodeIds,
+    edges,
+    hasFocusedSubset,
+    nodes,
+    selectedNodeId,
+  ]);
+
+  const stylesheet = useMemo(
+    () => [
+      {
+        selector: "node",
+        style: {
+          label: "data(label)",
+          width: "data(rawSize)",
+          height: "data(rawSize)",
+          "background-color": "data(color)",
+          color: "#2f2a70",
+          "font-size": 11,
+          "font-family": "var(--font-body)",
+          "text-wrap": "wrap",
+          "text-max-width": 124,
+          "text-background-color": "#ffffff",
+          "text-background-opacity": 0.9,
+          "text-background-shape": "roundrectangle",
+          "text-border-width": 1,
+          "text-border-color": "#d7d2ff",
+          "text-border-opacity": 0.85,
+          "text-margin-y": 12,
+          "text-valign": "bottom",
+          "border-width": 1.2,
+          "border-color": "#ffffff",
+          "overlay-opacity": 0,
+          "shadow-blur": 10,
+          "shadow-opacity": 0.18,
+          "shadow-color": "#7d73d8",
+        },
+      },
+      {
+        selector: "node[type = 'target']",
+        style: {
+          shape: "round-rectangle",
+        },
+      },
+      {
+        selector: "node[type = 'pathway']",
+        style: {
+          shape: "round-rectangle",
+          width: 30,
+          height: 22,
+        },
+      },
+      {
+        selector: "node[type = 'drug']",
+        style: {
+          shape: "diamond",
+          width: 22,
+          height: 22,
+        },
+      },
+      {
+        selector: "node[type = 'interaction']",
+        style: {
+          width: 14,
+          height: 14,
+        },
+      },
+      {
+        selector: "node.label-hidden",
+        style: {
+          label: "",
+        },
+      },
+      {
+        selector: "node.is-selected",
+        style: {
+          "border-width": 2.6,
+          "border-color": "#f08b2e",
+          "shadow-opacity": 0.34,
+          "shadow-color": "#f08b2e",
+        },
+      },
+      {
+        selector: "node.is-faded",
+        style: {
+          opacity: 0.14,
+          "text-opacity": 0.08,
+        },
+      },
+      {
+        selector: "edge",
+        style: {
+          width: "mapData(weight, 0, 1, 1, 3.8)",
+          "line-color": "data(color)",
+          "target-arrow-color": "data(color)",
+          "target-arrow-shape": "triangle",
+          "arrow-scale": 0.9,
+          "curve-style": "bezier",
+          opacity: 0.84,
+        },
+      },
+      {
+        selector: "edge[type = 'target_target']",
+        style: {
+          "curve-style": "unbundled-bezier",
+          "control-point-distances": [24],
+          "control-point-weights": [0.5],
+        },
+      },
+      {
+        selector: "edge.is-faded",
+        style: {
+          opacity: 0.12,
+        },
+      },
+      {
+        selector: "edge.is-focused",
+        style: {
+          opacity: 0.96,
+          width: "mapData(weight, 0, 1, 2, 4.6)",
+        },
+      },
+    ],
+    [],
+  );
 
   useEffect(() => {
-    if (nodes.length === 0 || !fgRef.current) {
-      hasFittedRef.current = false;
-      lastAutoFitNodeCountRef.current = 0;
-      return;
-    }
-    const shouldFirstFit = !hasFittedRef.current;
-    const shouldWaveFit =
-      hasFittedRef.current &&
-      !selectedNodeId &&
-      !hasFocusedSubset &&
-      nodes.length - lastAutoFitNodeCountRef.current >= 18;
+    if (!cy) return;
 
-    if (shouldFirstFit || shouldWaveFit) {
-      const timer = setTimeout(() => {
-        fgRef.current?.zoomToFit(360, shouldFirstFit ? 68 : 52);
-      }, 220);
-      hasFittedRef.current = true;
-      lastAutoFitNodeCountRef.current = nodes.length;
-      return () => clearTimeout(timer);
-    }
-    return;
-  }, [hasFocusedSubset, nodes.length, selectedNodeId]);
+    const useBreadth = nodes.length <= 28;
 
-  useEffect(() => {
-    const graph = fgRef.current as
-      | (ForceGraphMethods<NodeObject, LinkObject> & {
-          d3Force: (name: string) => unknown;
-          d3ReheatSimulation: () => void;
-        })
-      | undefined;
-    if (!graph) return;
-
-    const chargeForce = graph.d3Force("charge") as
-      | { strength: (value: number | ((node: RenderNode) => number)) => void }
-      | undefined;
-    chargeForce?.strength((node: RenderNode) => {
-      switch (node.type) {
-        case "disease":
-          return -920;
-        case "target":
-          return -560;
-        case "pathway":
-          return -330;
-        case "drug":
-          return -250;
-        case "interaction":
-        default:
-          return -180;
-      }
-    });
-
-    const linkForce = graph.d3Force("link") as
-      | {
-          distance: (value: number | ((link: RenderLink) => number)) => void;
-          strength: (value: number | ((link: RenderLink) => number)) => void;
-        }
-      | undefined;
-    linkForce?.distance((link: RenderLink) => {
-      switch (link.type) {
-        case "disease_target":
-          return 190;
-        case "target_pathway":
-          return 168;
-        case "target_drug":
-          return 150;
-        case "target_target":
-          return 220;
-        case "pathway_drug":
-        default:
-          return 182;
-      }
-    });
-    linkForce?.strength((link: RenderLink) => {
-      return link.type === "target_target" ? 0.03 : 0.11;
-    });
-
-    const collideForce = graph.d3Force("collide") as
-      | { radius: (value: number | ((node: RenderNode) => number)) => void }
-      | undefined;
-    collideForce?.radius((node: RenderNode) =>
-      Math.max(10, Math.min(32, 10 + (node.size ?? 16) * 0.24)),
+    const layout = cy.layout(
+      useBreadth
+        ? {
+            name: "breadthfirst",
+            directed: true,
+            animate: true,
+            animationDuration: 320,
+            fit: true,
+            padding: 28,
+            spacingFactor: 1.02,
+            roots: diseaseRootId ? [diseaseRootId] : undefined,
+          }
+        : {
+            name: "cose",
+            animate: true,
+            animationDuration: 360,
+            fit: true,
+            padding: 28,
+            randomize: false,
+            gravity: 0.34,
+            componentSpacing: 58,
+            idealEdgeLength: (edge: { data: (key: string) => string }) => {
+              const type = edge.data("type") as GraphEdge["type"];
+              if (type === "disease_target") return 138;
+              if (type === "target_pathway") return 118;
+              if (type === "target_drug") return 112;
+              if (type === "target_target") return 126;
+              return 115;
+            },
+            nodeRepulsion: (node: { data: (key: string) => string }) => {
+              const type = node.data("type") as GraphNode["type"];
+              if (type === "disease") return 145000;
+              if (type === "target") return 98000;
+              return 68000;
+            },
+          },
     );
 
-    graph.d3ReheatSimulation();
-  }, [edges.length, nodes.length]);
+    layout.on("layoutstop", () => {
+      cy.fit(undefined, 28);
+      const currentZoom = cy.zoom();
+      if (currentZoom < 0.56) {
+        cy.zoom(0.56);
+      }
+      cy.zoom(clampZoom(cy.zoom()));
+      cy.center();
+    });
+
+    layout.run();
+    cy.minZoom(MIN_ZOOM);
+    cy.maxZoom(MAX_ZOOM);
+  }, [cy, diseaseRootId, layoutSignature, nodes.length]);
+
+  useEffect(() => {
+    if (!cy) return;
+
+    const onTapBackground = (event: { target: unknown }) => {
+      if (event.target !== cy) return;
+      setPathAnchorNodeId(null);
+      setLocalFocusNodeIds(new Set());
+      setLocalFocusEdgeIds(new Set());
+      onSelectNode(null);
+    };
+
+    const onTapNode = (event: {
+      target: { id: () => string };
+      originalEvent?: MouseEvent;
+    }) => {
+      const nodeId = String(event.target.id());
+      const mouseEvent = event.originalEvent;
+
+      if (mouseEvent?.shiftKey && pathAnchorNodeId) {
+        const path = shortestPath(pathAnchorNodeId, nodeId, adjacency);
+        if (path.length > 0) {
+          const focusNodes = new Set(path);
+          const focusEdges = new Set<string>();
+
+          for (let i = 0; i < path.length - 1; i += 1) {
+            const from = path[i]!;
+            const to = path[i + 1]!;
+            const hit = edges.find(
+              (edge) =>
+                (edge.source === from && edge.target === to) ||
+                (edge.source === to && edge.target === from),
+            );
+            if (hit) focusEdges.add(hit.id);
+          }
+
+          setLocalFocusNodeIds(focusNodes);
+          setLocalFocusEdgeIds(focusEdges);
+        }
+        setPathAnchorNodeId(null);
+        return;
+      }
+
+      if (mouseEvent?.shiftKey) {
+        setPathAnchorNodeId(nodeId);
+        return;
+      }
+
+      setPathAnchorNodeId(null);
+      setLocalFocusNodeIds(new Set());
+      setLocalFocusEdgeIds(new Set());
+      onSelectNode(nodeMap.get(nodeId) ?? null);
+    };
+
+    const onRightTapNode = (event: { target: { id: () => string } }) => {
+      const nodeId = String(event.target.id());
+      const neighbors = adjacency.get(nodeId) ?? [];
+      const neighborhood = new Set<string>([nodeId, ...neighbors]);
+      const focusEdges = new Set<string>();
+
+      for (const edge of edges) {
+        if (neighborhood.has(edge.source) && neighborhood.has(edge.target)) {
+          focusEdges.add(edge.id);
+        }
+      }
+
+      setLocalFocusNodeIds(neighborhood);
+      setLocalFocusEdgeIds(focusEdges);
+      onSelectNode(nodeMap.get(nodeId) ?? null);
+    };
+
+    cy.on("tap", onTapBackground);
+    cy.on("tap", "node", onTapNode);
+    cy.on("cxttap", "node", onRightTapNode);
+
+    return () => {
+      cy.off("tap", onTapBackground);
+      cy.off("tap", "node", onTapNode);
+      cy.off("cxttap", "node", onRightTapNode);
+    };
+  }, [adjacency, cy, edges, nodeMap, onSelectNode, pathAnchorNodeId]);
 
   const nodeCounts = useMemo(
     () =>
@@ -403,8 +554,9 @@ export function GraphCanvas({
       ),
     [nodes],
   );
+
   const canvasHeight = fullscreen
-    ? Math.max(420, Math.floor(window.innerHeight - 48))
+    ? Math.max(420, Math.floor((typeof window !== "undefined" ? window.innerHeight : 900) - 48))
     : Math.max(460, Math.floor(width * 0.56));
 
   return (
@@ -423,21 +575,30 @@ export function GraphCanvas({
           onClick={() => {
             setLocalFocusNodeIds(new Set());
             setLocalFocusEdgeIds(new Set());
-            fgRef.current?.zoomToFit(360, 52);
+            setPathAnchorNodeId(null);
+            if (!cy) return;
+            cy.fit(undefined, 40);
+            cy.zoom(clampZoom(cy.zoom()));
+            cy.center();
           }}
           title="Fit graph"
           className="border-[#d7d2ff] bg-white text-[#4a4390] hover:bg-[#f2efff]"
         >
           <LocateFixed className="h-4 w-4" />
         </Button>
+
         <Button
           size="icon"
           variant="secondary"
           onClick={() => {
-            const canvas = containerRef.current?.querySelector("canvas");
-            if (!canvas) return;
+            if (!cy) return;
+            const png = cy.png({
+              full: true,
+              scale: 2,
+              bg: "#ffffff",
+            });
             const a = document.createElement("a");
-            a.href = canvas.toDataURL("image/png", 1);
+            a.href = png;
             a.download = "targetgraph-network.png";
             a.click();
           }}
@@ -445,6 +606,7 @@ export function GraphCanvas({
         >
           <Camera className="h-4 w-4" />
         </Button>
+
         <Button
           size="icon"
           variant="secondary"
@@ -472,185 +634,18 @@ export function GraphCanvas({
         ) : null}
       </div>
 
-      <ForceGraph2D
-        ref={fgRef}
-        width={width}
-        height={canvasHeight}
-        graphData={{
-          nodes: renderNodes,
-          links: renderLinks,
-        }}
-        backgroundColor="rgba(0,0,0,0)"
-        nodeLabel={() => ""}
-        linkDirectionalArrowLength={2.2}
-        linkDirectionalArrowRelPos={0.98}
-        linkDirectionalParticles={(link) => (activeEdgeSet.has(link.id) ? 2 : 0)}
-        linkDirectionalParticleWidth={2.8}
-        linkDirectionalParticleSpeed={0.006}
-        d3AlphaDecay={0.028}
-        d3VelocityDecay={0.24}
-        cooldownTicks={170}
-        onRenderFramePre={() => {
-          labelRectsRef.current = [];
-        }}
-        onBackgroundClick={() => {
-          setPathAnchorNodeId(null);
-          setLocalFocusNodeIds(new Set());
-          setLocalFocusEdgeIds(new Set());
-          onSelectNode(null);
-        }}
-        onNodeHover={(node) => setHoverNodeId(node ? String(node.id) : null)}
-        onNodeClick={(node, event) => {
-          const nodeId = String(node.id);
-          const mouseEvent = event as MouseEvent;
-          if (mouseEvent.shiftKey && pathAnchorNodeId) {
-            const path = shortestPath(pathAnchorNodeId, nodeId, adjacency);
-            if (path.length > 0) {
-              const focusNodes = new Set(path);
-              const focusEdges = new Set<string>();
-              for (let i = 0; i < path.length - 1; i += 1) {
-                const from = path[i]!;
-                const to = path[i + 1]!;
-                const hit = edges.find(
-                  (edge) =>
-                    (edge.source === from && edge.target === to) ||
-                    (edge.source === to && edge.target === from),
-                );
-                if (hit) focusEdges.add(hit.id);
-              }
-              setLocalFocusNodeIds(focusNodes);
-              setLocalFocusEdgeIds(focusEdges);
-            }
-            setPathAnchorNodeId(null);
-          } else if (mouseEvent.shiftKey) {
-            setPathAnchorNodeId(nodeId);
-          } else {
-            setPathAnchorNodeId(null);
-            setLocalFocusNodeIds(new Set());
-            setLocalFocusEdgeIds(new Set());
-            onSelectNode(nodeMap.get(nodeId) ?? null);
+      <CytoscapeComponent
+        elements={elements}
+        stylesheet={stylesheet}
+        style={{ width: "100%", height: `${canvasHeight}px` }}
+        minZoom={MIN_ZOOM}
+        maxZoom={MAX_ZOOM}
+        wheelSensitivity={0.16}
+        cy={(instance: Core) => {
+          if (cy !== instance) {
+            setCy(instance);
           }
         }}
-        onNodeRightClick={(node) => {
-          const nodeId = String(node.id);
-          const neighbors = adjacency.get(nodeId) ?? [];
-          const neighborhood = new Set<string>([nodeId, ...neighbors]);
-          const focusEdges = new Set<string>();
-          for (const edge of edges) {
-            if (neighborhood.has(edge.source) && neighborhood.has(edge.target)) {
-              focusEdges.add(edge.id);
-            }
-          }
-          setLocalFocusNodeIds(neighborhood);
-          setLocalFocusEdgeIds(focusEdges);
-          onSelectNode(nodeMap.get(nodeId) ?? null);
-        }}
-        nodeCanvasObject={(node, ctx, globalScale) => {
-          const n = node as RenderNode;
-          const selected = selectedNodeId === n.id;
-          const focused = !hasFocusedSubset || activeNodeSet.has(n.id);
-          const radius = Math.max(6.4, Math.min(18, 5.8 + (n.size ?? 14) * 0.24));
-
-          const glow =
-            selected
-              ? 10
-              : n.type === "target"
-                ? 4 + (n.score ?? 0) * 14
-                : n.type === "disease"
-                  ? 6
-                  : 0;
-
-          if (glow > 0) {
-            ctx.save();
-            ctx.globalAlpha = focused ? 0.82 : 0.14;
-            ctx.shadowColor = selected ? "#f08b2e" : n.color;
-            ctx.shadowBlur = glow;
-            ctx.fillStyle = selected ? "#5b57e6" : n.color;
-            drawNode(ctx, n, radius * 0.98);
-            ctx.restore();
-          }
-
-          ctx.save();
-          ctx.globalAlpha = focused ? 0.95 : 0.16;
-          ctx.fillStyle = selected ? "#5b57e6" : n.color;
-          ctx.strokeStyle = selected ? "#f08b2e" : "#ffffff";
-          ctx.lineWidth = selected ? 2.2 : 1;
-          drawNode(ctx, n, radius);
-          ctx.stroke();
-          ctx.restore();
-
-          const showLabel =
-            n.type === "disease" ||
-            selected ||
-            activeNodeSet.has(n.id) ||
-            hoverNodeId === n.id ||
-            autoLabelNodeIds.has(n.id) ||
-            globalScale > 2.45;
-
-          if (!showLabel) return;
-
-          const prominent = selected || hoverNodeId === n.id || activeNodeSet.has(n.id);
-          const label = prominent
-            ? n.displayLabel
-            : shortLabel(
-                n.displayLabel,
-                n.type === "target" ? 14 : n.type === "pathway" ? 24 : 22,
-              );
-          const fontSize = Math.max(9, 11 / globalScale);
-          ctx.font = `${fontSize}px var(--font-body)`;
-          const widthWithPadding = ctx.measureText(label).width + 8;
-          const absX = typeof n.x === "number" ? n.x : 0;
-          const absY = typeof n.y === "number" ? n.y : 0;
-          const distanceFromCenter = Math.hypot(absX, absY);
-          const angle = hashLabelAngle(n.id);
-          const radialX = distanceFromCenter < 52 ? Math.cos(angle) : absX / distanceFromCenter;
-          const radialY = distanceFromCenter < 52 ? Math.sin(angle) : absY / distanceFromCenter;
-          const tangentX = -radialY;
-          const tangentY = radialX;
-          const jitter = ((Math.floor((angle * 1000) % 5) || 0) - 2) * (prominent ? 1.8 : 2.6);
-          const x = radialX * (radius + (prominent ? 14 : 11)) + tangentX * jitter;
-          const y = radialY * (radius + (prominent ? 14 : 11)) + tangentY * jitter;
-
-          const rect: LabelRect = {
-            left: absX + x - widthWithPadding / 2,
-            top: absY + y - fontSize,
-            right: absX + x + widthWithPadding / 2,
-            bottom: absY + y + 6,
-          };
-
-          if (!prominent) {
-            const hasCollision = labelRectsRef.current.some((existing) => collides(rect, existing));
-            if (hasCollision) return;
-          }
-          labelRectsRef.current.push(rect);
-
-          ctx.save();
-          ctx.globalAlpha = focused ? 0.95 : 0.2;
-          ctx.fillStyle = "rgba(255,255,255,0.92)";
-          ctx.strokeStyle = "rgba(155,145,224,0.7)";
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.roundRect(x - widthWithPadding / 2, y - fontSize, widthWithPadding, fontSize + 6, 4);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = "#322c73";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(label, x, y - fontSize / 2 + 2);
-          ctx.restore();
-        }}
-        linkColor={(link) => {
-          const l = link as RenderLink;
-          if (!hasFocusedSubset) return l.color;
-          return activeEdgeSet.has(l.id) ? l.color : "rgba(173,163,224,0.25)";
-        }}
-        linkWidth={(link) => {
-          const l = link as RenderLink;
-          const base = Math.max(0.7, Math.min(3.2, l.weight * 2.4));
-          if (!hasFocusedSubset) return base;
-          return activeEdgeSet.has(l.id) ? Math.max(base, 2.4) : 0.6;
-        }}
-        linkCurvature={(link) => ((link as RenderLink).type === "target_target" ? 0.24 : 0.08)}
       />
 
       {nodes.length === 0 ? (

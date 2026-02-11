@@ -48,6 +48,7 @@ function downloadJson(data: unknown, filename: string) {
 export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
   const stream = useGraphStream();
   const { start, stop } = stream;
+  const [maxTargets, setMaxTargets] = useState(10);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [sankeyOpen, setSankeyOpen] = useState(true);
   const [showPathways, setShowPathways] = useState(defaults?.pathways ?? true);
@@ -58,9 +59,9 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
   const [highlightedEdgeIds, setHighlightedEdgeIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    start(diseaseQuery, 20);
+    start(diseaseQuery, maxTargets);
     return () => stop();
-  }, [diseaseQuery, start, stop]);
+  }, [diseaseQuery, maxTargets, start, stop]);
 
   const filtered = useMemo(() => {
     const hiddenTypes = new Set<string>();
@@ -163,7 +164,7 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
                 <Button
                   size="sm"
                   className="flex-1"
-                  onClick={() => stream.start(diseaseQuery, 20)}
+                  onClick={() => stream.start(diseaseQuery, maxTargets)}
                 >
                   <RefreshCw className="h-3.5 w-3.5" /> Rebuild
                 </Button>
@@ -200,6 +201,20 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
                   Clear focus highlighting
                 </Button>
               ) : null}
+              <div className="space-y-1 text-[11px] text-[#9db8d3]">
+                <label htmlFor="max-targets-select" className="block">Target budget</label>
+                <select
+                  id="max-targets-select"
+                  className="h-8 w-full rounded-md border border-white/10 bg-[#122032] px-2 text-xs text-[#dceeff]"
+                  value={String(maxTargets)}
+                  onChange={(event) => setMaxTargets(Number(event.target.value))}
+                >
+                  <option value="6">Fast (6 targets)</option>
+                  <option value="10">Balanced (10 targets)</option>
+                  <option value="15">Deep (15 targets)</option>
+                  <option value="20">Maximum (20 targets)</option>
+                </select>
+              </div>
             </CardContent>
           </Card>
 

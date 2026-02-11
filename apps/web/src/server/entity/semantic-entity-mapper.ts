@@ -39,6 +39,20 @@ const conceptCache = createTTLCache<string, ResolvedConcept[]>(
   appConfig.cache.maxEntries,
 );
 
+const diseaseQualifierTerms = [
+  "biomarker",
+  "measurement",
+  "profile",
+  "susceptibility",
+  "severity",
+  "risk",
+  "response",
+  "progression",
+  "screening",
+  "finding",
+  "trait",
+];
+
 function normalizeGreek(value: string): string {
   return value
     .toLowerCase()
@@ -62,6 +76,17 @@ function sanitizeMention(value: string): string {
     .trim();
 }
 
+function normalizeDiseaseMention(value: string): string {
+  return sanitizeMention(value)
+    .split(/\s+/)
+    .filter((token) => {
+      const normalized = normalizeGreek(token);
+      return !diseaseQualifierTerms.some((term) => normalized === term);
+    })
+    .join(" ")
+    .trim();
+}
+
 function isQuestionLike(value: string): boolean {
   const normalized = normalizeGreek(value);
   return /\b(what|which|why|how|implication|impact|effect|best|strongest|thread)\b/.test(
@@ -82,6 +107,27 @@ function tokens(value: string): string[] {
   return normalizeGreek(value)
     .split(" ")
     .filter((token) => token.length > 1);
+}
+
+function interventionAnchorVariants(mention: string): string[] {
+  const normalized = normalizeGreek(mention).replace(/\binhibitors?\b/g, "").trim();
+  const variants = new Set<string>();
+  if (normalized) variants.add(normalized);
+
+  if (/\btnf\s+alpha\b/.test(normalized)) {
+    variants.add("tnf alpha");
+    variants.add("tnf-a");
+    variants.add("tnf a");
+    variants.add("tnf");
+  }
+
+  if (/\btnf\s+beta\b/.test(normalized)) {
+    variants.add("tnf beta");
+    variants.add("tnf-b");
+    variants.add("tnf b");
+  }
+
+  return [...variants].filter((value) => value.length >= 2).slice(0, 4);
 }
 
 function scoreMatch(mention: string, candidateName: string, description?: string): number {
@@ -130,12 +176,12 @@ function dedupeMentions(concepts: ConceptMention[]): ConceptMention[] {
     const normalizedMention = normalizeGreek(concept.mention);
     const cleanedMention = sanitizeMention(concept.mention);
     if (!cleanedMention) continue;
-    if (concept.type === "disease" && isQuestionLike(cleanedMention)) continue;
+    if (isQuestionLike(cleanedMention)) continue;
     const key = `${concept.type}:${normalizedMention}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({
-      mention: cleanedMention,
+      mention: concept.type === "disease" ? normalizeDiseaseMention(cleanedMention) : cleanedMention,
       type: concept.type,
     });
   }
@@ -238,6 +284,8 @@ async function extractConceptMentions(query: string): Promise<ConceptMention[]> 
     const response = await Promise.race([
       openai.responses.create({
         model: appConfig.openai.smallModel,
+        max_output_tokens: 220,
+        reasoning: { effort: "minimal" },
         input: [
           {
             role: "system",
@@ -258,7 +306,7 @@ async function extractConceptMentions(query: string): Promise<ConceptMention[]> 
         },
       }),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("concept extraction timeout")), 900),
+        setTimeout(() => reject(new Error("concept extraction timeout")), 1200),
       ),
     ]);
 
@@ -274,14 +322,16 @@ async function extractConceptMentions(query: string): Promise<ConceptMention[]> 
 }
 
 async function resolveDiseaseMention(mention: string): Promise<CanonicalEntity[]> {
-  const hits = await searchDiseases(mention, 8);
+  const normalizedMention = normalizeDiseaseMention(mention);
+  const query = normalizedMention.length >= 3 ? normalizedMention : mention;
+  const hits = await searchDiseases(query, 8);
   return hits
     .map((item) => ({
       entityType: "disease" as const,
       id: item.id,
       name: item.name,
       description: item.description,
-      score: scoreMatch(mention, item.name, item.description),
+      score: scoreMatch(query, item.name, item.description),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 4);
@@ -316,11 +366,45 @@ async function resolveDrugMention(mention: string): Promise<CanonicalEntity[]> {
 }
 
 async function resolveInterventionMention(mention: string): Promise<CanonicalEntity[]> {
-  const anchor = mention.replace(/\binhibitors?\b/i, "").trim();
-  const [targetHits, drugHits] = await Promise.all([
-    anchor.length >= 2 ? resolveTargetMention(anchor) : Promise.resolve([]),
-    resolveDrugMention(mention),
-  ]);
+  const anchors = interventionAnchorVariants(mention);
+  const targetSets = await Promise.all(
+    anchors.length > 0
+      ? anchors.map((anchor) => resolveTargetMention(anchor))
+      : [Promise.resolve([] as CanonicalEntity[])],
+  );
+  const mentionNorm = normalizeGreek(mention);
+
+  const targetMap = new Map<string, CanonicalEntity>();
+  for (const candidate of targetSets.flat()) {
+    const existing = targetMap.get(candidate.id);
+    if (!existing || candidate.score > existing.score) {
+      targetMap.set(candidate.id, candidate);
+    }
+  }
+
+  const targetHits = [...targetMap.values()].map((candidate) => {
+    const nameNorm = normalizeGreek(candidate.name);
+    const descNorm = normalizeGreek(candidate.description ?? "");
+    let boostedScore = candidate.score;
+
+    if (
+      /\btnf\s+alpha\b/.test(mentionNorm) &&
+      /\bbeta\b/.test(`${nameNorm} ${descNorm}`)
+    ) {
+      boostedScore -= 8;
+    }
+
+    if (/\btnf\b/.test(mentionNorm) && nameNorm === "tnf") {
+      boostedScore += 4;
+    }
+
+    return {
+      ...candidate,
+      score: boostedScore,
+    };
+  });
+
+  const drugHits = await resolveDrugMention(mention);
 
   const combined = [...targetHits, ...drugHits]
     .sort((a, b) => b.score - a.score)

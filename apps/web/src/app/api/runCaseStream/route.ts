@@ -491,6 +491,20 @@ export async function GET(request: NextRequest) {
           candidates,
         });
 
+        const semanticConceptsEarly = await Promise.race([
+          semanticConceptPromise,
+          new Promise<Awaited<ReturnType<typeof resolveSemanticConcepts>>>((resolve) =>
+            setTimeout(() => resolve([]), 1200),
+          ),
+        ]);
+        const semanticDisease = semanticConceptsEarly.find(
+          (concept) =>
+            concept.selected?.entityType === "disease" &&
+            concept.selected.id &&
+            diseaseIdPattern.test(concept.selected.id) &&
+            (concept.selected.score ?? 0) >= 2.2,
+        )?.selected;
+
         let chosen:
           | {
               selected: DiseaseCandidate;
@@ -512,6 +526,22 @@ export async function GET(request: NextRequest) {
             chosen = {
               selected: pinned,
               rationale: "User-pinned disease entity.",
+            };
+          }
+        }
+
+        if (!chosen) {
+          if (semanticDisease) {
+            const semanticMatch =
+              candidates.find((item) => item.id === semanticDisease.id) ??
+              ({
+                id: semanticDisease.id,
+                name: semanticDisease.name,
+                description: semanticDisease.description,
+              } satisfies DiseaseCandidate);
+            chosen = {
+              selected: semanticMatch,
+              rationale: "Selected via semantic disease concept mapping.",
             };
           }
         }

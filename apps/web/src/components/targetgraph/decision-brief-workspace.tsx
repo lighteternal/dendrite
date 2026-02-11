@@ -243,16 +243,16 @@ export function DecisionBriefWorkspace({
       <header className="sticky top-0 z-40 border-b border-[#ddd9ff] bg-white/95 px-3 py-3 backdrop-blur md:px-6">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex items-center gap-2">
-            <Badge className="rounded-full bg-[#5b57e6] px-3 py-1 text-white">TargetGraph</Badge>
+            <Badge className="rounded-full bg-[#f0872d] px-3 py-1 text-white">TargetGraph</Badge>
             <Button
               size="sm"
               variant="secondary"
-              className="border-[#ddd9ff] bg-[#f3f1ff] text-[#4a4390] hover:bg-[#e7e3ff]"
+              className="border-[#f0d9c4] bg-[#fff4e8] text-[#8d511c] hover:bg-[#ffe9d4]"
               onClick={() => router.push("/")}
             >
               <ArrowLeft className="h-3.5 w-3.5" /> Main search
             </Button>
-            <Badge className="rounded-full bg-[#f3f1ff] text-[#4a4390]">
+            <Badge className="rounded-full bg-[#fff4e8] text-[#8d511c]">
               {stream.resolverSelection?.selected?.name ?? initialQuery}
             </Badge>
           </div>
@@ -273,7 +273,7 @@ export function DecisionBriefWorkspace({
                   }
                 }}
                 placeholder="Ask a translational disease question"
-                className="h-10 w-full rounded-lg border border-[#d6d1ff] bg-[#faf9ff] pl-9 pr-3 text-sm text-[#332f78] outline-none ring-[#5b57e6] placeholder:text-[#827dbb] focus:ring-2"
+                className="h-10 w-full rounded-lg border border-[#ffd7b2] bg-[#fffaf4] pl-9 pr-3 text-sm text-[#4d2d52] outline-none ring-[#f0872d] placeholder:text-[#9d7660] focus:ring-2"
               />
             </div>
 
@@ -287,7 +287,7 @@ export function DecisionBriefWorkspace({
               <option value="deep">Due Diligence</option>
             </select>
 
-            <Button className="h-10 bg-[#5b57e6] text-white hover:bg-[#4a42ce]" onClick={runBrief}>
+            <Button className="h-10 bg-[#f0872d] text-white hover:bg-[#d6711d]" onClick={runBrief}>
               {stream.isRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} Generate evidence brief
             </Button>
           </div>
@@ -320,7 +320,7 @@ export function DecisionBriefWorkspace({
                 <div className="flex items-center justify-between gap-2 font-semibold text-[#3a347f]">
                   <span>{phase}</span>
                   {active ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#5b57e6]" />
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f0872d]" />
                   ) : reached ? (
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
                   ) : (
@@ -368,7 +368,7 @@ export function DecisionBriefWorkspace({
                         }}
                         className={`rounded-full border px-2 py-0.5 text-[10px] ${
                           diseaseIdOverride === item.id
-                            ? "border-[#5b57e6] bg-[#ebe8ff] text-[#3a347f]"
+                            ? "border-[#f2b37e] bg-[#fff0df] text-[#7c4719]"
                             : "border-[#d7d2ff] bg-white text-[#5f599f]"
                         }`}
                       >
@@ -704,7 +704,7 @@ export function DecisionBriefWorkspace({
             <CardContent className="space-y-2 text-xs text-[#575299]">
               <Button
                 size="sm"
-                className="w-full bg-[#5b57e6] text-white hover:bg-[#4a42ce]"
+                className="w-full bg-[#f0872d] text-white hover:bg-[#d6711d]"
                 onClick={runBrief}
               >
                 <Play className="h-3.5 w-3.5" /> Re-run current brief
@@ -713,7 +713,7 @@ export function DecisionBriefWorkspace({
               <Button
                 size="sm"
                 variant="secondary"
-                className="w-full border-[#d8d3ff] bg-[#f0edff] text-[#4a4390] hover:bg-[#e5e0ff]"
+                className="w-full border-[#f2d9bf] bg-[#fff4e8] text-[#8d511c] hover:bg-[#ffe9d4]"
                 onClick={() => {
                   downloadJson(
                     {

@@ -28,18 +28,18 @@ type Props = {
 
 const nodeColors: Record<GraphNode["type"], string> = {
   disease: "#ef5f66",
-  target: "#5b57e6",
-  pathway: "#22b8d8",
-  drug: "#ef9232",
-  interaction: "#8f98bb",
+  target: "#7f4dd5",
+  pathway: "#f0a23e",
+  drug: "#e87f22",
+  interaction: "#9f8bc9",
 };
 
 const edgeColors: Record<GraphEdge["type"], string> = {
-  disease_target: "#8f98bb",
-  target_pathway: "#2ea6d6",
-  target_drug: "#ef9232",
-  target_target: "#7550ef",
-  pathway_drug: "#27a4bb",
+  disease_target: "#9d8ca9",
+  target_pathway: "#f0a23e",
+  target_drug: "#e87f22",
+  target_target: "#7f4dd5",
+  pathway_drug: "#d06d1a",
 };
 
 const MIN_ZOOM = 0.34;
@@ -119,10 +119,10 @@ function buildDegreeMap(edges: GraphEdge[]): Map<string, number> {
 
 function nodeSize(node: GraphNode): number {
   if (node.type === "disease") return 46;
-  if (node.type === "target") return Math.max(24, Math.min(38, (node.size ?? 20) * 0.8));
-  if (node.type === "pathway") return 26;
-  if (node.type === "drug") return 24;
-  return 18;
+  if (node.type === "target") return Math.max(26, Math.min(40, (node.size ?? 20) * 0.78));
+  if (node.type === "pathway") return 24;
+  if (node.type === "drug") return 22;
+  return 13;
 }
 
 function clampZoom(value: number): number {
@@ -148,25 +148,33 @@ export function GraphCanvas({
   const [localFocusEdgeIds, setLocalFocusEdgeIds] = useState<Set<string>>(new Set());
 
   const nodeMap = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
-  const degreeMap = useMemo(() => buildDegreeMap(edges), [edges]);
+  const validNodeIds = useMemo(() => new Set(nodes.map((node) => node.id)), [nodes]);
+  const validEdges = useMemo(
+    () =>
+      edges.filter(
+        (edge) => validNodeIds.has(edge.source) && validNodeIds.has(edge.target),
+      ),
+    [edges, validNodeIds],
+  );
+  const degreeMap = useMemo(() => buildDegreeMap(validEdges), [validEdges]);
   const diseaseRootId = useMemo(
     () => nodes.find((node) => node.type === "disease")?.id ?? null,
     [nodes],
   );
   const layoutSignature = useMemo(() => {
     const nodeIds = nodes.map((node) => node.id).sort().join("|");
-    const edgeIds = edges.map((edge) => edge.id).sort().join("|");
+    const edgeIds = validEdges.map((edge) => edge.id).sort().join("|");
     return `${nodeIds}::${edgeIds}`;
-  }, [edges, nodes]);
+  }, [nodes, validEdges]);
 
   const adjacency = useMemo(() => {
     const map = new Map<string, string[]>();
-    for (const edge of edges) {
+    for (const edge of validEdges) {
       map.set(edge.source, [...(map.get(edge.source) ?? []), edge.target]);
       map.set(edge.target, [...(map.get(edge.target) ?? []), edge.source]);
     }
     return map;
-  }, [edges]);
+  }, [validEdges]);
 
   useEffect(() => {
     const root = containerRef.current;
@@ -225,10 +233,13 @@ export function GraphCanvas({
       const labelSource = informativeNodeLabel(node);
       const shouldShowLabel =
         node.type === "disease" ||
-        nodes.length <= 22 ||
         selectedNodeId === node.id ||
         activeNodeSet.has(node.id) ||
-        autoLabelNodeIds.has(node.id);
+        autoLabelNodeIds.has(node.id) ||
+        (node.type !== "interaction" && nodes.length <= 16) ||
+        (node.type === "target" && nodes.length <= 36) ||
+        (node.type === "pathway" && nodes.length <= 24) ||
+        (node.type === "drug" && nodes.length <= 24);
 
       const classes = [
         hasFocusedSubset && !activeNodeSet.has(node.id) ? "is-faded" : "",
@@ -254,10 +265,14 @@ export function GraphCanvas({
       } satisfies ElementDefinition;
     });
 
-    const edgeElements = edges.map((edge) => {
+    const edgeElements = validEdges.map((edge) => {
+      const showEdgeLabel =
+        activeEdgeSet.has(edge.id) ||
+        (edge.type !== "target_target" && (edge.weight ?? 0) >= 0.92 && nodes.length <= 60);
       const classes = [
         hasFocusedSubset && !activeEdgeSet.has(edge.id) ? "is-faded" : "",
         activeEdgeSet.has(edge.id) ? "is-focused" : "",
+        showEdgeLabel ? "label-visible" : "",
       ]
         .filter(Boolean)
         .join(" ");
@@ -268,6 +283,16 @@ export function GraphCanvas({
           source: edge.source,
           target: edge.target,
           type: edge.type,
+          label:
+            edge.type === "disease_target"
+              ? "association"
+              : edge.type === "target_pathway"
+                ? "pathway"
+                : edge.type === "target_drug"
+                  ? "drug link"
+                  : edge.type === "target_target"
+                    ? "interaction"
+                    : "mechanism link",
           weight: edge.weight ?? 0.4,
           color: edgeColors[edge.type],
         },
@@ -280,7 +305,7 @@ export function GraphCanvas({
     activeEdgeSet,
     activeNodeSet,
     autoLabelNodeIds,
-    edges,
+    validEdges,
     hasFocusedSubset,
     nodes,
     selectedNodeId,
@@ -300,11 +325,13 @@ export function GraphCanvas({
           "font-family": "var(--font-body)",
           "text-wrap": "wrap",
           "text-max-width": 124,
+          "min-zoomed-font-size": 7,
           "text-background-color": "#ffffff",
           "text-background-opacity": 0.9,
           "text-background-shape": "roundrectangle",
+          "text-background-padding": "1.4px",
           "text-border-width": 1,
-          "text-border-color": "#d7d2ff",
+          "text-border-color": "#ffd7b1",
           "text-border-opacity": 0.85,
           "text-margin-y": 12,
           "text-valign": "bottom",
@@ -313,7 +340,7 @@ export function GraphCanvas({
           "overlay-opacity": 0,
           "shadow-blur": 10,
           "shadow-opacity": 0.18,
-          "shadow-color": "#7d73d8",
+          "shadow-color": "#d28a3a",
         },
       },
       {
@@ -355,9 +382,9 @@ export function GraphCanvas({
         selector: "node.is-selected",
         style: {
           "border-width": 2.6,
-          "border-color": "#f08b2e",
+          "border-color": "#f0872d",
           "shadow-opacity": 0.34,
-          "shadow-color": "#f08b2e",
+          "shadow-color": "#f0872d",
         },
       },
       {
@@ -374,6 +401,9 @@ export function GraphCanvas({
           "line-color": "data(color)",
           "target-arrow-color": "data(color)",
           "target-arrow-shape": "triangle",
+          "source-endpoint": "outside-to-node",
+          "target-endpoint": "outside-to-node",
+          "line-cap": "round",
           "arrow-scale": 0.9,
           "curve-style": "bezier",
           opacity: 0.84,
@@ -383,6 +413,7 @@ export function GraphCanvas({
         selector: "edge[type = 'target_target']",
         style: {
           "curve-style": "unbundled-bezier",
+          "edge-distances": "node-position",
           "control-point-distances": [24],
           "control-point-weights": [0.5],
         },
@@ -398,6 +429,21 @@ export function GraphCanvas({
         style: {
           opacity: 0.96,
           width: "mapData(weight, 0, 1, 2, 4.6)",
+        },
+      },
+      {
+        selector: "edge.label-visible",
+        style: {
+          label: "data(label)",
+          "font-size": 9,
+          color: "#8a4d1a",
+          "text-background-color": "#fff5e8",
+          "text-background-opacity": 0.92,
+          "text-background-shape": "roundrectangle",
+          "text-border-width": 0.8,
+          "text-border-color": "#f8c99b",
+          "text-border-opacity": 0.9,
+          "text-rotation": "autorotate",
         },
       },
     ],
@@ -448,12 +494,27 @@ export function GraphCanvas({
     );
 
     layout.on("layoutstop", () => {
-      cy.fit(undefined, 28);
+      const padding = nodes.length <= 12 ? 36 : nodes.length <= 40 ? 32 : 26;
+      cy.fit(undefined, padding);
       const currentZoom = cy.zoom();
-      if (currentZoom < 0.56) {
-        cy.zoom(0.56);
-      }
-      cy.zoom(clampZoom(cy.zoom()));
+      const maxPreferredZoom =
+        nodes.length <= 5
+          ? 0.95
+          : nodes.length <= 12
+            ? 1.08
+            : nodes.length <= 30
+              ? 1.18
+              : 1.35;
+      const minPreferredZoom =
+        nodes.length >= 130
+          ? 0.34
+          : nodes.length >= 80
+            ? 0.4
+            : nodes.length >= 40
+              ? 0.46
+              : 0.52;
+      const bounded = Math.max(minPreferredZoom, Math.min(currentZoom, maxPreferredZoom));
+      cy.zoom(clampZoom(bounded));
       cy.center();
     });
 
@@ -489,7 +550,7 @@ export function GraphCanvas({
           for (let i = 0; i < path.length - 1; i += 1) {
             const from = path[i]!;
             const to = path[i + 1]!;
-            const hit = edges.find(
+            const hit = validEdges.find(
               (edge) =>
                 (edge.source === from && edge.target === to) ||
                 (edge.source === to && edge.target === from),
@@ -521,7 +582,7 @@ export function GraphCanvas({
       const neighborhood = new Set<string>([nodeId, ...neighbors]);
       const focusEdges = new Set<string>();
 
-      for (const edge of edges) {
+      for (const edge of validEdges) {
         if (neighborhood.has(edge.source) && neighborhood.has(edge.target)) {
           focusEdges.add(edge.id);
         }
@@ -541,7 +602,7 @@ export function GraphCanvas({
       cy.off("tap", "node", onTapNode);
       cy.off("cxttap", "node", onRightTapNode);
     };
-  }, [adjacency, cy, edges, nodeMap, onSelectNode, pathAnchorNodeId]);
+  }, [adjacency, cy, nodeMap, onSelectNode, pathAnchorNodeId, validEdges]);
 
   const nodeCounts = useMemo(
     () =>
@@ -565,7 +626,7 @@ export function GraphCanvas({
       className={
         fullscreen
           ? "fixed inset-0 z-40 rounded-none border-0 bg-[#f2f2ff] p-3"
-          : "relative min-h-[460px] overflow-hidden rounded-xl border border-[#d7d2ff] bg-[linear-gradient(180deg,#fcfbff_0%,#f1f3ff_100%)] shadow-[0_26px_72px_rgba(77,65,170,0.18)]"
+          : "relative min-h-[460px] overflow-hidden rounded-xl border border-[#f2dac4] bg-[linear-gradient(180deg,#fffdf8_0%,#fff5ec_100%)] shadow-[0_26px_72px_rgba(170,107,42,0.18)]"
       }
     >
       <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
@@ -582,7 +643,7 @@ export function GraphCanvas({
             cy.center();
           }}
           title="Fit graph"
-          className="border-[#d7d2ff] bg-white text-[#4a4390] hover:bg-[#f2efff]"
+          className="border-[#f1d8c2] bg-white text-[#8b4f1a] hover:bg-[#fff2e5]"
         >
           <LocateFixed className="h-4 w-4" />
         </Button>
@@ -602,7 +663,7 @@ export function GraphCanvas({
             a.download = "targetgraph-network.png";
             a.click();
           }}
-          className="border-[#d7d2ff] bg-white text-[#4a4390] hover:bg-[#f2efff]"
+          className="border-[#f1d8c2] bg-white text-[#8b4f1a] hover:bg-[#fff2e5]"
         >
           <Camera className="h-4 w-4" />
         </Button>
@@ -611,21 +672,21 @@ export function GraphCanvas({
           size="icon"
           variant="secondary"
           onClick={() => setFullscreen((prev) => !prev)}
-          className="border-[#d7d2ff] bg-white text-[#4a4390] hover:bg-[#f2efff]"
+          className="border-[#f1d8c2] bg-white text-[#8b4f1a] hover:bg-[#fff2e5]"
         >
           {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
         </Button>
       </div>
 
-      <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-xl border border-[#ddd9ff] bg-white/92 px-3 py-2 text-[11px] text-[#5c56a0] backdrop-blur">
-        <div className="mb-1 font-semibold text-[#342f7b]">Live Graph</div>
+      <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-xl border border-[#f1d8c2] bg-white/92 px-3 py-2 text-[11px] text-[#885527] backdrop-blur">
+        <div className="mb-1 font-semibold text-[#6e3f17]">Live Graph</div>
         <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
           <span>Disease: {nodeCounts.disease ?? 0}</span>
           <span>Targets: {nodeCounts.target ?? 0}</span>
           <span>Pathways: {nodeCounts.pathway ?? 0}</span>
           <span>Drugs: {nodeCounts.drug ?? 0}</span>
           <span>Interactions: {nodeCounts.interaction ?? 0}</span>
-          <span>Edges: {edges.length}</span>
+          <span>Edges: {validEdges.length}</span>
         </div>
         {hiddenSummary && hiddenSummary.hiddenEdges > 0 ? (
           <div className="mt-1 rounded-md border border-[#f3d1ab] bg-[#fff7ec] px-2 py-1 text-[10px] text-[#8f5b2d]">
@@ -650,13 +711,13 @@ export function GraphCanvas({
 
       {nodes.length === 0 ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-          <div className="rounded-full border border-[#ddd9ff] bg-white px-4 py-2 text-xs font-medium text-[#4e488f]">
+          <div className="rounded-full border border-[#f1d8c2] bg-white px-4 py-2 text-xs font-medium text-[#8b4f1a]">
             Building core network...
           </div>
         </div>
       ) : null}
 
-      <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-[#ddd9ff] bg-white/92 px-2.5 py-1.5 text-[10px] text-[#6962a8]">
+      <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-[#f1d8c2] bg-white/92 px-2.5 py-1.5 text-[10px] text-[#94633a]">
         Right-click: neighborhood focus • Shift-click two nodes: shortest path
       </div>
     </div>

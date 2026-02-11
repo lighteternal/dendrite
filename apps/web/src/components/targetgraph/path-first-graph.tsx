@@ -97,17 +97,17 @@ export function PathFirstGraph({
       }
     };
 
-    const dominantTargetIds = [...primaryTargetIds].slice(0, showInteractionContext ? 8 : 6);
+    const dominantTargetIds = [...primaryTargetIds].slice(0, showInteractionContext ? 6 : 4);
 
     for (const targetId of dominantTargetIds) {
       if (showPathwayContext) {
-        addTopEdgesForTarget(targetId, "target_pathway", 4);
+        addTopEdgesForTarget(targetId, "target_pathway", 2);
       }
       if (showDrugContext) {
-        addTopEdgesForTarget(targetId, "target_drug", 4);
+        addTopEdgesForTarget(targetId, "target_drug", 2);
       }
       if (showInteractionContext) {
-        addTopEdgesForTarget(targetId, "target_target", 4);
+        addTopEdgesForTarget(targetId, "target_target", 2);
       }
     }
 
@@ -119,14 +119,24 @@ export function PathFirstGraph({
       }
     }
 
-    // Backfill with strongest global edges to avoid overly sparse "single-thread" rendering.
-    const minVisibleEdges = showInteractionContext ? 70 : 48;
+    // Keep graph readable by adding only edges that stay anchored to the disease/lead-target neighborhood.
+    const minVisibleEdges = showInteractionContext ? 38 : 24;
     if (selectedEdgeIds.size < minVisibleEdges) {
+      const anchorNodeIds = new Set<string>([
+        ...(diseaseNode ? [diseaseNode.id] : []),
+        ...primaryTargetIds,
+      ]);
       for (const edge of [...edges].sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))) {
         if (selectedEdgeIds.has(edge.id)) continue;
         if (!showInteractionContext && edge.type === "target_target") continue;
         if (!showPathwayContext && edge.type === "target_pathway") continue;
         if (!showDrugContext && edge.type === "target_drug") continue;
+        const anchored =
+          anchorNodeIds.has(edge.source) ||
+          anchorNodeIds.has(edge.target) ||
+          focusNodeIds.has(edge.source) ||
+          focusNodeIds.has(edge.target);
+        if (!anchored) continue;
         selectedEdgeIds.add(edge.id);
         focusNodeIds.add(edge.source);
         focusNodeIds.add(edge.target);
@@ -143,7 +153,7 @@ export function PathFirstGraph({
       return 1;
     };
 
-    const maxEdges = showInteractionContext ? 220 : 170;
+    const maxEdges = showInteractionContext ? 120 : 90;
     const visibleEdges = edges
       .filter((edge) => selectedEdgeIds.has(edge.id))
       .sort((a, b) => {
@@ -165,7 +175,7 @@ export function PathFirstGraph({
     const hiddenNodes = Math.max(0, nodes.length - visibleNodes.length);
     const summaryPrefix =
       pathUpdate?.summary ??
-      `Showing predominant threads across ${primaryTargetIds.size} lead targets`;
+      `Showing predominant ${showInteractionContext ? "mechanistic" : "translational"} connections across ${primaryTargetIds.size} lead targets`;
     const summary =
       hiddenEdges > 0
         ? `${summaryPrefix}. +${hiddenEdges} additional edges hidden for readability.`

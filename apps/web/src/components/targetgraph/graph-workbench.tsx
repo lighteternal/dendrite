@@ -14,8 +14,10 @@ import {
   RefreshCw,
   Search,
   Sparkles,
+  Telescope,
 } from "lucide-react";
 import { BuildStepper } from "@/components/targetgraph/build-stepper";
+import { DeepDiscoverer } from "@/components/targetgraph/deep-discoverer";
 import { buildEvidenceTable } from "@/components/targetgraph/evidence";
 import { HypothesisPanel } from "@/components/targetgraph/hypothesis-panel";
 import { MechanismSankey } from "@/components/targetgraph/mechanism-sankey";
@@ -28,6 +30,7 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { GraphEdge } from "@/lib/contracts";
+import type { DiscoverEntity } from "@/hooks/useDeepDiscoverStream";
 import { useGraphStream } from "@/hooks/useGraphStream";
 import { toast } from "sonner";
 
@@ -43,7 +46,7 @@ type BuildProfile = {
   literature: boolean;
 };
 
-type WorkspaceView = "network" | "evidence" | "hypothesis";
+type WorkspaceView = "network" | "evidence" | "hypothesis" | "discoverer";
 type ConnectionLens = "balanced" | "evidence" | "drugability" | "mechanism";
 
 type Props = {
@@ -73,6 +76,10 @@ const lensLabel: Record<ConnectionLens, string> = {
   drugability: "Drug-actionability",
   mechanism: "Pathway-mechanism",
 };
+
+function normalizeLookupValue(value: string): string {
+  return value.trim().toLowerCase();
+}
 
 function edgePriority(edge: GraphEdge, lens: ConnectionLens): number {
   const weight = typeof edge.weight === "number" ? edge.weight : 0.4;
@@ -219,12 +226,57 @@ export function GraphWorkbench({
     const baseEdges = stream.edges.filter(
       (edge) => baseNodeIdSet.has(edge.source) && baseNodeIdSet.has(edge.target),
     );
-
-    const sortedEdges = [...baseEdges]
+    const scored = [...baseEdges]
       .map((edge) => ({ edge, score: edgePriority(edge, connectionLens) }))
       .sort((a, b) => b.score - a.score || a.edge.id.localeCompare(b.edge.id));
 
-    const keptEdges = sortedEdges.slice(0, Math.min(edgeBudget, sortedEdges.length)).map((item) => item.edge);
+    const grouped: Record<GraphEdge["type"], Array<{ edge: GraphEdge; score: number }>> = {
+      disease_target: [],
+      target_pathway: [],
+      target_drug: [],
+      target_target: [],
+      pathway_drug: [],
+    };
+    for (const item of scored) {
+      grouped[item.edge.type].push(item);
+    }
+
+    const selected = new Map<string, GraphEdge>();
+    const pick = (type: GraphEdge["type"], count: number) => {
+      if (count <= 0) return;
+      let picked = 0;
+      for (const item of grouped[type]) {
+        if (selected.size >= edgeBudget) break;
+        if (selected.has(item.edge.id)) continue;
+        selected.set(item.edge.id, item.edge);
+        picked += 1;
+        if (picked >= count) break;
+      }
+    };
+
+    const diseaseFloor = Math.min(
+      grouped.disease_target.length,
+      Math.max(8, Math.floor(edgeBudget * 0.18)),
+    );
+    pick("disease_target", diseaseFloor);
+
+    const remainingBudget = Math.max(0, edgeBudget - selected.size);
+    const pathwayQuota = showPathways ? Math.max(14, Math.floor(remainingBudget * 0.36)) : 0;
+    const drugQuota = showDrugs ? Math.max(14, Math.floor(remainingBudget * 0.42)) : 0;
+    const interactionQuota = showInteractions ? Math.max(8, Math.floor(remainingBudget * 0.18)) : 0;
+
+    pick("target_pathway", pathwayQuota);
+    pick("pathway_drug", Math.floor(pathwayQuota * 0.5));
+    pick("target_drug", drugQuota);
+    pick("target_target", interactionQuota);
+
+    for (const item of scored) {
+      if (selected.size >= edgeBudget) break;
+      if (selected.has(item.edge.id)) continue;
+      selected.set(item.edge.id, item.edge);
+    }
+
+    const keptEdges = [...selected.values()];
 
     const visibleNodeIds = new Set<string>();
     for (const edge of keptEdges) {
@@ -282,6 +334,26 @@ export function GraphWorkbench({
     };
   }, [stream.ranking]);
 
+  const executiveNarrative = useMemo(() => {
+    if (!stream.ranking) {
+      return [
+        "Target ranking is still running. Early graph structure is already explorable while narrative synthesis completes.",
+      ];
+    }
+
+    const top = stream.ranking.rankedTargets[0];
+    const topReason = top?.reasons?.[0] ?? "not provided";
+    const caveat = top?.caveats?.[0] ?? stream.ranking.systemSummary.dataGaps[0] ?? "not provided";
+    const anchors = stream.ranking.systemSummary.keyPathways.slice(0, 3);
+
+    return [
+      `Current strongest lever: ${top?.symbol ?? "not provided"} (${top ? top.score.toFixed(3) : "not provided"}).`,
+      `Why now: ${topReason}`,
+      `Mechanism anchors in this run: ${anchors.length > 0 ? anchors.join(", ") : "not provided"}.`,
+      `Primary caveat: ${caveat}`,
+    ];
+  }, [stream.ranking]);
+
   const pipelineElapsedMs = useMemo(() => {
     const done = stream.statuses.P6;
     if (done && done.pct >= 100) return done.elapsedMs;
@@ -290,17 +362,32 @@ export function GraphWorkbench({
     return phases.reduce((best, item) => (item.elapsedMs > best ? item.elapsedMs : best), 0);
   }, [stream.statuses]);
 
-  const nodeIdsByLabel = useMemo(() => {
+  const nodeLookup = useMemo(() => {
     const map = new Map<string, string[]>();
+    const add = (key: string, nodeId: string) => {
+      const normalized = normalizeLookupValue(key);
+      if (!normalized) return;
+      map.set(normalized, [...(map.get(normalized) ?? []), nodeId]);
+    };
+
     for (const node of stream.nodes) {
-      map.set(node.label, [...(map.get(node.label) ?? []), node.id]);
+      add(node.label, node.id);
+      add(node.primaryId, node.id);
+      add(`${node.type}:${node.primaryId}`, node.id);
+
+      const displayName =
+        typeof node.meta.displayName === "string" ? node.meta.displayName : undefined;
+      const targetSymbol =
+        typeof node.meta.targetSymbol === "string" ? node.meta.targetSymbol : undefined;
+      if (displayName) add(displayName, node.id);
+      if (targetSymbol) add(targetSymbol, node.id);
     }
     return map;
   }, [stream.nodes]);
 
   const onSankeyBandClick = (source: string, target: string) => {
-    const sourceNodes = nodeIdsByLabel.get(source) ?? [];
-    const targetNodes = nodeIdsByLabel.get(target) ?? [];
+    const sourceNodes = nodeLookup.get(normalizeLookupValue(source)) ?? [];
+    const targetNodes = nodeLookup.get(normalizeLookupValue(target)) ?? [];
     const sourceSet = new Set(sourceNodes);
     const targetSet = new Set(targetNodes);
     const nodeIds = new Set<string>([...sourceNodes, ...targetNodes]);
@@ -308,6 +395,36 @@ export function GraphWorkbench({
 
     for (const edge of stream.edges) {
       if (sourceSet.has(edge.source) && targetSet.has(edge.target)) {
+        edgeIds.add(edge.id);
+      }
+    }
+
+    setWorkspaceView("network");
+    setHighlightedNodeIds(nodeIds);
+    setHighlightedEdgeIds(edgeIds);
+  };
+
+  const focusDiscovererEntities = (entities: DiscoverEntity[]) => {
+    if (entities.length === 0) return;
+
+    const nodeIds = new Set<string>();
+    for (const entity of entities) {
+      if (entity.primaryId) {
+        const idsByPrimary = nodeLookup.get(
+          normalizeLookupValue(`${entity.type}:${entity.primaryId}`),
+        );
+        idsByPrimary?.forEach((id) => nodeIds.add(id));
+      }
+
+      const idsByLabel = nodeLookup.get(normalizeLookupValue(entity.label));
+      idsByLabel?.forEach((id) => nodeIds.add(id));
+    }
+
+    if (nodeIds.size === 0) return;
+
+    const edgeIds = new Set<string>();
+    for (const edge of stream.edges) {
+      if (nodeIds.has(edge.source) && nodeIds.has(edge.target)) {
         edgeIds.add(edge.id);
       }
     }
@@ -478,7 +595,7 @@ export function GraphWorkbench({
       </CardHeader>
       <CardContent className="space-y-2">
         <div className="text-xs text-[#6560a5]">
-          You do not need to start over each time. Run new diseases from the top bar or pick a recent case.
+          Run Network, Evidence, Hypothesis, or Discoverer workflows without restarting the case.
         </div>
         <div className="flex flex-wrap gap-2">
           {recentCases.length === 0 ? (
@@ -514,7 +631,8 @@ export function GraphWorkbench({
       <CardHeader className="pb-2">
         <CardTitle className="text-sm text-[#342f7b]">Executive Readout</CardTitle>
       </CardHeader>
-      <CardContent className="grid gap-2 text-xs text-[#575299] md:grid-cols-3">
+      <CardContent className="space-y-2 text-xs text-[#575299]">
+        <div className="grid gap-2 md:grid-cols-3">
         <div className="rounded-lg border border-[#e0dcff] bg-[#f7f5ff] p-2">
           <div className="text-[11px] uppercase tracking-[0.12em] text-[#7f79b8]">Top target</div>
           <div className="mt-1 text-sm font-semibold text-[#342f7b]">
@@ -544,6 +662,15 @@ export function GraphWorkbench({
             {(decisionBrief?.gaps ?? []).length > 0
               ? decisionBrief?.gaps.join(" • ")
               : "Data-gap summary pending ranking output."}
+          </div>
+        </div>
+        </div>
+        <div className="rounded-lg border border-[#f3d1ab] bg-[#fff7ec] p-2">
+          <div className="text-[11px] uppercase tracking-[0.12em] text-[#a7692a]">Natural language brief</div>
+          <div className="mt-1 space-y-1 leading-5 text-[#83552c]">
+            {executiveNarrative.map((line, index) => (
+              <div key={`${line}-${index}`}>{line}</div>
+            ))}
           </div>
         </div>
       </CardContent>
@@ -670,10 +797,11 @@ export function GraphWorkbench({
         onValueChange={(value) => setWorkspaceView(value as WorkspaceView)}
         className="px-3 pt-3 md:px-6"
       >
-        <TabsList className="grid w-full max-w-[780px] grid-cols-3 border border-[#ddd9ff] bg-white/95">
+        <TabsList className="grid w-full max-w-[980px] grid-cols-4 border border-[#ddd9ff] bg-white/95">
           <TabsTrigger value="network" className="gap-1"><Network className="h-3.5 w-3.5" /> Network</TabsTrigger>
           <TabsTrigger value="evidence" className="gap-1"><ListTree className="h-3.5 w-3.5" /> Evidence</TabsTrigger>
           <TabsTrigger value="hypothesis" className="gap-1"><Brain className="h-3.5 w-3.5" /> Hypothesis</TabsTrigger>
+          <TabsTrigger value="discoverer" className="gap-1"><Telescope className="h-3.5 w-3.5" /> Discoverer</TabsTrigger>
         </TabsList>
 
         <TabsContent value="network" className="mt-3">
@@ -803,6 +931,49 @@ export function GraphWorkbench({
                   lens: lensLabel[connectionLens],
                 }}
               />
+              {mechanismCard}
+            </div>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="discoverer" className="mt-3">
+          <div className="grid gap-3 xl:grid-cols-[420px_minmax(0,1fr)]">
+            <div className="space-y-3 xl:sticky xl:top-[182px] xl:self-start">
+              <DeepDiscoverer
+                diseaseQuery={diseaseQuery}
+                diseaseId={diseaseNode?.primaryId ?? null}
+                onFocusEntities={focusDiscovererEntities}
+              />
+              {caseControlsCard}
+            </div>
+
+            <div className="space-y-3">
+              {executiveCard}
+              <Card className="border-[#d7d2ff] bg-white/95">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm text-[#342f7b]">Discovery Graph Focus</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <div className="rounded-lg border border-[#f3d1ab] bg-[#fff7ec] px-2.5 py-2 text-[11px] text-[#8b5b2f]">
+                    Click any journey event to focus the graph on entities surfaced by the agent.
+                  </div>
+                  <GraphCanvas
+                    nodes={filtered.nodes}
+                    edges={filtered.edges}
+                    selectedNodeId={selectedNodeId}
+                    onSelectNode={(node) => {
+                      setSelectedNodeId(node?.id ?? null);
+                    }}
+                    highlightedNodeIds={highlightedNodeIds}
+                    highlightedEdgeIds={highlightedEdgeIds}
+                    hiddenSummary={{
+                      hiddenNodes: filtered.hiddenNodes,
+                      hiddenEdges: filtered.hiddenEdges,
+                      lens: lensLabel[connectionLens],
+                    }}
+                  />
+                </CardContent>
+              </Card>
               {mechanismCard}
             </div>
           </div>

@@ -53,9 +53,48 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
       }
     }
 
-    const ranked = [...aggregated.values()]
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 22);
+    const allRanked = [...aggregated.values()].sort((a, b) => b.value - a.value);
+    const byTypePair = new Map<string, SankeyRow[]>();
+    for (const row of allRanked) {
+      const key = `${row.sourceType}->${row.targetType}`;
+      byTypePair.set(key, [...(byTypePair.get(key) ?? []), row]);
+    }
+
+    const selected: SankeyRow[] = [];
+    const selectedKeys = new Set<string>();
+    const pick = (pair: string, count: number) => {
+      const list = byTypePair.get(pair) ?? [];
+      for (const row of list) {
+        if (selected.length >= 72) break;
+        const rowKey = `${row.sourceType}:${row.source}=>${row.targetType}:${row.target}`;
+        if (selectedKeys.has(rowKey)) continue;
+        selected.push(row);
+        selectedKeys.add(rowKey);
+        if (
+          selected.filter(
+            (item) => `${item.sourceType}->${item.targetType}` === pair,
+          ).length >= count
+        ) {
+          break;
+        }
+      }
+    };
+
+    pick("disease->target", 10);
+    pick("target->pathway", 20);
+    pick("disease->pathway", 12);
+    pick("pathway->drug", 20);
+    pick("target->drug", 24);
+
+    for (const row of allRanked) {
+      if (selected.length >= 72) break;
+      const rowKey = `${row.sourceType}:${row.source}=>${row.targetType}:${row.target}`;
+      if (selectedKeys.has(rowKey)) continue;
+      selected.push(row);
+      selectedKeys.add(rowKey);
+    }
+
+    const ranked = selected;
 
     const nodesById = new Map<string, FlowNode>();
     const links: FlowLink[] = [];
@@ -102,7 +141,7 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
 
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_280px]">
-      <div className="h-[360px] rounded-xl border border-[#ddd9ff] bg-[#fefeff] p-2">
+      <div className="h-[390px] rounded-xl border border-[#ddd9ff] bg-[#fefeff] p-2">
         <ResponsiveSankey
           data={{
             nodes,
@@ -116,7 +155,7 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
           nodeBorderWidth={1}
           nodeBorderColor="#ece9ff"
           nodeThickness={14}
-          nodeSpacing={18}
+          nodeSpacing={14}
           linkOpacity={0.48}
           linkHoverOpacity={0.82}
           linkBlendMode="multiply"
@@ -191,6 +230,9 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
               </div>
               <div className="mt-1 line-clamp-2">
                 {truncateLabel(flow.source, 26)} → {truncateLabel(flow.target, 26)}
+              </div>
+              <div className="mt-1 text-[10px] uppercase tracking-[0.12em] text-[#8a84bf]">
+                {flow.sourceType} → {flow.targetType}
               </div>
             </button>
           ))}

@@ -34,9 +34,9 @@ export const appConfig = {
     phaseTimeoutMs: parseNumber(process.env.PHASE_TIMEOUT_MS, 12_000),
     batchMinDelayMs: parseNumber(process.env.STREAM_BATCH_MIN_DELAY_MS, 120),
     batchMaxDelayMs: parseNumber(process.env.STREAM_BATCH_MAX_DELAY_MS, 320),
-    rankingTimeoutMs: parseNumber(process.env.STREAM_RANKING_TIMEOUT_MS, 2_000),
-    p5BudgetMs: parseNumber(process.env.STREAM_P5_BUDGET_MS, 14_000),
-    p5PerTargetTimeoutMs: parseNumber(process.env.STREAM_P5_PER_TARGET_TIMEOUT_MS, 6_000),
+    rankingTimeoutMs: parseNumber(process.env.STREAM_RANKING_TIMEOUT_MS, 10_000),
+    p5BudgetMs: parseNumber(process.env.STREAM_P5_BUDGET_MS, 10_000),
+    p5PerTargetTimeoutMs: parseNumber(process.env.STREAM_P5_PER_TARGET_TIMEOUT_MS, 3_500),
     maxLiteratureTargets: parseNumber(process.env.STREAM_MAX_LITERATURE_TARGETS, 5),
   },
   string: {

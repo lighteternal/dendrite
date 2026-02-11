@@ -85,7 +85,7 @@ export function LandingPage() {
             </Badge>
           </div>
           <h1 className="max-w-5xl text-4xl font-semibold leading-tight tracking-tight text-[#2a2574] md:text-6xl">
-            Disease-to-target system mapping for translational teams
+            Biology-first disease-to-target decision workspace
           </h1>
           <p className="max-w-4xl text-sm leading-7 text-[#3d3a7e] md:text-base">{APP_QUESTION}</p>
           <div className="inline-flex rounded-full border border-[#f2c38b] bg-[#fff6e8] px-4 py-2 text-xs font-medium text-[#9a5510]">

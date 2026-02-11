@@ -29,8 +29,10 @@ type RenderNode = NodeObject & {
   id: string;
   type: GraphNode["type"];
   label: string;
+  displayLabel: string;
   size: number;
   score: number;
+  degree: number;
   color: string;
 };
 
@@ -146,6 +148,39 @@ function shortLabel(value: string, max = 24): string {
   return `${value.slice(0, Math.max(8, max - 1))}\u2026`;
 }
 
+function hashLabelAngle(value: string): number {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 33 + value.charCodeAt(i)) >>> 0;
+  }
+  return (hash % 360) * (Math.PI / 180);
+}
+
+function informativeNodeLabel(node: GraphNode): string {
+  const displayName =
+    typeof node.meta.displayName === "string" && node.meta.displayName.trim().length > 0
+      ? node.meta.displayName.trim()
+      : undefined;
+  const targetSymbol =
+    typeof node.meta.targetSymbol === "string" && node.meta.targetSymbol.trim().length > 0
+      ? node.meta.targetSymbol.trim()
+      : undefined;
+
+  if (node.type === "target") {
+    return targetSymbol ?? displayName ?? node.label;
+  }
+
+  if (node.type === "pathway") {
+    return displayName ?? node.label;
+  }
+
+  if (node.type === "drug") {
+    return displayName ?? node.label;
+  }
+
+  return displayName ?? node.label;
+}
+
 function collides(a: LabelRect, b: LabelRect, pad = 3): boolean {
   return !(
     a.right + pad < b.left ||
@@ -203,17 +238,28 @@ export function GraphCanvas({
     return map;
   }, [edges]);
 
+  const nodeDegree = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const edge of edges) {
+      map.set(edge.source, (map.get(edge.source) ?? 0) + 1);
+      map.set(edge.target, (map.get(edge.target) ?? 0) + 1);
+    }
+    return map;
+  }, [edges]);
+
   const renderNodes = useMemo<RenderNode[]>(
     () =>
       nodes.map((node) => ({
         id: node.id,
         type: node.type,
         label: node.label,
+        displayLabel: informativeNodeLabel(node),
         size: node.size ?? 18,
         score: node.score ?? 0,
+        degree: nodeDegree.get(node.id) ?? 0,
         color: nodeColors[node.type],
       })),
-    [nodes],
+    [nodeDegree, nodes],
   );
 
   const renderLinks = useMemo<RenderLink[]>(
@@ -242,6 +288,22 @@ export function GraphCanvas({
   );
 
   const hasFocusedSubset = activeNodeSet.size > 0 || activeEdgeSet.size > 0;
+
+  const autoLabelNodeIds = useMemo(() => {
+    const pick = (type: GraphNode["type"], count: number, field: "score" | "degree") =>
+      [...renderNodes]
+        .filter((node) => node.type === type)
+        .sort((a, b) => (b[field] ?? 0) - (a[field] ?? 0))
+        .slice(0, count)
+        .map((node) => node.id);
+
+    return new Set<string>([
+      ...pick("disease", 2, "score"),
+      ...pick("target", 6, "score"),
+      ...pick("pathway", 5, "degree"),
+      ...pick("drug", 5, "degree"),
+    ]);
+  }, [renderNodes]);
 
   useEffect(() => {
     if (nodes.length === 0 || !fgRef.current) {
@@ -282,16 +344,16 @@ export function GraphCanvas({
     chargeForce?.strength((node: RenderNode) => {
       switch (node.type) {
         case "disease":
-          return -760;
+          return -920;
         case "target":
-          return -360;
+          return -560;
         case "pathway":
-          return -280;
+          return -330;
         case "drug":
-          return -200;
+          return -250;
         case "interaction":
         default:
-          return -155;
+          return -180;
       }
     });
 
@@ -304,27 +366,27 @@ export function GraphCanvas({
     linkForce?.distance((link: RenderLink) => {
       switch (link.type) {
         case "disease_target":
-          return 130;
+          return 190;
         case "target_pathway":
-          return 118;
+          return 168;
         case "target_drug":
-          return 86;
+          return 150;
         case "target_target":
-          return 78;
+          return 220;
         case "pathway_drug":
         default:
-          return 102;
+          return 182;
       }
     });
     linkForce?.strength((link: RenderLink) => {
-      return link.type === "target_target" ? 0.08 : 0.14;
+      return link.type === "target_target" ? 0.03 : 0.11;
     });
 
     const collideForce = graph.d3Force("collide") as
       | { radius: (value: number | ((node: RenderNode) => number)) => void }
       | undefined;
     collideForce?.radius((node: RenderNode) =>
-      Math.max(9, Math.min(28, 8 + (node.size ?? 16) * 0.24)),
+      Math.max(10, Math.min(32, 10 + (node.size ?? 16) * 0.24)),
     );
 
     graph.d3ReheatSimulation();
@@ -522,23 +584,32 @@ export function GraphCanvas({
             selected ||
             activeNodeSet.has(n.id) ||
             hoverNodeId === n.id ||
-            (n.type === "target" && (n.score ?? 0) >= 0.7) ||
-            globalScale > 2.35;
+            autoLabelNodeIds.has(n.id) ||
+            globalScale > 2.45;
 
           if (!showLabel) return;
 
           const prominent = selected || hoverNodeId === n.id || activeNodeSet.has(n.id);
-          const label = prominent ? n.label : shortLabel(n.label);
+          const label = prominent
+            ? n.displayLabel
+            : shortLabel(
+                n.displayLabel,
+                n.type === "target" ? 14 : n.type === "pathway" ? 24 : 22,
+              );
           const fontSize = Math.max(9, 11 / globalScale);
           ctx.font = `${fontSize}px var(--font-body)`;
           const widthWithPadding = ctx.measureText(label).width + 8;
           const absX = typeof n.x === "number" ? n.x : 0;
           const absY = typeof n.y === "number" ? n.y : 0;
-          const mag = Math.hypot(absX, absY) || 1;
-          const ux = absX / mag;
-          const uy = absY / mag;
-          const x = ux * (radius + 11);
-          const y = uy * (radius + 11);
+          const distanceFromCenter = Math.hypot(absX, absY);
+          const angle = hashLabelAngle(n.id);
+          const radialX = distanceFromCenter < 52 ? Math.cos(angle) : absX / distanceFromCenter;
+          const radialY = distanceFromCenter < 52 ? Math.sin(angle) : absY / distanceFromCenter;
+          const tangentX = -radialY;
+          const tangentY = radialX;
+          const jitter = ((Math.floor((angle * 1000) % 5) || 0) - 2) * (prominent ? 1.8 : 2.6);
+          const x = radialX * (radius + (prominent ? 14 : 11)) + tangentX * jitter;
+          const y = radialY * (radius + (prominent ? 14 : 11)) + tangentY * jitter;
 
           const rect: LabelRect = {
             left: absX + x - widthWithPadding / 2,
@@ -579,7 +650,7 @@ export function GraphCanvas({
           if (!hasFocusedSubset) return base;
           return activeEdgeSet.has(l.id) ? Math.max(base, 2.4) : 0.6;
         }}
-        linkCurvature={(link) => ((link as RenderLink).type === "target_target" ? 0.18 : 0.08)}
+        linkCurvature={(link) => ((link as RenderLink).type === "target_target" ? 0.24 : 0.08)}
       />
 
       {nodes.length === 0 ? (

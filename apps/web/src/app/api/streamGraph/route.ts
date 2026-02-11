@@ -32,6 +32,8 @@ type PipelinePhase = "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6";
 
 type SourceHealthState = Record<SourceName, "green" | "yellow" | "red">;
 
+const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
+
 function cleanText(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -234,7 +236,7 @@ export async function GET(request: NextRequest) {
             }
           } else {
             const diseases = await withTimeout(searchDiseases(diseaseQuery, 8), phaseTimeoutMs);
-            const disease = diseases[0];
+            const disease = diseases.find((item) => diseaseEntityPattern.test(item.id)) ?? diseases[0];
             diseaseId = disease?.id ?? `QUERY_${diseaseQuery.replace(/\s+/g, "_")}`;
             diseaseName = disease?.name ?? diseaseQuery;
             diseaseDescription = disease?.description;
@@ -382,9 +384,10 @@ export async function GET(request: NextRequest) {
             });
 
             const seededTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, maxTargets));
+            let degradedTargets = 0;
 
             for (const batch of chunkArray(seededTargets, 4)) {
-              const resolved = await Promise.all(
+              const resolved = await Promise.allSettled(
                 batch.map(async (targetNodeId) => {
                   const symbol = targetSymbolByNodeId.get(targetNodeId);
                   if (!symbol) return { targetNodeId, pathways: [] as Awaited<ReturnType<typeof findPathwaysByGene>> };
@@ -400,7 +403,13 @@ export async function GET(request: NextRequest) {
               const nodes: GraphNode[] = [];
               const edges: GraphEdge[] = [];
 
-              for (const item of resolved) {
+              for (const settled of resolved) {
+                if (settled.status === "rejected") {
+                  degradedTargets += 1;
+                  continue;
+                }
+
+                const item = settled.value;
                 for (const pathway of item.pathways) {
                   const pathwayNodeId = makeNodeId("pathway", pathway.id);
                   pathwaysByTargetId.get(item.targetNodeId)?.add(pathway.id);
@@ -434,11 +443,30 @@ export async function GET(request: NextRequest) {
 
               pushNodesEdges(nodes, edges);
               pathwayCount = [...nodeMap.values()].filter((node) => node.type === "pathway").length;
-              emitStatus("P2", `${pathwayCount} pathways linked`, 52, {
-                targets: targetCount,
-                pathways: pathwayCount,
-              });
+              emitStatus(
+                "P2",
+                `${pathwayCount} pathways linked`,
+                52,
+                {
+                  targets: targetCount,
+                  pathways: pathwayCount,
+                  degradedTargets,
+                },
+                degradedTargets > 0,
+              );
               await sleep(randomInt(appConfig.stream.batchMinDelayMs, appConfig.stream.batchMaxDelayMs));
+            }
+
+            if (degradedTargets > 0) {
+              sourceHealth.reactome = "yellow";
+              emit({
+                event: "error",
+                data: {
+                  phase: "P2",
+                  message: `Reactome pathway expansion partial: ${degradedTargets} target-level fetches degraded`,
+                  recoverable: true,
+                },
+              });
             }
 
             emit({
@@ -779,11 +807,11 @@ export async function GET(request: NextRequest) {
           let failedTargets = 0;
           let skippedTargets = 0;
 
-          const focusBatches = chunkArray(focusTargets, 2);
+          const focusBatches = chunkArray(focusTargets, 3);
           for (let batchIdx = 0; batchIdx < focusBatches.length; batchIdx += 1) {
             const batch = focusBatches[batchIdx];
             if (Date.now() > phaseBudgetDeadline) {
-              skippedTargets += focusTargets.length - batchIdx * 2;
+              skippedTargets += focusTargets.length - batchIdx * 3;
               break;
             }
 

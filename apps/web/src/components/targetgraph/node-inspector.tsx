@@ -34,13 +34,18 @@ export function NodeInspector({ selectedNode, edges, enrichmentByNode }: Props) 
     (edge) => edge.source === selectedNode.id || edge.target === selectedNode.id,
   );
 
+  const title =
+    (typeof selectedNode.meta.targetSymbol === "string" && selectedNode.meta.targetSymbol) ||
+    (typeof selectedNode.meta.displayName === "string" && selectedNode.meta.displayName) ||
+    selectedNode.label;
+
   const enrichment = enrichmentByNode[selectedNode.id] ?? { articles: [], trials: [] };
 
   return (
     <Card className="h-full border-[#d7d2ff] bg-white/95">
       <CardHeader>
         <div className="flex items-center justify-between gap-2">
-          <CardTitle className="text-sm text-[#342f7b]">{selectedNode.label}</CardTitle>
+          <CardTitle className="text-sm text-[#342f7b]">{title}</CardTitle>
           <Badge variant="outline" className="border-[#ddd9ff] bg-[#f3f1ff] text-[#4a4390]">
             {selectedNode.type}
           </Badge>

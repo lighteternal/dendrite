@@ -14,3 +14,5 @@
 - [x] M12: Deep Discoverer agent workflow (LangGraph + DeepAgents-style subagents) with live SSE journey and graph-focus integration.
 - [x] M13: Reliability/readability hardening pass (Reactome fail-soft per target, faster BioMCP budget, richer Sankey coverage, improved node label spacing, executive natural-language brief).
 - [x] M14: Decision-brief-first rebuild (NL-first landing, `/brief` workspace, `/api/runCaseStream`, disease resolver guardrails, path-first graph declutter, and 5-disease regression validation).
+- [x] M15: Semantic concept mapper hardening (TNF-a/malaria-style intent extraction), query-alignment scoring/caveats, and fast `/api/suggestEntities` UX path.
+- [x] M16: Cytoscape-based mechanism network renderer with stable labels, readable layouts, and validated RA/malaria/Alzheimer’s desktop + mobile screenshots.

@@ -77,6 +77,7 @@ export type StatusUpdate = {
 type StartOptions = {
   query: string;
   diseaseId?: string | null;
+  diseaseName?: string | null;
   mode: RunMode;
 };
 
@@ -121,7 +122,7 @@ export function useCaseRunStream() {
   }, []);
 
   const start = useCallback(
-    ({ query, diseaseId, mode }: StartOptions) => {
+    ({ query, diseaseId, diseaseName, mode }: StartOptions) => {
       const trimmed = query.trim();
       if (!trimmed) return;
 
@@ -136,6 +137,9 @@ export function useCaseRunStream() {
       });
       if (diseaseId?.trim()) {
         params.set("diseaseId", diseaseId.trim());
+      }
+      if (diseaseName?.trim()) {
+        params.set("diseaseName", diseaseName.trim());
       }
 
       const source = new EventSource(`/api/runCaseStream?${params.toString()}`);

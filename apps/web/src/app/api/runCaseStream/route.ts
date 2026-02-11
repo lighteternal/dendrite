@@ -99,6 +99,36 @@ function compactText(value: string, max = 110): string {
   return `${value.slice(0, max - 1)}…`;
 }
 
+function extractDiseasePhrase(query: string): string {
+  let value = query.toLowerCase().trim();
+  value = value.replace(/^(for|in|about|regarding)\s+/, "");
+
+  const splitters = [
+    ",",
+    "?",
+    " what ",
+    " which ",
+    " where ",
+    " when ",
+    " how ",
+    " with ",
+    " showing ",
+    " after ",
+    " given ",
+  ];
+
+  for (const splitter of splitters) {
+    const idx = value.indexOf(splitter);
+    if (idx > 0) {
+      value = value.slice(0, idx).trim();
+    }
+  }
+
+  return value
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function derivePathUpdate(nodeMap: Map<string, GraphNode>, edgeMap: Map<string, GraphEdge>) {
   const disease = [...nodeMap.values()].find((node) => node.type === "disease");
   if (!disease) return null;
@@ -249,6 +279,7 @@ export async function GET(request: NextRequest) {
   const query = params.get("query")?.trim();
   const mode = (params.get("mode")?.trim().toLowerCase() as RunMode | null) ?? "balanced";
   const diseaseIdHint = params.get("diseaseId")?.trim();
+  const diseaseNameHint = params.get("diseaseName")?.trim();
 
   if (!query) {
     return new Response("Missing query", { status: 400 });
@@ -298,7 +329,7 @@ export async function GET(request: NextRequest) {
           pct: 2,
         });
 
-        const candidates: DiseaseCandidate[] = (await searchDiseases(query, 12))
+        let candidates: DiseaseCandidate[] = (await searchDiseases(query, 12))
           .filter((item) => diseaseIdPattern.test(item.id))
           .map((item) => ({
             id: item.id,
@@ -306,18 +337,55 @@ export async function GET(request: NextRequest) {
             description: item.description,
           }));
 
+        if (candidates.length === 0) {
+          const narrowedQuery = extractDiseasePhrase(query);
+          if (narrowedQuery.length >= 2 && narrowedQuery !== query.toLowerCase().trim()) {
+            candidates = (await searchDiseases(narrowedQuery, 12))
+              .filter((item) => diseaseIdPattern.test(item.id))
+              .map((item) => ({
+                id: item.id,
+                name: item.name,
+                description: item.description,
+              }));
+          }
+        }
+
         emit("resolver_candidates", {
           query,
           candidates,
         });
 
-        const chosen =
-          diseaseIdHint && candidates.find((item) => item.id === diseaseIdHint)
-            ? {
-                selected: candidates.find((item) => item.id === diseaseIdHint)!,
-                rationale: "User-selected disease entity.",
-              }
-            : await chooseBestDiseaseCandidate(query, candidates);
+        let chosen:
+          | {
+              selected: DiseaseCandidate;
+              rationale: string;
+            }
+          | undefined;
+
+        if (diseaseIdHint) {
+          const pinned =
+            candidates.find((item) => item.id === diseaseIdHint) ??
+            (diseaseNameHint
+              ? {
+                  id: diseaseIdHint,
+                  name: diseaseNameHint,
+                }
+              : null);
+
+          if (pinned) {
+            chosen = {
+              selected: pinned,
+              rationale: "User-pinned disease entity.",
+            };
+          }
+        }
+
+        if (!chosen) {
+          if (candidates.length === 0) {
+            throw new Error("No disease candidates found for query.");
+          }
+          chosen = await chooseBestDiseaseCandidate(query, candidates);
+        }
 
         emit("resolver_selected", {
           query,

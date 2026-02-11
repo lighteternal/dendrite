@@ -26,6 +26,7 @@ import { useCaseRunStream, type RunMode } from "@/hooks/useCaseRunStream";
 type Props = {
   initialQuery: string;
   initialDiseaseId?: string;
+  initialDiseaseName?: string;
   initialMode?: RunMode;
 };
 
@@ -61,7 +62,12 @@ function downloadJson(data: unknown, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-export function DecisionBriefWorkspace({ initialQuery, initialDiseaseId, initialMode = "balanced" }: Props) {
+export function DecisionBriefWorkspace({
+  initialQuery,
+  initialDiseaseId,
+  initialDiseaseName,
+  initialMode = "balanced",
+}: Props) {
   const router = useRouter();
   const stream = useCaseRunStream();
   const startStream = stream.start;
@@ -70,6 +76,9 @@ export function DecisionBriefWorkspace({ initialQuery, initialDiseaseId, initial
   const [query, setQuery] = useState(initialQuery);
   const [mode, setMode] = useState<RunMode>(initialMode);
   const [diseaseIdOverride, setDiseaseIdOverride] = useState<string | null>(initialDiseaseId ?? null);
+  const [diseaseNameOverride, setDiseaseNameOverride] = useState<string | null>(
+    initialDiseaseName ?? null,
+  );
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [showPathwayContext, setShowPathwayContext] = useState(true);
   const [showDrugContext, setShowDrugContext] = useState(true);
@@ -79,11 +88,12 @@ export function DecisionBriefWorkspace({ initialQuery, initialDiseaseId, initial
     startStream({
       query: initialQuery,
       diseaseId: initialDiseaseId ?? null,
+      diseaseName: initialDiseaseName ?? null,
       mode: initialMode,
     });
 
     return () => stopStream();
-  }, [initialDiseaseId, initialMode, initialQuery, startStream, stopStream]);
+  }, [initialDiseaseId, initialDiseaseName, initialMode, initialQuery, startStream, stopStream]);
 
   const activeSourceHealth = (stream.status?.sourceHealth ?? {}) as SourceHealth;
 
@@ -135,12 +145,15 @@ export function DecisionBriefWorkspace({ initialQuery, initialDiseaseId, initial
     router.replace(
       `/brief?query=${encodeURIComponent(trimmed)}&mode=${mode}${
         diseaseIdOverride ? `&diseaseId=${encodeURIComponent(diseaseIdOverride)}` : ""
+      }${
+        diseaseNameOverride ? `&diseaseName=${encodeURIComponent(diseaseNameOverride)}` : ""
       }`,
     );
 
     stream.start({
       query: trimmed,
       diseaseId: diseaseIdOverride,
+      diseaseName: diseaseNameOverride,
       mode,
     });
   };
@@ -172,6 +185,7 @@ export function DecisionBriefWorkspace({ initialQuery, initialDiseaseId, initial
                 onChange={(event) => {
                   setQuery(event.target.value);
                   setDiseaseIdOverride(null);
+                  setDiseaseNameOverride(null);
                 }}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") {
@@ -266,7 +280,7 @@ export function DecisionBriefWorkspace({ initialQuery, initialDiseaseId, initial
                         type="button"
                         onClick={() => {
                           setDiseaseIdOverride(item.id);
-                          setQuery(item.name);
+                          setDiseaseNameOverride(item.name);
                         }}
                         className={`rounded-full border px-2 py-0.5 text-[10px] ${
                           diseaseIdOverride === item.id

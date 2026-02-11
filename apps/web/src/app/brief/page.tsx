@@ -24,12 +24,15 @@ export default async function BriefPage({
 
   const diseaseIdRaw = Array.isArray(params.diseaseId) ? params.diseaseId[0] : params.diseaseId;
   const diseaseId = diseaseIdRaw?.trim() || undefined;
+  const diseaseNameRaw = Array.isArray(params.diseaseName) ? params.diseaseName[0] : params.diseaseName;
+  const diseaseName = diseaseNameRaw?.trim() || undefined;
 
   return (
     <DecisionBriefWorkspace
       initialQuery={query}
       initialMode={mode}
       initialDiseaseId={diseaseId}
+      initialDiseaseName={diseaseName}
     />
   );
 }

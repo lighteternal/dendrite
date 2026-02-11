@@ -22,7 +22,7 @@ import {
 } from "@/server/mcp/opentargets";
 import { findPathwaysByGene } from "@/server/mcp/reactome";
 import { getInteractionNetwork } from "@/server/mcp/stringdb";
-import { rankTargets } from "@/server/openai/ranking";
+import { rankTargets, rankTargetsFallback } from "@/server/openai/ranking";
 import { appConfig, assertRuntimeConfig } from "@/server/config";
 import { encodeSseEvent, randomInt } from "@/server/pipeline/sse";
 
@@ -73,13 +73,30 @@ export async function GET(request: NextRequest) {
     openai: "green",
   };
 
+  const streamState = { closed: false };
+
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const startedAt = Date.now();
       const phaseTimeoutMs = appConfig.stream.phaseTimeoutMs;
 
       const emit = (event: StreamEventPayload) => {
-        controller.enqueue(encodeSseEvent(event));
+        if (streamState.closed) return;
+        try {
+          controller.enqueue(encodeSseEvent(event));
+        } catch {
+          streamState.closed = true;
+        }
+      };
+
+      const closeStream = () => {
+        if (streamState.closed) return;
+        streamState.closed = true;
+        try {
+          controller.close();
+        } catch {
+          // noop
+        }
       };
 
       const emitStatus = (
@@ -374,95 +391,129 @@ export async function GET(request: NextRequest) {
           });
 
           const seedTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, 10));
+          let degradedTargets = 0;
 
-          for (const targetNodeId of seedTargets) {
-            const targetPrimaryId = nodeMap.get(targetNodeId)?.primaryId;
-            const targetSymbol = targetSymbolByNodeId.get(targetNodeId);
-            if (!targetPrimaryId || !targetSymbol) continue;
+          for (const batch of chunkArray(seedTargets, 2)) {
+            const settledBatch = await Promise.allSettled(
+              batch.map(async (targetNodeId) => {
+                const targetPrimaryId = nodeMap.get(targetNodeId)?.primaryId;
+                const targetSymbol = targetSymbolByNodeId.get(targetNodeId);
+                if (!targetPrimaryId || !targetSymbol) {
+                  throw new Error(`missing target metadata for ${targetNodeId}`);
+                }
 
-            const [knownDrugs, activityDrugs] = await Promise.allSettled([
-              withTimeout(getKnownDrugsForTarget(targetPrimaryId, 8), phaseTimeoutMs),
-              withTimeout(getTargetActivityDrugs(targetSymbol, 8), phaseTimeoutMs),
-            ]);
+                const [knownDrugs, activityDrugs] = await Promise.allSettled([
+                  withTimeout(getKnownDrugsForTarget(targetPrimaryId, 8), phaseTimeoutMs),
+                  withTimeout(getTargetActivityDrugs(targetSymbol, 8), phaseTimeoutMs),
+                ]);
 
-            const nodes: GraphNode[] = [];
-            const edges: GraphEdge[] = [];
+                const nodes: GraphNode[] = [];
+                const edges: GraphEdge[] = [];
 
-            if (knownDrugs.status === "fulfilled") {
-              for (const drug of knownDrugs.value) {
-                const drugNodeId = makeNodeId("drug", drug.drugId);
-                drugsByTargetId.get(targetNodeId)?.add(drug.drugId);
+                if (knownDrugs.status === "fulfilled") {
+                  for (const drug of knownDrugs.value) {
+                    const drugNodeId = makeNodeId("drug", drug.drugId);
+                    drugsByTargetId.get(targetNodeId)?.add(drug.drugId);
 
-                nodes.push({
-                  id: drugNodeId,
-                  type: "drug",
-                  primaryId: drug.drugId,
-                  label: drug.name,
-                  score: normalizeScore((drug.phase ?? 0) / 4),
-                  size: 18 + (drug.phase ?? 0) * 2,
-                  meta: {
-                    phase: drug.phase,
-                    status: drug.status,
-                    modality: drug.drugType,
-                    mechanism: drug.mechanismOfAction,
-                    stage: "P3",
-                  },
-                });
+                    nodes.push({
+                      id: drugNodeId,
+                      type: "drug",
+                      primaryId: drug.drugId,
+                      label: drug.name,
+                      score: normalizeScore((drug.phase ?? 0) / 4),
+                      size: 18 + (drug.phase ?? 0) * 2,
+                      meta: {
+                        phase: drug.phase,
+                        status: drug.status,
+                        modality: drug.drugType,
+                        mechanism: drug.mechanismOfAction,
+                        stage: "P3",
+                      },
+                    });
 
-                edges.push({
-                  id: makeEdgeId(targetNodeId, drugNodeId, "target_drug"),
-                  source: targetNodeId,
-                  target: drugNodeId,
-                  type: "target_drug",
-                  weight: normalizeScore((drug.phase ?? 0) / 4),
-                  meta: {
-                    source: "OpenTargets",
-                  },
-                });
+                    edges.push({
+                      id: makeEdgeId(targetNodeId, drugNodeId, "target_drug"),
+                      source: targetNodeId,
+                      target: drugNodeId,
+                      type: "target_drug",
+                      weight: normalizeScore((drug.phase ?? 0) / 4),
+                      meta: {
+                        source: "OpenTargets",
+                      },
+                    });
+                  }
+                }
+
+                if (activityDrugs.status === "fulfilled") {
+                  for (const drug of activityDrugs.value) {
+                    const drugNodeId = makeNodeId("drug", drug.moleculeId);
+                    drugsByTargetId.get(targetNodeId)?.add(drug.moleculeId);
+
+                    nodes.push({
+                      id: drugNodeId,
+                      type: "drug",
+                      primaryId: drug.moleculeId,
+                      label: drug.name,
+                      score: drug.potency ? normalizeScore(1 / (1 + drug.potency / 1000)) : 0.4,
+                      size: 18,
+                      meta: {
+                        activityType: drug.activityType,
+                        potency: drug.potency,
+                        potencyUnits: drug.potencyUnits,
+                        stage: "P3",
+                      },
+                    });
+
+                    edges.push({
+                      id: makeEdgeId(targetNodeId, drugNodeId, "target_drug"),
+                      source: targetNodeId,
+                      target: drugNodeId,
+                      type: "target_drug",
+                      weight: drug.potency ? normalizeScore(1 / (1 + drug.potency / 1000)) : 0.4,
+                      meta: {
+                        source: "ChEMBL",
+                      },
+                    });
+                  }
+                }
+
+                return { nodes, edges };
+              }),
+            );
+
+            for (const settled of settledBatch) {
+              if (settled.status === "fulfilled") {
+                pushNodesEdges(settled.value.nodes, settled.value.edges);
+              } else {
+                degradedTargets += 1;
               }
             }
 
-            if (activityDrugs.status === "fulfilled") {
-              for (const drug of activityDrugs.value) {
-                const drugNodeId = makeNodeId("drug", drug.moleculeId);
-                drugsByTargetId.get(targetNodeId)?.add(drug.moleculeId);
-
-                nodes.push({
-                  id: drugNodeId,
-                  type: "drug",
-                  primaryId: drug.moleculeId,
-                  label: drug.name,
-                  score: drug.potency ? normalizeScore(1 / (1 + drug.potency / 1000)) : 0.4,
-                  size: 18,
-                  meta: {
-                    activityType: drug.activityType,
-                    potency: drug.potency,
-                    potencyUnits: drug.potencyUnits,
-                    stage: "P3",
-                  },
-                });
-
-                edges.push({
-                  id: makeEdgeId(targetNodeId, drugNodeId, "target_drug"),
-                  source: targetNodeId,
-                  target: drugNodeId,
-                  type: "target_drug",
-                  weight: drug.potency ? normalizeScore(1 / (1 + drug.potency / 1000)) : 0.4,
-                  meta: {
-                    source: "ChEMBL",
-                  },
-                });
-              }
-            }
-
-            pushNodesEdges(nodes, edges);
             drugCount = [...nodeMap.values()].filter((node) => node.type === "drug").length;
             emitStatus("P3", `${drugCount} compounds linked`, 68, {
               targets: targetCount,
               pathways: pathwayCount,
               drugs: drugCount,
+              degradedTargets,
             });
-            await sleep(randomInt(160, 480));
+            await sleep(
+              randomInt(
+                Math.max(50, Math.floor(appConfig.stream.batchMinDelayMs / 2)),
+                Math.max(120, Math.floor(appConfig.stream.batchMaxDelayMs / 2)),
+              ),
+            );
+          }
+
+          if (degradedTargets > 0) {
+            sourceHealth.chembl = "yellow";
+            emit({
+              event: "error",
+              data: {
+                phase: "P3",
+                message: `Drug enrichment partial: ${degradedTargets} target-level fetches degraded`,
+                recoverable: true,
+              },
+            });
           }
 
           emit({
@@ -597,39 +648,75 @@ export async function GET(request: NextRequest) {
           });
 
           const linkByNodeId: Record<string, { articles: unknown[]; trials: unknown[] }> = {};
-          const focusTargets = targetNodeIds.slice(0, Math.min(8, targetNodeIds.length));
+          const focusTargets = targetNodeIds.slice(
+            0,
+            Math.min(appConfig.stream.maxLiteratureTargets, targetNodeIds.length),
+          );
+          const phaseBudgetDeadline = Date.now() + appConfig.stream.p5BudgetMs;
+          const perTargetTimeoutMs = Math.min(
+            phaseTimeoutMs,
+            appConfig.stream.p5PerTargetTimeoutMs,
+          );
+          let failedTargets = 0;
+          let skippedTargets = 0;
 
-          for (const targetNodeId of focusTargets) {
-            const targetSymbol = targetSymbolByNodeId.get(targetNodeId);
-            if (!targetSymbol) continue;
+          const focusBatches = chunkArray(focusTargets, 2);
+          for (let batchIdx = 0; batchIdx < focusBatches.length; batchIdx += 1) {
+            const batch = focusBatches[batchIdx];
+            if (Date.now() > phaseBudgetDeadline) {
+              skippedTargets += focusTargets.length - batchIdx * 2;
+              break;
+            }
 
-            const firstDrugId = [...(drugsByTargetId.get(targetNodeId) ?? [])][0];
-            const firstDrugName =
-              firstDrugId && nodeMap.get(makeNodeId("drug", firstDrugId))?.label
-                ? nodeMap.get(makeNodeId("drug", firstDrugId))?.label
-                : undefined;
+            const settled = await Promise.allSettled(
+              batch.map(async (targetNodeId) => {
+                const targetSymbol = targetSymbolByNodeId.get(targetNodeId);
+                if (!targetSymbol) {
+                  throw new Error(`missing target symbol for ${targetNodeId}`);
+                }
 
-            const enrichment = await withTimeout(
-              getLiteratureAndTrials(diseaseName, targetSymbol, firstDrugName),
-              phaseTimeoutMs,
+                const firstDrugId = [...(drugsByTargetId.get(targetNodeId) ?? [])][0];
+                const firstDrugName =
+                  firstDrugId && nodeMap.get(makeNodeId("drug", firstDrugId))?.label
+                    ? nodeMap.get(makeNodeId("drug", firstDrugId))?.label
+                    : undefined;
+
+                const enrichment = await withTimeout(
+                  getLiteratureAndTrials(diseaseName, targetSymbol, firstDrugName),
+                  perTargetTimeoutMs,
+                );
+
+                return {
+                  targetNodeId,
+                  enrichment,
+                };
+              }),
             );
 
-            linkByNodeId[targetNodeId] = {
-              articles: enrichment.articles,
-              trials: enrichment.trials,
-            };
+            for (const result of settled) {
+              if (result.status === "rejected") {
+                failedTargets += 1;
+                continue;
+              }
 
-            literatureByTargetId.set(targetNodeId, {
-              articleCount: enrichment.articles.length,
-              trialCount: enrichment.trials.length,
-            });
+              const { targetNodeId, enrichment } = result.value;
+              linkByNodeId[targetNodeId] = {
+                articles: enrichment.articles,
+                trials: enrichment.trials,
+              };
 
-            const current = nodeMap.get(targetNodeId);
-            if (current) {
-              current.meta.articleCount = enrichment.articles.length;
-              current.meta.trialCount = enrichment.trials.length;
-              nodeMap.set(targetNodeId, current);
-              emitGraph([current], []);
+              literatureByTargetId.set(targetNodeId, {
+                articleCount: enrichment.articles.length,
+                trialCount: enrichment.trials.length,
+              });
+
+              const current = nodeMap.get(targetNodeId);
+              if (current) {
+                current.meta.articleCount = enrichment.articles.length;
+                current.meta.trialCount = enrichment.trials.length;
+                nodeMap.set(targetNodeId, current);
+                emitGraph([current], []);
+              }
             }
 
             emitStatus(
@@ -638,9 +725,27 @@ export async function GET(request: NextRequest) {
               90,
               {
                 literatureTargets: Object.keys(linkByNodeId).length,
+                degradedTargets: failedTargets,
+                skippedTargets,
               },
+              failedTargets > 0 || skippedTargets > 0,
             );
             await sleep(120);
+          }
+
+          if (failedTargets > 0 || skippedTargets > 0) {
+            sourceHealth.biomcp = "yellow";
+            emit({
+              event: "error",
+              data: {
+                phase: "P5",
+                message:
+                  skippedTargets > 0
+                    ? `BioMCP enrichment partial: ${failedTargets} timed out, ${skippedTargets} skipped by phase budget`
+                    : `BioMCP enrichment partial: ${failedTargets} target enrichments timed out`,
+                recoverable: true,
+              },
+            });
           }
 
           emit({
@@ -668,34 +773,54 @@ export async function GET(request: NextRequest) {
           interactions: interactionCount,
         });
 
+        const rankingRows = targetNodeIds.map((targetNodeId) => {
+          const node = nodeMap.get(targetNodeId);
+          const pathways = [...(pathwaysByTargetId.get(targetNodeId) ?? new Set<string>())];
+          const drugs = [...(drugsByTargetId.get(targetNodeId) ?? new Set<string>())];
+          const interactions = interactionsByTargetId.get(targetNodeId) ?? 0;
+          const literature = literatureByTargetId.get(targetNodeId) ?? {
+            articleCount: 0,
+            trialCount: 0,
+          };
+
+          return {
+            id: node?.primaryId ?? targetNodeId,
+            symbol: String(node?.label ?? targetNodeId),
+            pathwayIds: pathways,
+            openTargetsEvidence: Number(node?.meta?.openTargetsEvidence ?? node?.score ?? 0),
+            drugActionability: Math.min(1, drugs.length / 8),
+            networkCentrality: Math.min(1, interactions / 8),
+            literatureSupport: Math.min(1, (literature.articleCount + literature.trialCount) / 10),
+            drugCount: drugs.length,
+            interactionCount: interactions,
+            articleCount: literature.articleCount,
+            trialCount: literature.trialCount,
+          };
+        });
+
+        emit({
+          event: "ranking",
+          data: rankTargetsFallback(rankingRows),
+        });
+        emitStatus("P6", "Baseline ranking ready; refining narrative", 96, {
+          targets: targetCount,
+          pathways: pathwayCount,
+          drugs: drugCount,
+          interactions: interactionCount,
+        });
+
         try {
-          const rankingRows = targetNodeIds.map((targetNodeId) => {
-            const node = nodeMap.get(targetNodeId);
-            const pathways = [...(pathwaysByTargetId.get(targetNodeId) ?? new Set<string>())];
-            const drugs = [...(drugsByTargetId.get(targetNodeId) ?? new Set<string>())];
-            const interactions = interactionsByTargetId.get(targetNodeId) ?? 0;
-            const literature = literatureByTargetId.get(targetNodeId) ?? {
-              articleCount: 0,
-              trialCount: 0,
-            };
-
-            return {
-              id: node?.primaryId ?? targetNodeId,
-              symbol: String(node?.label ?? targetNodeId),
-              pathwayIds: pathways,
-              openTargetsEvidence: Number(node?.meta?.openTargetsEvidence ?? node?.score ?? 0),
-              drugActionability: Math.min(1, drugs.length / 8),
-              networkCentrality: Math.min(1, interactions / 8),
-              literatureSupport: Math.min(1, (literature.articleCount + literature.trialCount) / 10),
-              drugCount: drugs.length,
-              interactionCount: interactions,
-              articleCount: literature.articleCount,
-              trialCount: literature.trialCount,
-            };
-          });
-
-          const ranking = await withTimeout(rankTargets(rankingRows), phaseTimeoutMs * 2);
+          const ranking = await withTimeout(
+            rankTargets(rankingRows),
+            appConfig.stream.rankingTimeoutMs,
+          );
           emit({ event: "ranking", data: ranking });
+          emitStatus("P6", "AI narrative refinement complete", 98, {
+            targets: targetCount,
+            pathways: pathwayCount,
+            drugs: drugCount,
+            interactions: interactionCount,
+          });
         } catch (error) {
           sourceHealth.openai = "yellow";
           emit({
@@ -731,22 +856,24 @@ export async function GET(request: NextRequest) {
           },
         });
 
-        controller.close();
+        closeStream();
       };
 
       run().catch((error) => {
-        controller.enqueue(
-          encodeSseEvent({
-            event: "error",
-            data: {
-              phase: "fatal",
-              message: error instanceof Error ? error.message : "unknown",
-              recoverable: false,
-            },
-          }),
-        );
-        controller.close();
+        emit({
+          event: "error",
+          data: {
+            phase: "fatal",
+            message: error instanceof Error ? error.message : "unknown",
+            recoverable: false,
+          },
+        });
+        closeStream();
       });
+    },
+    cancel() {
+      // Client disconnected; stop emitting gracefully.
+      streamState.closed = true;
     },
   });
 

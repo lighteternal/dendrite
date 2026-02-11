@@ -4,9 +4,31 @@ import {
   hypothesisResponseSchema,
 } from "@/lib/contracts";
 import { clamp } from "@/lib/graph";
-import { generateMechanismThread } from "@/server/openai/ranking";
+import {
+  generateMechanismThread,
+  mechanismThreadFallback,
+} from "@/server/openai/ranking";
+import { appConfig } from "@/server/config";
 
 export const runtime = "nodejs";
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error(`timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise
+      .then((result) => {
+        clearTimeout(timeout);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+  });
+}
 
 function normalizeWeights(noveltyToActionability: number, riskTolerance: number) {
   const actionabilityBias = noveltyToActionability / 100;
@@ -89,13 +111,18 @@ export async function POST(request: NextRequest) {
     missingInputs.push("No interaction neighborhood provided for selected pathway targets");
   }
 
-  const response = await generateMechanismThread({
+  const payload = {
     diseaseId: input.diseaseId,
     pathwayId: input.pathwayId,
     outputCount: input.outputCount,
     missingInputs,
     scoredTargets,
-  });
+  };
+
+  const response = await withTimeout(
+    generateMechanismThread(payload),
+    appConfig.openai.hypothesisTimeoutMs,
+  ).catch(() => mechanismThreadFallback(payload));
 
   return NextResponse.json(hypothesisResponseSchema.parse(response));
 }

@@ -111,7 +111,7 @@ async function callStructuredJson<T>(options: {
   }
 }
 
-function fallbackRank(rows: RankingInputRow[]): RankingResponse {
+export function rankTargetsFallback(rows: RankingInputRow[]): RankingResponse {
   const scored = rows
     .map((row) => {
       const score =
@@ -165,7 +165,7 @@ function fallbackRank(rows: RankingInputRow[]): RankingResponse {
 }
 
 export async function rankTargets(rows: RankingInputRow[]): Promise<RankingResponse> {
-  const fallback = fallbackRank(rows);
+  const fallback = rankTargetsFallback(rows);
   if (!openai) return fallback;
 
   const schema = {
@@ -258,10 +258,8 @@ export async function rankTargets(rows: RankingInputRow[]): Promise<RankingRespo
   }
 }
 
-export async function generateMechanismThread(
-  input: HypothesisInput,
-): Promise<HypothesisResponse> {
-  const fallback: HypothesisResponse = {
+export function mechanismThreadFallback(input: HypothesisInput): HypothesisResponse {
+  return {
     recommendedTargets: input.scoredTargets.slice(0, input.outputCount).map((target) => ({
       id: target.id,
       symbol: target.symbol,
@@ -289,6 +287,12 @@ export async function generateMechanismThread(
     },
     missingInputs: input.missingInputs,
   };
+}
+
+export async function generateMechanismThread(
+  input: HypothesisInput,
+): Promise<HypothesisResponse> {
+  const fallback = mechanismThreadFallback(input);
 
   if (!openai) return fallback;
 

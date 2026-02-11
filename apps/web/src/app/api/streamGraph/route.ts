@@ -55,6 +55,7 @@ export async function GET(request: NextRequest) {
 
   const { searchParams } = new URL(request.url);
   const diseaseQuery = searchParams.get("diseaseQuery")?.trim();
+  const diseaseIdHint = searchParams.get("diseaseId")?.trim();
   const maxTargets = Number(searchParams.get("maxTargets") ?? 20);
   const includePathways = searchParams.get("pathways") !== "0";
   const includeDrugs = searchParams.get("drugs") !== "0";
@@ -179,6 +180,7 @@ export async function GET(request: NextRequest) {
       const run = async () => {
         let diseaseId = "";
         let diseaseName = diseaseQuery;
+        let diseaseDescription: string | undefined;
         let targetCount = 0;
         let pathwayCount = 0;
         let drugCount = 0;
@@ -193,10 +195,27 @@ export async function GET(request: NextRequest) {
 
         try {
           emitStatus("P0", "Resolving disease query", 5);
-          const diseases = await withTimeout(searchDiseases(diseaseQuery, 8), phaseTimeoutMs);
-          const disease = diseases[0];
-          diseaseId = disease?.id ?? `QUERY_${diseaseQuery.replace(/\s+/g, "_")}`;
-          diseaseName = disease?.name ?? diseaseQuery;
+          if (diseaseIdHint) {
+            diseaseId = diseaseIdHint;
+            diseaseName = diseaseQuery;
+
+            try {
+              const diseases = await withTimeout(searchDiseases(diseaseQuery, 12), phaseTimeoutMs);
+              const exact = diseases.find((item) => item.id === diseaseIdHint);
+              if (exact?.name) {
+                diseaseName = exact.name;
+              }
+              diseaseDescription = exact?.description;
+            } catch {
+              sourceHealth.opentargets = "yellow";
+            }
+          } else {
+            const diseases = await withTimeout(searchDiseases(diseaseQuery, 8), phaseTimeoutMs);
+            const disease = diseases[0];
+            diseaseId = disease?.id ?? `QUERY_${diseaseQuery.replace(/\s+/g, "_")}`;
+            diseaseName = disease?.name ?? diseaseQuery;
+            diseaseDescription = disease?.description;
+          }
 
           const diseaseNode: GraphNode = {
             id: makeNodeId("disease", diseaseId),
@@ -206,14 +225,20 @@ export async function GET(request: NextRequest) {
             score: 1,
             size: 80,
             meta: {
-              description: disease?.description,
+              description: diseaseDescription,
               query: diseaseQuery,
             },
           };
 
           nodeMap.set(diseaseNode.id, diseaseNode);
           emitGraph([diseaseNode], []);
-          emitStatus("P0", `Resolved to ${diseaseName} (${diseaseId})`, 12);
+          emitStatus(
+            "P0",
+            diseaseIdHint
+              ? `Resolved to ${diseaseName} (${diseaseId}) via disease entity match`
+              : `Resolved to ${diseaseName} (${diseaseId})`,
+            12,
+          );
         } catch (error) {
           sourceHealth.opentargets = "red";
           emit({

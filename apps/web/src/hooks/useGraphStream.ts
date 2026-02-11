@@ -72,6 +72,7 @@ export function useGraphStream() {
       interactions: true,
       literature: true,
     },
+    diseaseIdHint?: string | null,
   ) => {
     stop();
     reset();
@@ -87,6 +88,9 @@ export function useGraphStream() {
       interactions: options.interactions ? "1" : "0",
       literature: options.literature ? "1" : "0",
     });
+    if (diseaseIdHint) {
+      params.set("diseaseId", diseaseIdHint);
+    }
     const url = `/api/streamGraph?${params.toString()}`;
     const source = new EventSource(url);
     eventSourceRef.current = source;

@@ -41,6 +41,38 @@ const knownDrugsCache = createTTLCache<string, KnownDrug[]>(
 
 const mcp = new McpClient(appConfig.mcp.opentargets);
 
+const diseaseIdPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
+
+function toDiseaseHit(raw: any): DiseaseHit | null {
+  const id = typeof raw?.id === "string" ? raw.id.trim() : "";
+  const name = typeof raw?.name === "string" ? raw.name.trim() : "";
+  const description = typeof raw?.description === "string" ? raw.description : undefined;
+  const entity =
+    typeof raw?.entity === "string" ? raw.entity.toLowerCase() : undefined;
+
+  if (!id || !name) return null;
+  if (entity && entity !== "disease") return null;
+  if (!diseaseIdPattern.test(id)) return null;
+
+  return {
+    id,
+    name,
+    description,
+  };
+}
+
+function normalizeDiseaseHits(rawHits: any[], size: number): DiseaseHit[] {
+  const deduped = new Map<string, DiseaseHit>();
+  for (const hit of rawHits) {
+    const normalized = toDiseaseHit(hit);
+    if (!normalized) continue;
+    if (!deduped.has(normalized.id)) {
+      deduped.set(normalized.id, normalized);
+    }
+  }
+  return [...deduped.values()].slice(0, size);
+}
+
 export async function searchDiseases(query: string, size = 8): Promise<DiseaseHit[]> {
   const cacheKey = `${query.toLowerCase()}::${size}`;
   const cached = diseaseCache.get(cacheKey);
@@ -48,12 +80,8 @@ export async function searchDiseases(query: string, size = 8): Promise<DiseaseHi
 
   try {
     const payload = await mcp.callTool<any>("search_diseases", { query, size });
-    const hits =
-      payload?.data?.search?.hits?.map((hit: any) => ({
-        id: hit.id,
-        name: hit.name,
-        description: hit.description,
-      })) ?? [];
+    const rawHits = payload?.data?.search?.hits ?? payload?.hits ?? [];
+    const hits = normalizeDiseaseHits(rawHits, size);
 
     diseaseCache.set(cacheKey, hits);
     return hits;
@@ -70,6 +98,7 @@ export async function searchDiseases(query: string, size = 8): Promise<DiseaseHi
                   id
                   name
                   description
+                  entity
                 }
               }
             }
@@ -79,11 +108,8 @@ export async function searchDiseases(query: string, size = 8): Promise<DiseaseHi
       },
     );
 
-    const hits = (response?.data?.search?.hits ?? []).slice(0, size).map((hit: any) => ({
-      id: hit.id,
-      name: hit.name,
-      description: hit.description,
-    }));
+    const rawHits = response?.data?.search?.hits ?? [];
+    const hits = normalizeDiseaseHits(rawHits, size);
     diseaseCache.set(cacheKey, hits);
     return hits;
   }

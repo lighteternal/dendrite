@@ -13,3 +13,4 @@
 - [x] M11: UI readability + IA split-screen pass (Network/Evidence/Hypothesis tabs), disease-only entity matching hardening, and second E2E/API validation sweep.
 - [x] M12: Deep Discoverer agent workflow (LangGraph + DeepAgents-style subagents) with live SSE journey and graph-focus integration.
 - [x] M13: Reliability/readability hardening pass (Reactome fail-soft per target, faster BioMCP budget, richer Sankey coverage, improved node label spacing, executive natural-language brief).
+- [x] M14: Decision-brief-first rebuild (NL-first landing, `/brief` workspace, `/api/runCaseStream`, disease resolver guardrails, path-first graph declutter, and 5-disease regression validation).

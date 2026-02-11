@@ -53,6 +53,7 @@ STRING_MAX_ADDED_EDGES=500
 STRING_MAX_NEIGHBORS_PER_SEED=15
 CACHE_TTL_MS=300000
 OPENAI_MODEL=gpt-5.2
+OPENAI_SMALL_MODEL=gpt-5.2
 STREAM_RANKING_TIMEOUT_MS=10000
 STREAM_P5_BUDGET_MS=10000
 STREAM_P5_PER_TARGET_TIMEOUT_MS=3500
@@ -68,19 +69,39 @@ STREAM_MAX_LITERATURE_TARGETS=5
 - `npm run services:down` - stop MCP services.
 - `./scripts/check-services.sh` - health checks on local ports.
 
-## Streamed Build Pipeline
+## Brief-First API Surface
 
-`GET /api/streamGraph?diseaseQuery=...&maxTargets=20`
+### `GET /api/resolveDisease?query=...`
 
-SSE events:
+Disease-only entity resolver used by landing and brief workspace:
 
-- `status` - phase updates, elapsed time, counts, source health.
-- `partial_graph` - incremental graph node/edge waves.
-- `sankey` - mechanism trail rows.
-- `ranking` - strict JSON ranked targets.
-- `enrichment_ready` - article/trial snippets linked to node IDs.
-- `done` - final stats.
-- `error` - recoverable/non-recoverable issues.
+- Returns `selected`, `candidates`, `rationale`
+- Restricts to disease entity namespaces (`EFO`, `MONDO`, `ORPHANET`, `DOID`, `HP`)
+- Uses semantic ranking + lexical guardrails to avoid non-disease variants (for example biomarker/measurement entities)
+
+### `GET /api/runCaseStream?query=...&mode=fast|balanced|deep[&diseaseId=...]`
+
+Decision-brief streaming endpoint consumed by `/brief`:
+
+- `resolver_candidates` - disease candidates surfaced before run starts
+- `resolver_selected` - selected disease entity + rationale
+- `status` - step status, counts, source health, completion
+- `agent_step` - natural-language timeline entries for user explainability
+- `graph_patch` - incremental node/edge updates for mechanism graph
+- `path_update` - currently strongest mechanism thread for graph focus
+- `brief_section` - recommendation + assembled brief sections
+- `done` - run completion event
+- `error` - recoverable/non-recoverable failures
+
+Modes:
+
+- `fast`: smallest target set for speed
+- `balanced`: default depth with interaction context
+- `deep`: densest run with literature/trial enrichment
+
+### `GET /api/streamGraph?diseaseQuery=...&maxTargets=...`
+
+Low-level pipeline endpoint still available for internal orchestration and compatibility.
 
 Pipeline phases:
 
@@ -174,6 +195,9 @@ Validated locally in this repository:
   - Crohn disease
   - Acute myeloid leukemia
   - Full pipeline completion observed on each run with no browser runtime errors
+- Decision brief stream checks across 5 diseases ✅
+  - Canonical disease resolution observed (`MONDO_0004975`, `EFO_0003060`, `EFO_0000685`, `EFO_0000384`, `EFO_0000222`)
+  - `P6: Build complete` status observed in all runs
 - Direct MCP endpoint checks ✅
   - OpenTargets: `http://127.0.0.1:7010/mcp`
   - Reactome: `http://127.0.0.1:7020/mcp`
@@ -182,9 +206,9 @@ Validated locally in this repository:
   - BioMCP: `http://127.0.0.1:8000/mcp`
   - Verified by direct tool calls (`search_diseases`, `find_pathways_by_gene`, `get_interaction_network`, `search_targets`, `article_searcher`, `trial_searcher`)
 
-Recent observed timings (full profile enabled, `maxTargets=8`, February 11, 2026):
+Recent observed timings (balanced mode, February 11, 2026):
 
-- API stream completion across 5 diseases: ~24s to ~27s
+- API stream completion across 5 diseases: ~25s to ~29s
 - Typical bottlenecks: P5 (BioMCP literature/trial enrichment), P6 (OpenAI narrative refinement with timeout fallback)
 - Agent discoverer run observed: ~53s end-to-end for a full delegated workflow
 

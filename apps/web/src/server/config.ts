@@ -54,6 +54,7 @@ export const appConfig = {
   },
   openai: {
     model: process.env.OPENAI_MODEL ?? "gpt-5.2",
+    smallModel: process.env.OPENAI_SMALL_MODEL ?? "gpt-5.2",
     hypothesisTimeoutMs: parseNumber(process.env.OPENAI_HYPOTHESIS_TIMEOUT_MS, 10_000),
   },
 };

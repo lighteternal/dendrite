@@ -43,6 +43,13 @@ type RenderLink = LinkObject<RenderNode> & {
   color: string;
 };
 
+type LabelRect = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
 const nodeColors: Record<GraphNode["type"], string> = {
   disease: "#ef4444",
   target: "#5b57e6",
@@ -134,6 +141,20 @@ function drawNode(ctx: CanvasRenderingContext2D, node: RenderNode, radius: numbe
   }
 }
 
+function shortLabel(value: string, max = 24): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(8, max - 1))}\u2026`;
+}
+
+function collides(a: LabelRect, b: LabelRect, pad = 3): boolean {
+  return !(
+    a.right + pad < b.left ||
+    a.left - pad > b.right ||
+    a.bottom + pad < b.top ||
+    a.top - pad > b.bottom
+  );
+}
+
 export function GraphCanvas({
   nodes,
   edges,
@@ -147,6 +168,7 @@ export function GraphCanvas({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const hasFittedRef = useRef(false);
   const lastAutoFitNodeCountRef = useRef(0);
+  const labelRectsRef = useRef<LabelRect[]>([]);
 
   const [width, setWidth] = useState(1000);
   const [fullscreen, setFullscreen] = useState(false);
@@ -406,6 +428,9 @@ export function GraphCanvas({
         d3AlphaDecay={0.028}
         d3VelocityDecay={0.24}
         cooldownTicks={170}
+        onRenderFramePre={() => {
+          labelRectsRef.current = [];
+        }}
         onBackgroundClick={() => {
           setPathAnchorNodeId(null);
           setLocalFocusNodeIds(new Set());
@@ -494,20 +519,39 @@ export function GraphCanvas({
 
           const showLabel =
             n.type === "disease" ||
-            n.type === "target" ||
             selected ||
             activeNodeSet.has(n.id) ||
             hoverNodeId === n.id ||
-            globalScale > 2.1;
+            (n.type === "target" && (n.score ?? 0) >= 0.7) ||
+            globalScale > 2.35;
 
           if (!showLabel) return;
 
-          const label = n.label;
+          const prominent = selected || hoverNodeId === n.id || activeNodeSet.has(n.id);
+          const label = prominent ? n.label : shortLabel(n.label);
           const fontSize = Math.max(9, 11 / globalScale);
           ctx.font = `${fontSize}px var(--font-body)`;
           const widthWithPadding = ctx.measureText(label).width + 8;
-          const x = 0;
-          const y = radius + fontSize + 4;
+          const absX = typeof n.x === "number" ? n.x : 0;
+          const absY = typeof n.y === "number" ? n.y : 0;
+          const mag = Math.hypot(absX, absY) || 1;
+          const ux = absX / mag;
+          const uy = absY / mag;
+          const x = ux * (radius + 11);
+          const y = uy * (radius + 11);
+
+          const rect: LabelRect = {
+            left: absX + x - widthWithPadding / 2,
+            top: absY + y - fontSize,
+            right: absX + x + widthWithPadding / 2,
+            bottom: absY + y + 6,
+          };
+
+          if (!prominent) {
+            const hasCollision = labelRectsRef.current.some((existing) => collides(rect, existing));
+            if (hasCollision) return;
+          }
+          labelRectsRef.current.push(rect);
 
           ctx.save();
           ctx.globalAlpha = focused ? 0.95 : 0.2;

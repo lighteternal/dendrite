@@ -32,6 +32,29 @@ type PipelinePhase = "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6";
 
 type SourceHealthState = Record<SourceName, "green" | "yellow" | "red">;
 
+function cleanText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function compactLabel(value: string, max = 32): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(8, max - 1))}\u2026`;
+}
+
+function preferredLabel(
+  candidates: Array<unknown>,
+  fallback: string,
+  max = 32,
+): string {
+  for (const candidate of candidates) {
+    const cleaned = cleanText(candidate);
+    if (cleaned) return compactLabel(cleaned, max);
+  }
+  return compactLabel(fallback, max);
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -221,11 +244,12 @@ export async function GET(request: NextRequest) {
             id: makeNodeId("disease", diseaseId),
             type: "disease",
             primaryId: diseaseId,
-            label: diseaseName,
+            label: preferredLabel([diseaseName], diseaseId, 40),
             score: 1,
             size: 80,
             meta: {
               description: diseaseDescription,
+              displayName: diseaseName,
               query: diseaseQuery,
             },
           };
@@ -255,7 +279,7 @@ export async function GET(request: NextRequest) {
             id: makeNodeId("disease", diseaseId),
             type: "disease",
             primaryId: diseaseId,
-            label: diseaseQuery,
+            label: preferredLabel([diseaseQuery], diseaseId, 40),
             score: 0.5,
             size: 80,
             meta: {
@@ -290,11 +314,17 @@ export async function GET(request: NextRequest) {
                 id: targetNodeId,
                 type: "target",
                 primaryId: target.targetId,
-                label: target.targetSymbol,
+                label: preferredLabel(
+                  [target.targetSymbol, target.targetName],
+                  target.targetId,
+                  24,
+                ),
                 score,
                 size: 24 + score * 30,
                 meta: {
+                  targetSymbol: target.targetSymbol,
                   targetName: target.targetName,
+                  displayName: target.targetName || target.targetSymbol,
                   openTargetsEvidence: score,
                   stage: "P1",
                 },
@@ -379,10 +409,11 @@ export async function GET(request: NextRequest) {
                     id: pathwayNodeId,
                     type: "pathway",
                     primaryId: pathway.id,
-                    label: pathway.name,
+                    label: preferredLabel([pathway.name], pathway.id, 34),
                     score: 0.6,
                     size: 22,
                     meta: {
+                      displayName: pathway.name,
                       species: pathway.species,
                       stage: "P2",
                     },
@@ -476,10 +507,11 @@ export async function GET(request: NextRequest) {
                       id: drugNodeId,
                       type: "drug",
                       primaryId: drug.drugId,
-                      label: drug.name,
+                      label: preferredLabel([drug.name], drug.drugId, 28),
                       score: normalizeScore((drug.phase ?? 0) / 4),
                       size: 18 + (drug.phase ?? 0) * 2,
                       meta: {
+                        displayName: drug.name,
                         phase: drug.phase,
                         status: drug.status,
                         modality: drug.drugType,
@@ -510,10 +542,11 @@ export async function GET(request: NextRequest) {
                       id: drugNodeId,
                       type: "drug",
                       primaryId: drug.moleculeId,
-                      label: drug.name,
+                      label: preferredLabel([drug.name], drug.moleculeId, 28),
                       score: drug.potency ? normalizeScore(1 / (1 + drug.potency / 1000)) : 0.4,
                       size: 18,
                       meta: {
+                        displayName: drug.name,
                         activityType: drug.activityType,
                         potency: drug.potency,
                         potencyUnits: drug.potencyUnits,
@@ -639,10 +672,11 @@ export async function GET(request: NextRequest) {
                 id: nodeId,
                 type: "interaction",
                 primaryId: node.symbol,
-                label: node.symbol,
+                label: preferredLabel([node.symbol, node.annotation], node.id, 24),
                 score: 0.35,
                 size: 16,
                 meta: {
+                  displayName: node.annotation || node.symbol,
                   annotation: node.annotation,
                   stage: "P4",
                 },

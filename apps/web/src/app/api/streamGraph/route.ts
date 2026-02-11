@@ -56,6 +56,10 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const diseaseQuery = searchParams.get("diseaseQuery")?.trim();
   const maxTargets = Number(searchParams.get("maxTargets") ?? 20);
+  const includePathways = searchParams.get("pathways") !== "0";
+  const includeDrugs = searchParams.get("drugs") !== "0";
+  const includeInteractions = searchParams.get("interactions") !== "0";
+  const includeLiterature = searchParams.get("literature") !== "0";
 
   if (!diseaseQuery) {
     return new Response("Missing diseaseQuery", { status: 400 });
@@ -302,100 +306,128 @@ export async function GET(request: NextRequest) {
           });
         }
 
-        try {
-          emitStatus("P2", "Fetching pathways from Reactome", 36, {
-            targets: targetCount,
-          });
-
-          const seededTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, maxTargets));
-
-          for (const batch of chunkArray(seededTargets, 4)) {
-            const resolved = await Promise.all(
-              batch.map(async (targetNodeId) => {
-                const symbol = targetSymbolByNodeId.get(targetNodeId);
-                if (!symbol) return { targetNodeId, pathways: [] as Awaited<ReturnType<typeof findPathwaysByGene>> };
-
-                const pathways = await withTimeout(findPathwaysByGene(symbol), phaseTimeoutMs);
-                return {
-                  targetNodeId,
-                  pathways: pathways.slice(0, 8),
-                };
-              }),
-            );
-
-            const nodes: GraphNode[] = [];
-            const edges: GraphEdge[] = [];
-
-            for (const item of resolved) {
-              for (const pathway of item.pathways) {
-                const pathwayNodeId = makeNodeId("pathway", pathway.id);
-                pathwaysByTargetId.get(item.targetNodeId)?.add(pathway.id);
-
-                nodes.push({
-                  id: pathwayNodeId,
-                  type: "pathway",
-                  primaryId: pathway.id,
-                  label: pathway.name,
-                  score: 0.6,
-                  size: 22,
-                  meta: {
-                    species: pathway.species,
-                    stage: "P2",
-                  },
-                });
-
-                edges.push({
-                  id: makeEdgeId(item.targetNodeId, pathwayNodeId, "target_pathway"),
-                  source: item.targetNodeId,
-                  target: pathwayNodeId,
-                  type: "target_pathway",
-                  weight: 0.65,
-                  meta: {
-                    source: "Reactome",
-                  },
-                });
-              }
-            }
-
-            pushNodesEdges(nodes, edges);
-            pathwayCount = [...nodeMap.values()].filter((node) => node.type === "pathway").length;
-            emitStatus("P2", `${pathwayCount} pathways linked`, 52, {
-              targets: targetCount,
-              pathways: pathwayCount,
-            });
-            await sleep(randomInt(appConfig.stream.batchMinDelayMs, appConfig.stream.batchMaxDelayMs));
-          }
-
+        if (!includePathways) {
+          emitStatus(
+            "P2",
+            "Pathway expansion skipped by build profile",
+            52,
+            { targets: targetCount },
+            true,
+          );
           emit({
             event: "sankey",
             data: {
               rows: toSankeyRows([...nodeMap.values()], [...edgeMap.values()]),
             },
           });
-        } catch (error) {
-          sourceHealth.reactome = "yellow";
-          emit({
-            event: "error",
-            data: {
-              phase: "P2",
-              message: `Reactome pathway expansion degraded: ${error instanceof Error ? error.message : "unknown"}`,
-              recoverable: true,
-            },
-          });
+        } else {
+          try {
+            emitStatus("P2", "Fetching pathways from Reactome", 36, {
+              targets: targetCount,
+            });
+
+            const seededTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, maxTargets));
+
+            for (const batch of chunkArray(seededTargets, 4)) {
+              const resolved = await Promise.all(
+                batch.map(async (targetNodeId) => {
+                  const symbol = targetSymbolByNodeId.get(targetNodeId);
+                  if (!symbol) return { targetNodeId, pathways: [] as Awaited<ReturnType<typeof findPathwaysByGene>> };
+
+                  const pathways = await withTimeout(findPathwaysByGene(symbol), phaseTimeoutMs);
+                  return {
+                    targetNodeId,
+                    pathways: pathways.slice(0, 8),
+                  };
+                }),
+              );
+
+              const nodes: GraphNode[] = [];
+              const edges: GraphEdge[] = [];
+
+              for (const item of resolved) {
+                for (const pathway of item.pathways) {
+                  const pathwayNodeId = makeNodeId("pathway", pathway.id);
+                  pathwaysByTargetId.get(item.targetNodeId)?.add(pathway.id);
+
+                  nodes.push({
+                    id: pathwayNodeId,
+                    type: "pathway",
+                    primaryId: pathway.id,
+                    label: pathway.name,
+                    score: 0.6,
+                    size: 22,
+                    meta: {
+                      species: pathway.species,
+                      stage: "P2",
+                    },
+                  });
+
+                  edges.push({
+                    id: makeEdgeId(item.targetNodeId, pathwayNodeId, "target_pathway"),
+                    source: item.targetNodeId,
+                    target: pathwayNodeId,
+                    type: "target_pathway",
+                    weight: 0.65,
+                    meta: {
+                      source: "Reactome",
+                    },
+                  });
+                }
+              }
+
+              pushNodesEdges(nodes, edges);
+              pathwayCount = [...nodeMap.values()].filter((node) => node.type === "pathway").length;
+              emitStatus("P2", `${pathwayCount} pathways linked`, 52, {
+                targets: targetCount,
+                pathways: pathwayCount,
+              });
+              await sleep(randomInt(appConfig.stream.batchMinDelayMs, appConfig.stream.batchMaxDelayMs));
+            }
+
+            emit({
+              event: "sankey",
+              data: {
+                rows: toSankeyRows([...nodeMap.values()], [...edgeMap.values()]),
+              },
+            });
+          } catch (error) {
+            sourceHealth.reactome = "yellow";
+            emit({
+              event: "error",
+              data: {
+                phase: "P2",
+                message: `Reactome pathway expansion degraded: ${error instanceof Error ? error.message : "unknown"}`,
+                recoverable: true,
+              },
+            });
+          }
         }
 
-        try {
-          emitStatus("P3", "Fetching drugs from OpenTargets and ChEMBL", 58, {
-            targets: targetCount,
-            pathways: pathwayCount,
-          });
+        if (!includeDrugs) {
+          emitStatus(
+            "P3",
+            "Drug enrichment skipped by build profile",
+            68,
+            {
+              targets: targetCount,
+              pathways: pathwayCount,
+            },
+            true,
+          );
+        } else {
+          try {
+            emitStatus("P3", "Fetching drugs from OpenTargets and ChEMBL", 58, {
+              targets: targetCount,
+              pathways: pathwayCount,
+            });
 
-          const seedTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, 10));
-          let degradedTargets = 0;
+            const seedTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, 10));
+            let degradedTargets = 0;
 
-          for (const batch of chunkArray(seedTargets, 2)) {
-            const settledBatch = await Promise.allSettled(
-              batch.map(async (targetNodeId) => {
+            for (const batch of chunkArray(seedTargets, 2)) {
+              const settledBatch = await Promise.allSettled(
+                batch.map(async (targetNodeId) => {
                 const targetPrimaryId = nodeMap.get(targetNodeId)?.primaryId;
                 const targetSymbol = targetSymbolByNodeId.get(targetNodeId);
                 if (!targetPrimaryId || !targetSymbol) {
@@ -477,86 +509,99 @@ export async function GET(request: NextRequest) {
                   }
                 }
 
-                return { nodes, edges };
-              }),
-            );
+                  return { nodes, edges };
+                }),
+              );
 
-            for (const settled of settledBatch) {
-              if (settled.status === "fulfilled") {
-                pushNodesEdges(settled.value.nodes, settled.value.edges);
-              } else {
-                degradedTargets += 1;
+              for (const settled of settledBatch) {
+                if (settled.status === "fulfilled") {
+                  pushNodesEdges(settled.value.nodes, settled.value.edges);
+                } else {
+                  degradedTargets += 1;
+                }
               }
+
+              drugCount = [...nodeMap.values()].filter((node) => node.type === "drug").length;
+              emitStatus("P3", `${drugCount} compounds linked`, 68, {
+                targets: targetCount,
+                pathways: pathwayCount,
+                drugs: drugCount,
+                degradedTargets,
+              });
+              await sleep(
+                randomInt(
+                  Math.max(50, Math.floor(appConfig.stream.batchMinDelayMs / 2)),
+                  Math.max(120, Math.floor(appConfig.stream.batchMaxDelayMs / 2)),
+                ),
+              );
             }
 
-            drugCount = [...nodeMap.values()].filter((node) => node.type === "drug").length;
-            emitStatus("P3", `${drugCount} compounds linked`, 68, {
-              targets: targetCount,
-              pathways: pathwayCount,
-              drugs: drugCount,
-              degradedTargets,
-            });
-            await sleep(
-              randomInt(
-                Math.max(50, Math.floor(appConfig.stream.batchMinDelayMs / 2)),
-                Math.max(120, Math.floor(appConfig.stream.batchMaxDelayMs / 2)),
-              ),
-            );
-          }
+            if (degradedTargets > 0) {
+              sourceHealth.chembl = "yellow";
+              emit({
+                event: "error",
+                data: {
+                  phase: "P3",
+                  message: `Drug enrichment partial: ${degradedTargets} target-level fetches degraded`,
+                  recoverable: true,
+                },
+              });
+            }
 
-          if (degradedTargets > 0) {
+            emit({
+              event: "sankey",
+              data: {
+                rows: toSankeyRows([...nodeMap.values()], [...edgeMap.values()]),
+              },
+            });
+          } catch (error) {
             sourceHealth.chembl = "yellow";
             emit({
               event: "error",
               data: {
                 phase: "P3",
-                message: `Drug enrichment partial: ${degradedTargets} target-level fetches degraded`,
+                message: `Drug enrichment degraded: ${error instanceof Error ? error.message : "unknown"}`,
                 recoverable: true,
               },
             });
           }
-
-          emit({
-            event: "sankey",
-            data: {
-              rows: toSankeyRows([...nodeMap.values()], [...edgeMap.values()]),
-            },
-          });
-        } catch (error) {
-          sourceHealth.chembl = "yellow";
-          emit({
-            event: "error",
-            data: {
-              phase: "P3",
-              message: `Drug enrichment degraded: ${error instanceof Error ? error.message : "unknown"}`,
-              recoverable: true,
-            },
-          });
         }
 
-        try {
-          emitStatus("P4", "Fetching STRING interaction neighborhood", 72, {
-            targets: targetCount,
-            drugs: drugCount,
-          });
+        if (!includeInteractions) {
+          emitStatus(
+            "P4",
+            "Interaction overlay skipped by build profile",
+            80,
+            {
+              targets: targetCount,
+              drugs: drugCount,
+            },
+            true,
+          );
+        } else {
+          try {
+            emitStatus("P4", "Fetching STRING interaction neighborhood", 72, {
+              targets: targetCount,
+              drugs: drugCount,
+            });
 
-          const seedSymbols = targetNodeIds
-            .slice(0, Math.min(12, targetNodeIds.length))
-            .map((id) => targetSymbolByNodeId.get(id))
-            .filter((symbol): symbol is string => Boolean(symbol));
+            const seedSymbols = targetNodeIds
+              .slice(0, Math.min(12, targetNodeIds.length))
+              .map((id) => targetSymbolByNodeId.get(id))
+              .filter((symbol): symbol is string => Boolean(symbol));
 
-          if (seedSymbols.length > 1) {
-            const interaction = await withTimeout(
-              getInteractionNetwork(
-                seedSymbols,
-                appConfig.string.confidenceDefault,
-                appConfig.string.maxNeighborsPerSeed,
-              ),
-              phaseTimeoutMs,
-            );
+            if (seedSymbols.length > 1) {
+              const interaction = await withTimeout(
+                getInteractionNetwork(
+                  seedSymbols,
+                  appConfig.string.confidenceDefault,
+                  appConfig.string.maxNeighborsPerSeed,
+                ),
+                phaseTimeoutMs,
+              );
 
-            const nodes: GraphNode[] = [];
-            const edges: GraphEdge[] = [];
+              const nodes: GraphNode[] = [];
+              const edges: GraphEdge[] = [];
 
             for (const node of interaction.nodes.slice(0, appConfig.string.maxAddedNodes)) {
               const existingTarget = targetNodeIds.find(
@@ -618,34 +663,49 @@ export async function GET(request: NextRequest) {
               }
             }
 
-            pushNodesEdges(nodes, edges);
-            interactionCount = edges.length;
-          }
+              pushNodesEdges(nodes, edges);
+              interactionCount = edges.length;
+            }
 
-          emitStatus("P4", `${interactionCount} interaction edges added`, 80, {
-            interactions: interactionCount,
-            targets: targetCount,
-            drugs: drugCount,
-          });
-        } catch (error) {
-          sourceHealth.string = "yellow";
-          emit({
-            event: "error",
-            data: {
-              phase: "P4",
-              message: `STRING interactions degraded: ${error instanceof Error ? error.message : "unknown"}`,
-              recoverable: true,
-            },
-          });
+            emitStatus("P4", `${interactionCount} interaction edges added`, 80, {
+              interactions: interactionCount,
+              targets: targetCount,
+              drugs: drugCount,
+            });
+          } catch (error) {
+            sourceHealth.string = "yellow";
+            emit({
+              event: "error",
+              data: {
+                phase: "P4",
+                message: `STRING interactions degraded: ${error instanceof Error ? error.message : "unknown"}`,
+                recoverable: true,
+              },
+            });
+          }
         }
 
-        try {
-          emitStatus("P5", "Fetching literature and trial snippets", 84, {
-            targets: targetCount,
-            pathways: pathwayCount,
-            drugs: drugCount,
-            interactions: interactionCount,
-          });
+        if (!includeLiterature) {
+          emitStatus(
+            "P5",
+            "Literature/trials enrichment skipped by build profile",
+            90,
+            {
+              targets: targetCount,
+              pathways: pathwayCount,
+              drugs: drugCount,
+              interactions: interactionCount,
+            },
+            true,
+          );
+        } else {
+          try {
+            emitStatus("P5", "Fetching literature and trial snippets", 84, {
+              targets: targetCount,
+              pathways: pathwayCount,
+              drugs: drugCount,
+              interactions: interactionCount,
+            });
 
           const linkByNodeId: Record<string, { articles: unknown[]; trials: unknown[] }> = {};
           const focusTargets = targetNodeIds.slice(
@@ -748,22 +808,23 @@ export async function GET(request: NextRequest) {
             });
           }
 
-          emit({
-            event: "enrichment_ready",
-            data: {
-              linksByNodeId: linkByNodeId,
-            },
-          });
-        } catch (error) {
-          sourceHealth.biomcp = "yellow";
-          emit({
-            event: "error",
-            data: {
-              phase: "P5",
-              message: `BioMCP enrichment degraded: ${error instanceof Error ? error.message : "unknown"}`,
-              recoverable: true,
-            },
-          });
+            emit({
+              event: "enrichment_ready",
+              data: {
+                linksByNodeId: linkByNodeId,
+              },
+            });
+          } catch (error) {
+            sourceHealth.biomcp = "yellow";
+            emit({
+              event: "error",
+              data: {
+                phase: "P5",
+                message: `BioMCP enrichment degraded: ${error instanceof Error ? error.message : "unknown"}`,
+                recoverable: true,
+              },
+            });
+          }
         }
 
         emitStatus("P6", "Ranking targets and generating summary", 94, {

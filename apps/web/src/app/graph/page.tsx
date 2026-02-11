@@ -19,10 +19,15 @@ export default async function GraphPage({
     literature:
       (Array.isArray(params.literature) ? params.literature[0] : params.literature) !== "0",
   };
+  const maxTargetsRaw = Array.isArray(params.maxTargets) ? params.maxTargets[0] : params.maxTargets;
+  const parsedMaxTargets = Number(maxTargetsRaw ?? 6);
+  const initialMaxTargets = Number.isFinite(parsedMaxTargets)
+    ? Math.max(4, Math.min(20, Math.floor(parsedMaxTargets)))
+    : 6;
 
   if (!disease) {
     return <div className="p-8 text-sm">Missing disease query.</div>;
   }
 
-  return <GraphWorkbench diseaseQuery={disease} defaults={defaults} />;
+  return <GraphWorkbench diseaseQuery={disease} defaults={defaults} initialMaxTargets={initialMaxTargets} />;
 }

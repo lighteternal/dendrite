@@ -21,6 +21,12 @@ type StreamError = {
 };
 
 type EnrichmentMap = Record<string, { articles: unknown[]; trials: unknown[] }>;
+type BuildOptions = {
+  pathways: boolean;
+  drugs: boolean;
+  interactions: boolean;
+  literature: boolean;
+};
 
 export function useGraphStream() {
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -57,14 +63,31 @@ export function useGraphStream() {
     setIsStreaming(false);
   }, []);
 
-  const start = useCallback((diseaseQuery: string, maxTargets = 20) => {
+  const start = useCallback((
+    diseaseQuery: string,
+    maxTargets = 20,
+    options: BuildOptions = {
+      pathways: true,
+      drugs: true,
+      interactions: true,
+      literature: true,
+    },
+  ) => {
     stop();
     reset();
     setIsStreaming(true);
     setIsDone(false);
     const token = ++streamTokenRef.current;
 
-    const url = `/api/streamGraph?diseaseQuery=${encodeURIComponent(diseaseQuery)}&maxTargets=${maxTargets}`;
+    const params = new URLSearchParams({
+      diseaseQuery,
+      maxTargets: String(maxTargets),
+      pathways: options.pathways ? "1" : "0",
+      drugs: options.drugs ? "1" : "0",
+      interactions: options.interactions ? "1" : "0",
+      literature: options.literature ? "1" : "0",
+    });
+    const url = `/api/streamGraph?${params.toString()}`;
     const source = new EventSource(url);
     eventSourceRef.current = source;
 

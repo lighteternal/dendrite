@@ -654,6 +654,8 @@ export function GraphWorkbench({
           <span className="rounded-full border border-[#dfdbff] bg-[#f7f5ff] px-3 py-1">
             {stream.isStreaming
               ? "Status: building live network"
+              : stream.isInterrupted
+                ? "Status: stream interrupted (partial results shown)"
               : stream.isDone
                 ? `Status: complete${pipelineElapsedMs ? ` in ${(pipelineElapsedMs / 1000).toFixed(1)}s` : ""}`
                 : "Status: idle"}

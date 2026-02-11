@@ -42,6 +42,7 @@ export function useGraphStream() {
   const [enrichmentByNode, setEnrichmentByNode] = useState<EnrichmentMap>({});
   const [isStreaming, setIsStreaming] = useState(false);
   const [isDone, setIsDone] = useState(false);
+  const [isInterrupted, setIsInterrupted] = useState(false);
 
   const reset = useCallback(() => {
     setNodeMap(new Map());
@@ -53,6 +54,7 @@ export function useGraphStream() {
     setStats({});
     setEnrichmentByNode({});
     setIsDone(false);
+    setIsInterrupted(false);
   }, []);
 
   const stop = useCallback(() => {
@@ -78,6 +80,7 @@ export function useGraphStream() {
     reset();
     setIsStreaming(true);
     setIsDone(false);
+    setIsInterrupted(false);
     const token = ++streamTokenRef.current;
 
     const params = new URLSearchParams({
@@ -202,6 +205,11 @@ export function useGraphStream() {
     source.onerror = () => {
       if (!isCurrentStream()) return;
       setIsStreaming(false);
+      setIsInterrupted(true);
+      setErrors((prev) => [
+        ...prev,
+        { phase: "stream", message: "Connection interrupted; showing partial results", recoverable: true },
+      ]);
       source.close();
     };
   }, [reset, stop]);
@@ -220,6 +228,7 @@ export function useGraphStream() {
     enrichmentByNode,
     isStreaming,
     isDone,
+    isInterrupted,
     start,
     stop,
   };

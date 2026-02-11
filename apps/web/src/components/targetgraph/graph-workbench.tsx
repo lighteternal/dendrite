@@ -88,6 +88,15 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
   );
 
   const rankingRows = useMemo(() => buildEvidenceTable(stream.nodes, stream.edges), [stream.nodes, stream.edges]);
+  const nodeIdsByLabel = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const node of stream.nodes) {
+      const current = map.get(node.label) ?? [];
+      current.push(node.id);
+      map.set(node.label, current);
+    }
+    return map;
+  }, [stream.nodes]);
 
   const handleContinuePartial = (phase: string) => {
     toast.info(`Continuing ${phase} with partial data`);
@@ -97,16 +106,16 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
     const nodeIds = new Set<string>();
     const edgeIds = new Set<string>();
 
-    const sourceNodes = stream.nodes.filter((node) => node.label === source);
-    const targetNodes = stream.nodes.filter((node) => node.label === target);
+    const sourceNodes = nodeIdsByLabel.get(source) ?? [];
+    const targetNodes = nodeIdsByLabel.get(target) ?? [];
+    const sourceNodeSet = new Set(sourceNodes);
+    const targetNodeSet = new Set(targetNodes);
 
-    sourceNodes.forEach((node) => nodeIds.add(node.id));
-    targetNodes.forEach((node) => nodeIds.add(node.id));
+    sourceNodes.forEach((id) => nodeIds.add(id));
+    targetNodes.forEach((id) => nodeIds.add(id));
 
     for (const edge of stream.edges) {
-      const sourceNode = stream.nodes.find((node) => node.id === edge.source);
-      const targetNode = stream.nodes.find((node) => node.id === edge.target);
-      if (sourceNode?.label === source && targetNode?.label === target) {
+      if (sourceNodeSet.has(edge.source) && targetNodeSet.has(edge.target)) {
         edgeIds.add(edge.id);
       }
     }
@@ -126,8 +135,8 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
       </header>
       <BuildStepper statuses={stream.statuses} onContinuePartial={handleContinuePartial} />
 
-      <div className="grid gap-3 px-3 pt-3 md:grid-cols-[320px_minmax(0,1fr)_360px] md:px-6">
-        <div className="space-y-3">
+      <div className="grid gap-3 px-3 pt-3 xl:grid-cols-[300px_minmax(0,1fr)_360px] md:px-6">
+        <div className="order-2 space-y-3 xl:order-1 xl:sticky xl:top-[164px] xl:self-start">
           <Card className="border-white/10 bg-[#0d1521]">
             <CardHeader className="pb-3">
               <CardTitle className="text-sm text-[#dceeff]">Filters</CardTitle>
@@ -178,6 +187,19 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
                   <Download className="h-3.5 w-3.5" /> Export
                 </Button>
               </div>
+              {(highlightedNodeIds.size > 0 || highlightedEdgeIds.size > 0) ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="w-full"
+                  onClick={() => {
+                    setHighlightedNodeIds(new Set());
+                    setHighlightedEdgeIds(new Set());
+                  }}
+                >
+                  Clear focus highlighting
+                </Button>
+              ) : null}
             </CardContent>
           </Card>
 
@@ -222,12 +244,16 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
           ) : null}
         </div>
 
-        <div className="space-y-3">
+        <div className="order-1 space-y-3 xl:order-2">
           <GraphCanvas
             nodes={filtered.nodes}
             edges={filtered.edges}
             selectedNodeId={selectedNodeId}
-            onSelectNode={(node) => setSelectedNodeId(node?.id ?? null)}
+            onSelectNode={(node) => {
+              setSelectedNodeId(node?.id ?? null);
+              setHighlightedNodeIds(new Set());
+              setHighlightedEdgeIds(new Set());
+            }}
             highlightedNodeIds={highlightedNodeIds}
             highlightedEdgeIds={highlightedEdgeIds}
           />
@@ -251,11 +277,13 @@ export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
           </Collapsible>
         </div>
 
-        <NodeInspector
-          selectedNode={selectedNode}
-          edges={stream.edges}
-          enrichmentByNode={showLiterature ? stream.enrichmentByNode : {}}
-        />
+        <div className="order-3 xl:sticky xl:top-[164px] xl:self-start">
+          <NodeInspector
+            selectedNode={selectedNode}
+            edges={stream.edges}
+            enrichmentByNode={showLiterature ? stream.enrichmentByNode : {}}
+          />
+        </div>
       </div>
 
       <div className="px-6 pt-3 text-[11px] text-[#8faac6]">

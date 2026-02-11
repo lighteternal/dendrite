@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import CytoscapeComponent from "react-cytoscapejs";
 import type cytoscape from "cytoscape";
-import { Camera, Maximize2, Minimize2 } from "lucide-react";
+import { Camera, LocateFixed, Maximize2, Minimize2 } from "lucide-react";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
 import { Button } from "@/components/ui/button";
 
@@ -144,10 +144,39 @@ export function GraphCanvas({
   highlightedEdgeIds,
 }: Props) {
   const cyRef = useRef<cytoscape.Core | null>(null);
+  const layoutRef = useRef<cytoscape.Layouts | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [pathAnchorNodeId, setPathAnchorNodeId] = useState<string | null>(null);
 
   const nodeLookup = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const nodeCounts = useMemo(
+    () =>
+      nodes.reduce(
+        (acc, node) => {
+          acc[node.type] = (acc[node.type] ?? 0) + 1;
+          return acc;
+        },
+        {} as Record<GraphNode["type"], number>,
+      ),
+    [nodes],
+  );
+
+  const layoutOptions = useMemo<cytoscape.LayoutOptions>(
+    () => ({
+      name: "cose",
+      animate: false,
+      fit: true,
+      padding: 56,
+      randomize: false,
+      nodeRepulsion: nodes.length > 180 ? 10000 : 14000,
+      idealEdgeLength: nodes.length > 180 ? 100 : 126,
+      edgeElasticity: 90,
+      gravity: 0.35,
+      numIter: nodes.length > 220 ? 600 : 1000,
+      coolingFactor: 0.95,
+    }),
+    [nodes.length],
+  );
 
   const elements = useMemo(
     () => [
@@ -180,7 +209,7 @@ export function GraphCanvas({
     cy.off("tap", "node");
     cy.off("cxttap", "node");
 
-    cy.on("tap", "node", (event) => {
+    const onTap = (event: cytoscape.EventObjectNode) => {
       const node = event.target;
       const nodeId = node.id();
 
@@ -202,18 +231,28 @@ export function GraphCanvas({
         setPathAnchorNodeId(nodeId);
       } else {
         setPathAnchorNodeId(null);
+        cy.elements().removeClass("faded");
+        cy.elements().removeClass("highlighted");
         onSelectNode(nodeLookup.get(nodeId) ?? null);
       }
-    });
+    };
 
-    cy.on("cxttap", "node", (event) => {
+    const onContextTap = (event: cytoscape.EventObjectNode) => {
       const node = event.target;
       const neighborhood = node.closedNeighborhood();
       cy.elements().addClass("faded");
       neighborhood.removeClass("faded");
       neighborhood.addClass("highlighted");
       onSelectNode(nodeLookup.get(node.id()) ?? null);
-    });
+    };
+
+    cy.on("tap", "node", onTap);
+    cy.on("cxttap", "node", onContextTap);
+
+    return () => {
+      cy.off("tap", "node", onTap);
+      cy.off("cxttap", "node", onContextTap);
+    };
   }, [nodeLookup, onSelectNode, pathAnchorNodeId]);
 
   useEffect(() => {
@@ -222,6 +261,7 @@ export function GraphCanvas({
 
     cy.nodes().removeClass("selected");
     cy.elements().removeClass("faded");
+    cy.elements().removeClass("highlighted");
 
     if (selectedNodeId) {
       cy.getElementById(selectedNodeId).addClass("selected");
@@ -244,29 +284,43 @@ export function GraphCanvas({
     const cy = cyRef.current;
     if (!cy) return;
 
-    const layout = cy.layout({
-      name: "cose",
-      animate: true,
-      animationDuration: 600,
-      fit: true,
-      padding: 36,
-      nodeRepulsion: 12000,
-      idealEdgeLength: 120,
-      edgeElasticity: 80,
-    });
+    const timer = window.setTimeout(() => {
+      layoutRef.current?.stop();
+      const layout = cy.layout(layoutOptions);
+      layoutRef.current = layout;
+      layout.run();
+    }, 90);
 
-    layout.run();
-  }, [elements]);
+    return () => {
+      clearTimeout(timer);
+      layoutRef.current?.stop();
+    };
+  }, [layoutOptions, nodes.length, edges.length]);
 
   return (
     <div
       className={
         fullscreen
           ? "fixed inset-0 z-40 bg-[#050a10] p-4"
-          : "relative h-full min-h-[460px] rounded-lg border border-white/10 bg-[#09111c]"
+          : "relative h-[56vh] min-h-[460px] rounded-lg border border-white/10 bg-gradient-to-br from-[#09111c] via-[#07101a] to-[#081925] shadow-[0_22px_80px_rgba(4,12,26,0.65)] md:h-[62vh] md:min-h-[560px]"
       }
     >
       <div className="absolute right-2 top-2 z-20 flex items-center gap-2">
+        <Button
+          size="icon"
+          variant="secondary"
+          onClick={() => {
+            const cy = cyRef.current;
+            if (!cy) return;
+            cy.elements().removeClass("faded");
+            cy.elements().removeClass("highlighted");
+            cy.fit(undefined, 52);
+            cy.center();
+          }}
+          title="Fit graph"
+        >
+          <LocateFixed className="h-4 w-4" />
+        </Button>
         <Button
           size="icon"
           variant="secondary"
@@ -286,14 +340,35 @@ export function GraphCanvas({
           {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
         </Button>
       </div>
+      <div className="pointer-events-none absolute left-2 top-2 z-20 rounded-md border border-white/10 bg-[#07101a]/90 p-2 text-[10px] text-[#98b7d4]">
+        <div className="mb-1 font-semibold text-[#d8ebff]">Legend</div>
+        <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+          <div>Disease: {nodeCounts.disease ?? 0}</div>
+          <div>Targets: {nodeCounts.target ?? 0}</div>
+          <div>Pathways: {nodeCounts.pathway ?? 0}</div>
+          <div>Drugs: {nodeCounts.drug ?? 0}</div>
+          <div>Interactions: {nodeCounts.interaction ?? 0}</div>
+          <div>Edges: {edges.length}</div>
+        </div>
+      </div>
       <CytoscapeComponent
         elements={elements}
         stylesheet={styles}
         style={{ width: "100%", height: "100%" }}
+        minZoom={0.14}
+        maxZoom={2.4}
+        wheelSensitivity={0.25}
         cy={(cy) => {
           cyRef.current = cy;
         }}
       />
+      {nodes.length === 0 ? (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+          <div className="rounded-md border border-cyan-300/20 bg-[#07101a]/90 px-4 py-2 text-xs text-[#b8d4ef]">
+            Waiting for graph batches...
+          </div>
+        </div>
+      ) : null}
       <div className="pointer-events-none absolute bottom-2 left-2 rounded bg-[#07101a]/90 p-2 text-[10px] text-[#89a8c5]">
         Right-click node: focus neighborhood • Shift-click 2 nodes: shortest path
       </div>

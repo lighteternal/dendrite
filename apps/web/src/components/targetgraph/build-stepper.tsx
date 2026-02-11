@@ -56,52 +56,54 @@ export function BuildStepper({ statuses, onContinuePartial }: Props) {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-2 md:grid-cols-7">
-          {PIPELINE_STEPS.map((step) => {
-            const status = statuses[step.id];
-            const active = status?.phase === step.id;
-            const complete = (status?.pct ?? 0) >= 100 || (current?.pct ?? 0) > (status?.pct ?? 0);
+        <div className="overflow-x-auto pb-1">
+          <div className="flex min-w-max gap-2 md:grid md:min-w-0 md:grid-cols-7">
+            {PIPELINE_STEPS.map((step) => {
+              const status = statuses[step.id];
+              const active = status?.phase === step.id;
+              const complete = (status?.pct ?? 0) >= 100 || (current?.pct ?? 0) > (status?.pct ?? 0);
 
-            return (
-              <div
-                key={step.id}
-                className={cn(
-                  "rounded-md border border-white/10 bg-[#0a121e] p-2",
-                  active ? "border-cyan-400/60" : "",
-                )}
-              >
-                <div className="flex items-center justify-between gap-2 text-xs">
-                  <span className="font-medium text-[#dceeff]">{step.label}</span>
-                  {active ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-300" />
-                  ) : (
-                    <span className="text-[#85a2bf]">{complete ? "Done" : "Idle"}</span>
+              return (
+                <div
+                  key={step.id}
+                  className={cn(
+                    "min-w-[210px] rounded-md border border-white/10 bg-[#0a121e] p-2 md:min-w-0",
+                    active ? "border-cyan-400/60" : "",
                   )}
-                </div>
-                <Progress value={status?.pct ?? 0} className="mt-1 h-1.5" />
-                <div className="mt-1 text-[10px] text-[#92acc6]">
-                  {status?.message ?? "pending"}
-                </div>
-                {status?.counts && Object.keys(status.counts).length > 0 ? (
-                  <div className="mt-1 text-[10px] text-[#6f8ba6]">
-                    {Object.entries(status.counts)
-                      .map(([k, v]) => `${k}:${v}`)
-                      .join(" • ")}
+                >
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-medium text-[#dceeff]">{step.label}</span>
+                    {active ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-300" />
+                    ) : (
+                      <span className="text-[#85a2bf]">{complete ? "Done" : "Idle"}</span>
+                    )}
                   </div>
-                ) : null}
-                {active && status.timeoutMs && status.elapsedMs > status.timeoutMs ? (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    className="mt-2 h-6 w-full text-[10px]"
-                    onClick={() => onContinuePartial(step.id)}
-                  >
-                    Continue with partial data
-                  </Button>
-                ) : null}
-              </div>
-            );
-          })}
+                  <Progress value={status?.pct ?? 0} className="mt-1 h-1.5" />
+                  <div className="mt-1 text-[10px] text-[#92acc6]">
+                    {status?.message ?? "pending"}
+                  </div>
+                  {status?.counts && Object.keys(status.counts).length > 0 ? (
+                    <div className="mt-1 text-[10px] text-[#6f8ba6]">
+                      {Object.entries(status.counts)
+                        .map(([k, v]) => `${k}:${v}`)
+                        .join(" • ")}
+                    </div>
+                  ) : null}
+                  {active && status.timeoutMs && status.elapsedMs > status.timeoutMs ? (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="mt-2 h-6 w-full text-[10px]"
+                      onClick={() => onContinuePartial(step.id)}
+                    >
+                      Continue with partial data
+                    </Button>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
     </div>

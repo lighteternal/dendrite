@@ -24,6 +24,7 @@ type EnrichmentMap = Record<string, { articles: unknown[]; trials: unknown[] }>;
 
 export function useGraphStream() {
   const eventSourceRef = useRef<EventSource | null>(null);
+  const streamTokenRef = useRef(0);
 
   const [nodeMap, setNodeMap] = useState<Map<string, GraphNode>>(new Map());
   const [edgeMap, setEdgeMap] = useState<Map<string, GraphEdge>>(new Map());
@@ -60,12 +61,18 @@ export function useGraphStream() {
     stop();
     reset();
     setIsStreaming(true);
+    setIsDone(false);
+    const token = ++streamTokenRef.current;
 
     const url = `/api/streamGraph?diseaseQuery=${encodeURIComponent(diseaseQuery)}&maxTargets=${maxTargets}`;
     const source = new EventSource(url);
     eventSourceRef.current = source;
 
+    const isCurrentStream = () =>
+      eventSourceRef.current === source && streamTokenRef.current === token;
+
     source.addEventListener("status", (event) => {
+      if (!isCurrentStream()) return;
       const status = JSON.parse((event as MessageEvent<string>).data) as StreamStatus;
       setStatuses((prev) => ({
         ...prev,
@@ -74,6 +81,7 @@ export function useGraphStream() {
     });
 
     source.addEventListener("partial_graph", (event) => {
+      if (!isCurrentStream()) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as {
         nodes: GraphNode[];
         edges: GraphEdge[];
@@ -118,6 +126,7 @@ export function useGraphStream() {
     });
 
     source.addEventListener("sankey", (event) => {
+      if (!isCurrentStream()) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as {
         rows: SankeyRow[];
       };
@@ -125,11 +134,13 @@ export function useGraphStream() {
     });
 
     source.addEventListener("ranking", (event) => {
+      if (!isCurrentStream()) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as RankingResponse;
       setRanking(payload);
     });
 
     source.addEventListener("enrichment_ready", (event) => {
+      if (!isCurrentStream()) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as {
         linksByNodeId: EnrichmentMap;
       };
@@ -138,6 +149,7 @@ export function useGraphStream() {
     });
 
     source.addEventListener("error", (event) => {
+      if (!isCurrentStream()) return;
       try {
         const payload = JSON.parse((event as MessageEvent<string>).data) as StreamError;
         setErrors((prev) => [...prev, payload]);
@@ -150,6 +162,7 @@ export function useGraphStream() {
     });
 
     source.addEventListener("done", (event) => {
+      if (!isCurrentStream()) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as {
         stats: Record<string, number>;
       };
@@ -160,6 +173,7 @@ export function useGraphStream() {
     });
 
     source.onerror = () => {
+      if (!isCurrentStream()) return;
       setIsStreaming(false);
       source.close();
     };

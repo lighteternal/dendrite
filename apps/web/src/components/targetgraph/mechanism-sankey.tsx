@@ -17,6 +17,33 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
   const height = 240;
 
   const layout = useMemo(() => {
+    const aggregated = new Map<string, SankeyRow>();
+    for (const row of rows) {
+      if (!row.source || !row.target) continue;
+      const value = Number(row.value);
+      if (!Number.isFinite(value) || value <= 0) continue;
+      if (row.source === row.target) continue;
+
+      const key = `${row.sourceType}:${row.source}=>${row.targetType}:${row.target}`;
+      const existing = aggregated.get(key);
+      if (existing) {
+        existing.value += value;
+      } else {
+        aggregated.set(key, { ...row, value });
+      }
+    }
+
+    const safeRows = [...aggregated.values()]
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 90);
+
+    if (safeRows.length === 0) {
+      return {
+        nodes: [] as Array<{ name: string; type: string; x0?: number; x1?: number; y0?: number; y1?: number }>,
+        links: [] as Array<Link>,
+      };
+    }
+
     const nodeIndex = new Map<string, number>();
     const nodes: Array<{ name: string; type: string }> = [];
     const links: Array<{ source: number; target: number; value: number }> = [];
@@ -30,10 +57,37 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
       return nodeIndex.get(key)!;
     };
 
-    for (const row of rows.slice(0, 120)) {
+    for (const row of safeRows) {
       const source = getNodeIndex(row.source, row.sourceType);
       const target = getNodeIndex(row.target, row.targetType);
       links.push({ source, target, value: Math.max(0.1, row.value) });
+    }
+
+    if (nodes.length > 45) {
+      const allowed = new Set<number>(
+        links
+          .slice(0, 80)
+          .flatMap((link) => [link.source, link.target])
+          .slice(0, 45),
+      );
+      const remap = new Map<number, number>();
+      const cappedNodes: Array<{ name: string; type: string }> = [];
+
+      [...allowed].forEach((oldIdx) => {
+        remap.set(oldIdx, cappedNodes.length);
+        cappedNodes.push(nodes[oldIdx]!);
+      });
+
+      const cappedLinks = links
+        .filter((link) => allowed.has(link.source) && allowed.has(link.target))
+        .map((link) => ({
+          source: remap.get(link.source)!,
+          target: remap.get(link.target)!,
+          value: link.value,
+        }));
+
+      nodes.splice(0, nodes.length, ...cappedNodes);
+      links.splice(0, links.length, ...cappedLinks);
     }
 
     const sankey = d3Sankey<{ name: string; type: string }, { value: number }>()
@@ -44,12 +98,31 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
         [width - 20, height - 20],
       ]);
 
-    return sankey({ nodes: nodes.map((n) => ({ ...n })), links: links.map((l) => ({ ...l })) });
+    try {
+      return sankey({
+        nodes: nodes.map((n) => ({ ...n })),
+        links: links.map((l) => ({ ...l })),
+      });
+    } catch {
+      return {
+        nodes: [] as Array<{ name: string; type: string; x0?: number; x1?: number; y0?: number; y1?: number }>,
+        links: [] as Array<Link>,
+      };
+    }
   }, [rows]);
 
   return (
     <div className="w-full overflow-x-auto rounded-md border border-white/10 bg-[#0a1320] p-2">
-      <svg width={width} height={height} className="max-w-full">
+      {layout.nodes.length === 0 ? (
+        <div className="flex h-[220px] items-center justify-center rounded-md border border-dashed border-white/15 bg-[#0e192a] text-xs text-[#89a4bf]">
+          Mechanism trail appears once pathway-target edges are available.
+        </div>
+      ) : null}
+      <svg
+        width={width}
+        height={height}
+        className={`max-w-full ${layout.nodes.length === 0 ? "hidden" : "block"}`}
+      >
         <g transform="translate(10,10)">
           {layout.links.map((link, idx) => (
             <path

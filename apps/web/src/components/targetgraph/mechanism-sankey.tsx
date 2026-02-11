@@ -24,10 +24,10 @@ type FlowLink = {
 
 const typeColor: Record<string, string> = {
   disease: "#e11d48",
-  target: "#1d4ed8",
-  pathway: "#0f766e",
-  drug: "#c2410c",
-  interaction: "#64748b",
+  target: "#5b57e6",
+  pathway: "#06b6d4",
+  drug: "#f08b2e",
+  interaction: "#8b95b5",
 };
 
 function truncateLabel(value: string, max = 30): string {
@@ -36,7 +36,7 @@ function truncateLabel(value: string, max = 30): string {
 }
 
 export function MechanismSankey({ rows, onBandClick }: Props) {
-  const { nodes, links, topFlows } = useMemo(() => {
+  const { nodes, links, topFlows, hiddenFlowCount } = useMemo(() => {
     const aggregated = new Map<string, SankeyRow>();
 
     for (const row of rows) {
@@ -55,7 +55,7 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
 
     const ranked = [...aggregated.values()]
       .sort((a, b) => b.value - a.value)
-      .slice(0, 28);
+      .slice(0, 22);
 
     const nodesById = new Map<string, FlowNode>();
     const links: FlowLink[] = [];
@@ -88,12 +88,13 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
       nodes: [...nodesById.values()],
       links,
       topFlows: ranked.slice(0, 8),
+      hiddenFlowCount: Math.max(0, aggregated.size - ranked.length),
     };
   }, [rows]);
 
   if (nodes.length === 0 || links.length === 0) {
     return (
-      <div className="flex h-[300px] items-center justify-center rounded-xl border border-dashed border-[#c8daf7] bg-[#f9fbff] text-sm text-[#5d7da4]">
+      <div className="flex h-[300px] items-center justify-center rounded-xl border border-dashed border-[#ddd9ff] bg-[#fbfaff] text-sm text-[#6f69ae]">
         Mechanism trail becomes available after target-pathway and target-drug links stream in.
       </div>
     );
@@ -101,7 +102,7 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
 
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_280px]">
-      <div className="h-[360px] rounded-xl border border-[#c8daf7] bg-[#fbfdff] p-2">
+      <div className="h-[360px] rounded-xl border border-[#ddd9ff] bg-[#fefeff] p-2">
         <ResponsiveSankey
           data={{
             nodes,
@@ -113,10 +114,10 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
           colors={(node) => typeColor[(node as { type?: string }).type ?? "interaction"] ?? "#64748b"}
           nodeOpacity={0.96}
           nodeBorderWidth={1}
-          nodeBorderColor="#dbe8fb"
+          nodeBorderColor="#ece9ff"
           nodeThickness={14}
           nodeSpacing={18}
-          linkOpacity={0.46}
+          linkOpacity={0.48}
           linkHoverOpacity={0.82}
           linkBlendMode="multiply"
           enableLinkGradient
@@ -149,7 +150,7 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
             const sourceLabel = link.source?.id?.split(":").slice(1).join(":") ?? "unknown";
             const targetLabel = link.target?.id?.split(":").slice(1).join(":") ?? "unknown";
             return (
-              <div className="rounded-md border border-[#cadcf7] bg-white px-2 py-1 text-xs text-[#16385f] shadow-md">
+              <div className="rounded-md border border-[#ddd9ff] bg-white px-2 py-1 text-xs text-[#342f7b] shadow-md">
                 <div className="font-semibold">{sourceLabel} → {targetLabel}</div>
                 <div>flow score: {(link.value ?? 0).toFixed(2)}</div>
               </div>
@@ -164,7 +165,7 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
             },
             labels: {
               text: {
-                fill: "#274b74",
+                fill: "#4a4390",
                 fontSize: 11,
               },
             },
@@ -172,8 +173,8 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
         />
       </div>
 
-      <aside className="rounded-xl border border-[#c8daf7] bg-[#fbfdff] p-3">
-        <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-[#587ca5]">
+      <aside className="rounded-xl border border-[#ddd9ff] bg-[#fefeff] p-3">
+        <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-[#6b65a9]">
           Top Mechanism Flows
         </div>
         <div className="space-y-2">
@@ -181,12 +182,12 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
             <button
               key={`${flow.sourceType}-${flow.source}-${flow.targetType}-${flow.target}`}
               type="button"
-              className="w-full rounded-lg border border-[#d6e4f9] bg-white px-2.5 py-2 text-left text-xs text-[#23446c] transition hover:bg-[#eef5ff]"
+              className="w-full rounded-lg border border-[#e4e0ff] bg-white px-2.5 py-2 text-left text-xs text-[#473f88] transition hover:bg-[#f5f2ff]"
               onClick={() => onBandClick?.(flow.source, flow.target)}
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="font-semibold">#{index + 1}</span>
-                <span className="text-[#5d7da2]">{flow.value.toFixed(2)}</span>
+                <span className="text-[#8a5418]">{flow.value.toFixed(2)}</span>
               </div>
               <div className="mt-1 line-clamp-2">
                 {truncateLabel(flow.source, 26)} → {truncateLabel(flow.target, 26)}
@@ -194,6 +195,11 @@ export function MechanismSankey({ rows, onBandClick }: Props) {
             </button>
           ))}
         </div>
+        {hiddenFlowCount > 0 ? (
+          <div className="mt-2 rounded-md border border-[#f3d1ab] bg-[#fff7ec] px-2 py-1 text-[11px] text-[#8f5b2d]">
+            +{hiddenFlowCount} more low-priority flows hidden for readability.
+          </div>
+        ) : null}
       </aside>
     </div>
   );

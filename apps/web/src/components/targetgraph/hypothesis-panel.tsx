@@ -120,15 +120,15 @@ export function HypothesisPanel({
   };
 
   return (
-    <Card className="border-[#cfe1fb] bg-white/95">
+    <Card className="border-[#d7d2ff] bg-white/95">
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm text-[#1a4472]">Hypothesis Mode</CardTitle>
-        <p className="text-xs text-[#567aa4]">
+        <CardTitle className="text-sm text-[#342f7b]">Hypothesis Mode</CardTitle>
+        <p className="text-xs text-[#6963a9]">
           Select a pathway and scoring profile to produce a mechanism thread with auditable evidence.
         </p>
       </CardHeader>
-      <CardContent className="space-y-3 text-xs text-[#3a5f89]">
-        <div className="flex items-center justify-between rounded-md border border-[#d8e6f9] bg-[#f5f9ff] px-3 py-2">
+      <CardContent className="space-y-3 text-xs text-[#58529a]">
+        <div className="flex items-center justify-between rounded-md border border-[#e0dcff] bg-[#f7f5ff] px-3 py-2">
           <span>Enable director-mode scoring</span>
           <Switch checked={enabled} onCheckedChange={setEnabled} />
         </div>
@@ -136,7 +136,7 @@ export function HypothesisPanel({
         <div className="space-y-2">
           <div>Pathway</div>
           <Select value={pathwayId} onValueChange={setPathwayId} disabled={!enabled}>
-            <SelectTrigger className="border-[#c4d8f8] bg-[#f8fbff] text-[#23466e]">
+            <SelectTrigger className="border-[#ddd9ff] bg-[#f8f7ff] text-[#433d86]">
               <SelectValue placeholder="Select pathway" />
             </SelectTrigger>
             <SelectContent>
@@ -187,7 +187,7 @@ export function HypothesisPanel({
         </div>
 
         <Button
-          className="w-full bg-[#1a56db] text-white hover:bg-[#1547b6]"
+          className="w-full bg-[#5b57e6] text-white hover:bg-[#4a42ce]"
           disabled={!enabled || !pathwayId || loading}
           onClick={runHypothesis}
         >
@@ -195,33 +195,33 @@ export function HypothesisPanel({
         </Button>
 
         {result ? (
-          <div className="rounded-xl border border-[#cfe1fb] bg-[#f5f9ff] p-3">
+          <div className="rounded-xl border border-[#ddd9ff] bg-[#f8f7ff] p-3">
             <div className="mb-2 flex flex-wrap gap-1">
               {result.recommendedTargets.map((target) => (
-                <Badge key={target.id} className="bg-[#dce9ff] text-[#1d4575]">
+                <Badge key={target.id} className="bg-[#ede9ff] text-[#4a4390]">
                   {target.symbol} ({target.score.toFixed(3)})
                 </Badge>
               ))}
             </div>
-            <div className="text-sm font-semibold leading-6 text-[#1a406e]">
+            <div className="text-sm font-semibold leading-6 text-[#332d75]">
               {result.mechanismThread.claim}
             </div>
             <div className="mt-2 space-y-1">
               {result.mechanismThread.evidenceBullets.map((line, idx) => (
-                <div key={`ev-${idx}`} className="text-[11px] leading-5 text-[#335b89]">
+                <div key={`ev-${idx}`} className="text-[11px] leading-5 text-[#5d57a0]">
                   • {line}
                 </div>
               ))}
             </div>
             <div className="mt-2 space-y-1">
               {result.mechanismThread.caveats.map((line, idx) => (
-                <div key={`cv-${idx}`} className="text-[11px] leading-5 text-[#9b5f02]">
+                <div key={`cv-${idx}`} className="text-[11px] leading-5 text-[#8f5b2d]">
                   Caveat: {line}
                 </div>
               ))}
             </div>
             {result.missingInputs.length > 0 ? (
-              <div className="mt-2 rounded-md border border-[#f0d2a2] bg-[#fff8ef] px-2 py-1 text-[11px] text-[#8b5700]">
+              <div className="mt-2 rounded-md border border-[#f3d1ab] bg-[#fff7ec] px-2 py-1 text-[11px] text-[#8f5b2d]">
                 Missing inputs: {result.missingInputs.join("; ")}
               </div>
             ) : null}

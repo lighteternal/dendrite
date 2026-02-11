@@ -19,11 +19,11 @@ type Props = {
 export function NodeInspector({ selectedNode, edges, enrichmentByNode }: Props) {
   if (!selectedNode) {
     return (
-      <Card className="h-full border-[#cfe1fb] bg-white/95">
+      <Card className="h-full border-[#d7d2ff] bg-white/95">
         <CardHeader>
-          <CardTitle className="text-sm text-[#163e69]">Node Inspector</CardTitle>
+          <CardTitle className="text-sm text-[#342f7b]">Node Inspector</CardTitle>
         </CardHeader>
-        <CardContent className="text-sm text-[#567aa3]">
+        <CardContent className="text-sm text-[#6b65aa]">
           Select any node to inspect evidence, links, and local neighborhood.
         </CardContent>
       </Card>
@@ -37,51 +37,51 @@ export function NodeInspector({ selectedNode, edges, enrichmentByNode }: Props) 
   const enrichment = enrichmentByNode[selectedNode.id] ?? { articles: [], trials: [] };
 
   return (
-    <Card className="h-full border-[#cfe1fb] bg-white/95">
+    <Card className="h-full border-[#d7d2ff] bg-white/95">
       <CardHeader>
         <div className="flex items-center justify-between gap-2">
-          <CardTitle className="text-sm text-[#163e69]">{selectedNode.label}</CardTitle>
-          <Badge variant="outline" className="border-[#aac8f2] bg-[#eef5ff] text-[#285684]">
+          <CardTitle className="text-sm text-[#342f7b]">{selectedNode.label}</CardTitle>
+          <Badge variant="outline" className="border-[#ddd9ff] bg-[#f3f1ff] text-[#4a4390]">
             {selectedNode.type}
           </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="rounded-md border border-[#d6e4f7] bg-[#f6faff] p-2 text-xs text-[#44688f]">
+        <div className="rounded-md border border-[#e0dcff] bg-[#f8f7ff] p-2 text-xs text-[#5f59a2]">
           <div>ID: {selectedNode.primaryId}</div>
           <div>Score: {(selectedNode.score ?? 0).toFixed(3)}</div>
           <div>Degree: {incidentEdges.length}</div>
         </div>
 
         <Tabs defaultValue="evidence" className="w-full">
-          <TabsList className="grid w-full grid-cols-3 border border-[#d2e3fa] bg-[#f6faff]">
+          <TabsList className="grid w-full grid-cols-3 border border-[#ddd9ff] bg-[#f8f7ff]">
             <TabsTrigger value="evidence">Evidence</TabsTrigger>
             <TabsTrigger value="articles">Articles</TabsTrigger>
             <TabsTrigger value="trials">Trials</TabsTrigger>
           </TabsList>
 
           <TabsContent value="evidence" className="mt-2">
-            <ScrollArea className="h-[320px] rounded-md border border-[#d2e3fa] bg-[#f9fbff] p-2">
-              <div className="space-y-2 text-xs text-[#365a84]">
+            <ScrollArea className="h-[320px] rounded-md border border-[#ddd9ff] bg-[#fcfbff] p-2">
+              <div className="space-y-2 text-xs text-[#595399]">
                 {Object.entries(selectedNode.meta).length === 0 ? (
-                  <div className="text-[#6788ae]">No metadata on this node yet.</div>
+                  <div className="text-[#7b75b7]">No metadata on this node yet.</div>
                 ) : (
                   Object.entries(selectedNode.meta).map(([key, value]) => (
-                    <div key={key} className="rounded border border-[#d8e7fb] bg-white p-2">
-                      <div className="text-[#5f82a8]">{key}</div>
-                      <div className="font-mono text-[11px] text-[#1c4069] break-words">
+                    <div key={key} className="rounded border border-[#e4e0ff] bg-white p-2">
+                      <div className="text-[#7d78b8]">{key}</div>
+                      <div className="font-mono text-[11px] text-[#3f397f] break-words">
                         {typeof value === "string" ? value : JSON.stringify(value)}
                       </div>
                     </div>
                   ))
                 )}
-                <Separator className="bg-[#d7e7fb]" />
-                <div className="text-[#5f82a8]">Incident edges</div>
+                <Separator className="bg-[#e4e0ff]" />
+                <div className="text-[#7d78b8]">Incident edges</div>
                 {incidentEdges.map((edge) => (
-                  <div key={edge.id} className="rounded border border-[#d8e7fb] bg-white p-2">
+                  <div key={edge.id} className="rounded border border-[#e4e0ff] bg-white p-2">
                     <div>{edge.type}</div>
-                    <div className="text-[#6f90b4]">{edge.source} → {edge.target}</div>
-                    <div className="text-[#8ba7c5]">weight {(edge.weight ?? 0).toFixed(3)}</div>
+                    <div className="text-[#6b65a8]">{edge.source} → {edge.target}</div>
+                    <div className="text-[#8d87c2]">weight {(edge.weight ?? 0).toFixed(3)}</div>
                   </div>
                 ))}
               </div>
@@ -89,10 +89,10 @@ export function NodeInspector({ selectedNode, edges, enrichmentByNode }: Props) 
           </TabsContent>
 
           <TabsContent value="articles" className="mt-2">
-            <ScrollArea className="h-[320px] rounded-md border border-[#d2e3fa] bg-[#f9fbff] p-2">
-              <div className="space-y-2 text-xs text-[#365a84]">
+            <ScrollArea className="h-[320px] rounded-md border border-[#ddd9ff] bg-[#fcfbff] p-2">
+              <div className="space-y-2 text-xs text-[#595399]">
                 {(enrichment.articles ?? []).length === 0 ? (
-                  <div className="text-[#6788ae]">No article snippets yet.</div>
+                  <div className="text-[#7b75b7]">No article snippets yet.</div>
                 ) : (
                   (enrichment.articles as Array<Record<string, unknown>>).map((article, idx) => (
                     <a
@@ -100,15 +100,15 @@ export function NodeInspector({ selectedNode, edges, enrichmentByNode }: Props) 
                       href={String(article.url ?? "#")}
                       target="_blank"
                       rel="noreferrer"
-                      className="block rounded border border-[#d8e7fb] bg-white p-2 hover:bg-[#edf4ff]"
+                      className="block rounded border border-[#e4e0ff] bg-white p-2 hover:bg-[#f5f2ff]"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <span className="font-medium text-[#1f446f]">
+                        <span className="font-medium text-[#3f397f]">
                           {String(article.title ?? "Untitled")}
                         </span>
-                        <ExternalLink className="h-3 w-3 text-[#6a8eb6]" />
+                        <ExternalLink className="h-3 w-3 text-[#8d87c2]" />
                       </div>
-                      <div className="text-[#6f90b4]">{String(article.source ?? "Unknown")}</div>
+                      <div className="text-[#6b65a8]">{String(article.source ?? "Unknown")}</div>
                     </a>
                   ))
                 )}
@@ -117,10 +117,10 @@ export function NodeInspector({ selectedNode, edges, enrichmentByNode }: Props) 
           </TabsContent>
 
           <TabsContent value="trials" className="mt-2">
-            <ScrollArea className="h-[320px] rounded-md border border-[#d2e3fa] bg-[#f9fbff] p-2">
-              <div className="space-y-2 text-xs text-[#365a84]">
+            <ScrollArea className="h-[320px] rounded-md border border-[#ddd9ff] bg-[#fcfbff] p-2">
+              <div className="space-y-2 text-xs text-[#595399]">
                 {(enrichment.trials ?? []).length === 0 ? (
-                  <div className="text-[#6788ae]">No trial snippets yet.</div>
+                  <div className="text-[#7b75b7]">No trial snippets yet.</div>
                 ) : (
                   (enrichment.trials as Array<Record<string, unknown>>).map((trial, idx) => (
                     <a
@@ -128,15 +128,15 @@ export function NodeInspector({ selectedNode, edges, enrichmentByNode }: Props) 
                       href={String(trial.url ?? "#")}
                       target="_blank"
                       rel="noreferrer"
-                      className="block rounded border border-[#d8e7fb] bg-white p-2 hover:bg-[#edf4ff]"
+                      className="block rounded border border-[#e4e0ff] bg-white p-2 hover:bg-[#f5f2ff]"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <span className="font-medium text-[#1f446f]">
+                        <span className="font-medium text-[#3f397f]">
                           {String(trial.title ?? "Untitled")}
                         </span>
-                        <ExternalLink className="h-3 w-3 text-[#6a8eb6]" />
+                        <ExternalLink className="h-3 w-3 text-[#8d87c2]" />
                       </div>
-                      <div className="text-[#6f90b4]">
+                      <div className="text-[#6b65a8]">
                         {String(trial.id ?? "")} {trial.status ? `• ${String(trial.status)}` : ""}
                       </div>
                     </a>

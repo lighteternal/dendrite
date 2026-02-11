@@ -10,3 +10,4 @@
 - [x] M8: Upgrade graph rendering to force-directed canvas + robust Sankey readability and interaction polish.
 - [x] M9: Improve customer workflow (main-search navigation, in-workbench rerun, executive readout, clearer value framing).
 - [x] M10: End-to-end validation via Chromium automation on 5 diseases + lint/build checks.
+- [x] M11: UI readability + IA split-screen pass (Network/Evidence/Hypothesis tabs), disease-only entity matching hardening, and second E2E/API validation sweep.

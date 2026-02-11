@@ -33,24 +33,24 @@
 
 :root {
   --radius: 0.75rem;
-  --background: oklch(0.98 0.01 239);
-  --foreground: oklch(0.24 0.04 253);
+  --background: oklch(0.985 0.01 283);
+  --foreground: oklch(0.25 0.05 286);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.24 0.04 253);
+  --card-foreground: oklch(0.25 0.05 286);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.24 0.04 253);
-  --primary: oklch(0.56 0.19 250);
-  --primary-foreground: oklch(0.98 0.01 239);
-  --secondary: oklch(0.95 0.02 238);
-  --secondary-foreground: oklch(0.34 0.04 249);
-  --muted: oklch(0.95 0.01 240);
-  --muted-foreground: oklch(0.54 0.03 248);
-  --accent: oklch(0.74 0.15 186);
-  --accent-foreground: oklch(0.27 0.05 215);
+  --popover-foreground: oklch(0.25 0.05 286);
+  --primary: oklch(0.57 0.19 292);
+  --primary-foreground: oklch(0.985 0.01 283);
+  --secondary: oklch(0.96 0.02 274);
+  --secondary-foreground: oklch(0.35 0.05 283);
+  --muted: oklch(0.96 0.01 276);
+  --muted-foreground: oklch(0.54 0.03 278);
+  --accent: oklch(0.76 0.14 55);
+  --accent-foreground: oklch(0.35 0.08 45);
   --destructive: oklch(0.62 0.24 25);
-  --border: oklch(0.88 0.02 242);
-  --input: oklch(0.88 0.02 242);
-  --ring: oklch(0.64 0.17 249);
+  --border: oklch(0.9 0.02 279);
+  --input: oklch(0.9 0.02 279);
+  --ring: oklch(0.63 0.18 291);
 }
 
 @layer base {
@@ -62,11 +62,12 @@
     @apply bg-background text-foreground;
     font-family: var(--font-body), sans-serif;
     background-image:
-      radial-gradient(circle at 12% 18%, rgba(38, 120, 255, 0.18), transparent 32%),
-      radial-gradient(circle at 88% 14%, rgba(0, 168, 140, 0.14), transparent 30%),
-      linear-gradient(rgba(18, 58, 122, 0.04) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(18, 58, 122, 0.04) 1px, transparent 1px),
-      linear-gradient(180deg, #f5f8fd 0%, #edf3fb 100%);
+      radial-gradient(circle at 12% 18%, rgba(98, 73, 233, 0.2), transparent 32%),
+      radial-gradient(circle at 88% 14%, rgba(65, 120, 255, 0.16), transparent 30%),
+      radial-gradient(circle at 72% 72%, rgba(242, 140, 57, 0.13), transparent 34%),
+      linear-gradient(rgba(88, 70, 170, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(88, 70, 170, 0.04) 1px, transparent 1px),
+      linear-gradient(180deg, #f8f7ff 0%, #eff2ff 100%);
     background-size:
       auto,
       auto,

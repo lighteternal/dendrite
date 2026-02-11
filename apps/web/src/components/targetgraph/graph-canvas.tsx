@@ -18,6 +18,11 @@ type Props = {
   onSelectNode: (node: GraphNode | null) => void;
   highlightedNodeIds?: Set<string>;
   highlightedEdgeIds?: Set<string>;
+  hiddenSummary?: {
+    hiddenNodes: number;
+    hiddenEdges: number;
+    lens: string;
+  };
 };
 
 type RenderNode = NodeObject & {
@@ -40,18 +45,18 @@ type RenderLink = LinkObject<RenderNode> & {
 
 const nodeColors: Record<GraphNode["type"], string> = {
   disease: "#ef4444",
-  target: "#2563eb",
-  pathway: "#0f766e",
-  drug: "#d97706",
-  interaction: "#64748b",
+  target: "#5b57e6",
+  pathway: "#06b6d4",
+  drug: "#f08b2e",
+  interaction: "#8b95b5",
 };
 
 const edgeColors: Record<GraphEdge["type"], string> = {
-  disease_target: "#64748b",
-  target_pathway: "#0891b2",
-  target_drug: "#d97706",
+  disease_target: "#8b95b5",
+  target_pathway: "#2ea6d6",
+  target_drug: "#f08b2e",
   target_target: "#7c3aed",
-  pathway_drug: "#0f766e",
+  pathway_drug: "#27a4bb",
 };
 
 const shortestPath = (startId: string, endId: string, adjacency: Map<string, string[]>) => {
@@ -136,6 +141,7 @@ export function GraphCanvas({
   onSelectNode,
   highlightedNodeIds,
   highlightedEdgeIds,
+  hiddenSummary,
 }: Props) {
   const fgRef = useRef<ForceGraphMethods<NodeObject, LinkObject> | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -322,8 +328,8 @@ export function GraphCanvas({
       ref={containerRef}
       className={
         fullscreen
-          ? "fixed inset-0 z-40 rounded-none border-0 bg-[#edf3fb] p-3"
-          : "relative min-h-[460px] overflow-hidden rounded-xl border border-[#c6daf8] bg-[linear-gradient(180deg,#f7fbff_0%,#eef4fd_100%)] shadow-[0_24px_70px_rgba(22,63,120,0.12)]"
+          ? "fixed inset-0 z-40 rounded-none border-0 bg-[#f2f2ff] p-3"
+          : "relative min-h-[460px] overflow-hidden rounded-xl border border-[#d7d2ff] bg-[linear-gradient(180deg,#fcfbff_0%,#f1f3ff_100%)] shadow-[0_26px_72px_rgba(77,65,170,0.18)]"
       }
     >
       <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
@@ -336,7 +342,7 @@ export function GraphCanvas({
             fgRef.current?.zoomToFit(360, 52);
           }}
           title="Fit graph"
-          className="border-[#bfd5f8] bg-white text-[#264d7b] hover:bg-[#e9f1ff]"
+          className="border-[#d7d2ff] bg-white text-[#4a4390] hover:bg-[#f2efff]"
         >
           <LocateFixed className="h-4 w-4" />
         </Button>
@@ -351,7 +357,7 @@ export function GraphCanvas({
             a.download = "targetgraph-network.png";
             a.click();
           }}
-          className="border-[#bfd5f8] bg-white text-[#264d7b] hover:bg-[#e9f1ff]"
+          className="border-[#d7d2ff] bg-white text-[#4a4390] hover:bg-[#f2efff]"
         >
           <Camera className="h-4 w-4" />
         </Button>
@@ -359,14 +365,14 @@ export function GraphCanvas({
           size="icon"
           variant="secondary"
           onClick={() => setFullscreen((prev) => !prev)}
-          className="border-[#bfd5f8] bg-white text-[#264d7b] hover:bg-[#e9f1ff]"
+          className="border-[#d7d2ff] bg-white text-[#4a4390] hover:bg-[#f2efff]"
         >
           {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
         </Button>
       </div>
 
-      <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-xl border border-[#cfe1fb] bg-white/92 px-3 py-2 text-[11px] text-[#355981] backdrop-blur">
-        <div className="mb-1 font-semibold text-[#133660]">Live Graph</div>
+      <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-xl border border-[#ddd9ff] bg-white/92 px-3 py-2 text-[11px] text-[#5c56a0] backdrop-blur">
+        <div className="mb-1 font-semibold text-[#342f7b]">Live Graph</div>
         <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
           <span>Disease: {nodeCounts.disease ?? 0}</span>
           <span>Targets: {nodeCounts.target ?? 0}</span>
@@ -375,6 +381,11 @@ export function GraphCanvas({
           <span>Interactions: {nodeCounts.interaction ?? 0}</span>
           <span>Edges: {edges.length}</span>
         </div>
+        {hiddenSummary && hiddenSummary.hiddenEdges > 0 ? (
+          <div className="mt-1 rounded-md border border-[#f3d1ab] bg-[#fff7ec] px-2 py-1 text-[10px] text-[#8f5b2d]">
+            +{hiddenSummary.hiddenEdges} more edges hidden ({hiddenSummary.lens} lens)
+          </div>
+        ) : null}
       </div>
 
       <ForceGraph2D
@@ -465,17 +476,17 @@ export function GraphCanvas({
           if (glow > 0) {
             ctx.save();
             ctx.globalAlpha = focused ? 0.82 : 0.14;
-            ctx.shadowColor = selected ? "#f59e0b" : n.color;
+            ctx.shadowColor = selected ? "#f08b2e" : n.color;
             ctx.shadowBlur = glow;
-            ctx.fillStyle = selected ? "#1d4ed8" : n.color;
+            ctx.fillStyle = selected ? "#5b57e6" : n.color;
             drawNode(ctx, n, radius * 0.98);
             ctx.restore();
           }
 
           ctx.save();
           ctx.globalAlpha = focused ? 0.95 : 0.16;
-          ctx.fillStyle = selected ? "#1d4ed8" : n.color;
-          ctx.strokeStyle = selected ? "#f59e0b" : "#ffffff";
+          ctx.fillStyle = selected ? "#5b57e6" : n.color;
+          ctx.strokeStyle = selected ? "#f08b2e" : "#ffffff";
           ctx.lineWidth = selected ? 2.2 : 1;
           drawNode(ctx, n, radius);
           ctx.stroke();
@@ -501,13 +512,13 @@ export function GraphCanvas({
           ctx.save();
           ctx.globalAlpha = focused ? 0.95 : 0.2;
           ctx.fillStyle = "rgba(255,255,255,0.92)";
-          ctx.strokeStyle = "rgba(149,172,205,0.7)";
+          ctx.strokeStyle = "rgba(155,145,224,0.7)";
           ctx.lineWidth = 1;
           ctx.beginPath();
           ctx.roundRect(x - widthWithPadding / 2, y - fontSize, widthWithPadding, fontSize + 6, 4);
           ctx.fill();
           ctx.stroke();
-          ctx.fillStyle = "#16365d";
+          ctx.fillStyle = "#322c73";
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
           ctx.fillText(label, x, y - fontSize / 2 + 2);
@@ -516,7 +527,7 @@ export function GraphCanvas({
         linkColor={(link) => {
           const l = link as RenderLink;
           if (!hasFocusedSubset) return l.color;
-          return activeEdgeSet.has(l.id) ? l.color : "rgba(141,165,196,0.2)";
+          return activeEdgeSet.has(l.id) ? l.color : "rgba(173,163,224,0.25)";
         }}
         linkWidth={(link) => {
           const l = link as RenderLink;
@@ -529,13 +540,13 @@ export function GraphCanvas({
 
       {nodes.length === 0 ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-          <div className="rounded-full border border-[#c9dcf9] bg-white px-4 py-2 text-xs font-medium text-[#325983]">
+          <div className="rounded-full border border-[#ddd9ff] bg-white px-4 py-2 text-xs font-medium text-[#4e488f]">
             Building core network...
           </div>
         </div>
       ) : null}
 
-      <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-[#cadcf8] bg-white/92 px-2.5 py-1.5 text-[10px] text-[#4a678a]">
+      <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-[#ddd9ff] bg-white/92 px-2.5 py-1.5 text-[10px] text-[#6962a8]">
         Right-click: neighborhood focus • Shift-click two nodes: shortest path
       </div>
     </div>

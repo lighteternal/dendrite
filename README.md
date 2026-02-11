@@ -53,6 +53,10 @@ STRING_MAX_ADDED_EDGES=500
 STRING_MAX_NEIGHBORS_PER_SEED=15
 CACHE_TTL_MS=300000
 OPENAI_MODEL=gpt-5.2
+STREAM_RANKING_TIMEOUT_MS=10000
+STREAM_P5_BUDGET_MS=10000
+STREAM_P5_PER_TARGET_TIMEOUT_MS=3500
+STREAM_MAX_LITERATURE_TARGETS=5
 ```
 
 ## Local Commands
@@ -98,6 +102,22 @@ Output includes:
 - `recommendedTargets` (1 or 3)
 - `mechanismThread` JSON (`claim`, `evidenceBullets`, `counterfactuals`, `caveats`, `nextExperiments`)
 - `missingInputs`
+
+## Deep Discoverer API
+
+`GET /api/agentDiscover?diseaseQuery=...&question=...&diseaseId=...`
+
+SSE events:
+
+- `status` - workflow bootstrapping state.
+- `journey` - live agent journey entries (tool start/result, source, entities).
+- `final` - consolidated readout (answer, biomedical case, focus thread, caveats, next actions).
+- `done` - elapsed time.
+
+Implementation uses LangGraph/LangChain agent middleware with DeepAgents-style subagent delegation:
+
+- `pathway_mapper` (mechanism mapping)
+- `translational_scout` (compound/tractability scouting)
 
 ## Decision and Scoring
 
@@ -162,9 +182,10 @@ Validated locally in this repository:
   - BioMCP: `http://127.0.0.1:8000/mcp`
   - Verified by direct tool calls (`search_diseases`, `find_pathways_by_gene`, `get_interaction_network`, `search_targets`, `article_searcher`, `trial_searcher`)
 
-Recent observed timings (full profile enabled, `maxTargets=8`):
+Recent observed timings (full profile enabled, `maxTargets=8`, February 11, 2026):
 
-- API stream completion: ~3.6s to ~4.1s
-- Browser-observed end-to-end completion: ~2.4s to ~3.3s (warm cache)
+- API stream completion across 5 diseases: ~24s to ~27s
+- Typical bottlenecks: P5 (BioMCP literature/trial enrichment), P6 (OpenAI narrative refinement with timeout fallback)
+- Agent discoverer run observed: ~53s end-to-end for a full delegated workflow
 
 Runtime validation with live MCP services depends on your local Docker runtime and API/network availability.

@@ -11,3 +11,5 @@
 - [x] M9: Improve customer workflow (main-search navigation, in-workbench rerun, executive readout, clearer value framing).
 - [x] M10: End-to-end validation via Chromium automation on 5 diseases + lint/build checks.
 - [x] M11: UI readability + IA split-screen pass (Network/Evidence/Hypothesis tabs), disease-only entity matching hardening, and second E2E/API validation sweep.
+- [x] M12: Deep Discoverer agent workflow (LangGraph + DeepAgents-style subagents) with live SSE journey and graph-focus integration.
+- [x] M13: Reliability/readability hardening pass (Reactome fail-soft per target, faster BioMCP budget, richer Sankey coverage, improved node label spacing, executive natural-language brief).

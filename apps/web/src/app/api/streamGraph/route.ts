@@ -822,15 +822,26 @@ export async function GET(request: NextRequest) {
             interactions: interactionCount,
           });
         } catch (error) {
-          sourceHealth.openai = "yellow";
-          emit({
-            event: "error",
-            data: {
-              phase: "P6",
-              message: `Ranking degraded: ${error instanceof Error ? error.message : "unknown"}`,
-              recoverable: true,
-            },
-          });
+          const message = error instanceof Error ? error.message : "unknown";
+          const timedOut = message.includes("timeout");
+          if (timedOut) {
+            emitStatus("P6", "Baseline ranking finalized (AI refinement deferred)", 98, {
+              targets: targetCount,
+              pathways: pathwayCount,
+              drugs: drugCount,
+              interactions: interactionCount,
+            }, true);
+          } else {
+            sourceHealth.openai = "yellow";
+            emit({
+              event: "error",
+              data: {
+                phase: "P6",
+                message: `Ranking degraded: ${message}`,
+                recoverable: true,
+              },
+            });
+          }
         }
 
         emitStatus("P6", "Build complete", 100, {

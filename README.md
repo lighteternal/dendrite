@@ -154,10 +154,17 @@ Validated locally in this repository:
   - Crohn disease
   - Acute myeloid leukemia
   - Full pipeline completion observed on each run with no browser runtime errors
+- Direct MCP endpoint checks ✅
+  - OpenTargets: `http://127.0.0.1:7010/mcp`
+  - Reactome: `http://127.0.0.1:7020/mcp`
+  - STRING: `http://127.0.0.1:7030/mcp`
+  - ChEMBL: `http://127.0.0.1:7040/mcp`
+  - BioMCP: `http://127.0.0.1:8000/mcp`
+  - Verified by direct tool calls (`search_diseases`, `find_pathways_by_gene`, `get_interaction_network`, `search_targets`, `article_searcher`, `trial_searcher`)
 
 Recent observed timings (full profile enabled, `maxTargets=8`):
 
 - API stream completion: ~3.6s to ~4.1s
-- Browser-observed end-to-end completion: ~2.4s to ~2.6s (warm cache)
+- Browser-observed end-to-end completion: ~2.4s to ~3.3s (warm cache)
 
 Runtime validation with live MCP services depends on your local Docker runtime and API/network availability.

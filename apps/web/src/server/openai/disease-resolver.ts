@@ -50,7 +50,7 @@ function normalizeText(value: string): string {
     .trim();
 }
 
-function extractDiseaseIntent(query: string): string {
+export function extractDiseaseIntent(query: string): string {
   let value = normalizeText(query);
   value = value.replace(/^(for|in|about|regarding)\s+/, "");
 
@@ -68,6 +68,12 @@ function extractDiseaseIntent(query: string): string {
     " showing ",
     " to identify ",
     " to evaluate ",
+    " refractory to ",
+    " resistant to ",
+    " treated with ",
+    " failed ",
+    " relapse ",
+    " progressing on ",
   ];
 
   for (const splitter of splitters) {
@@ -154,6 +160,134 @@ function scoreCandidate(intent: string, candidate: DiseaseCandidate): {
   }
 
   return { score, penalized };
+}
+
+type RankedCandidate = DiseaseCandidate & {
+  score: number;
+  penalized: boolean;
+};
+
+function lexicalRankDiseaseCandidates(
+  query: string,
+  candidates: DiseaseCandidate[],
+): RankedCandidate[] {
+  const intent = extractDiseaseIntent(query);
+  return candidates
+    .map((candidate) => {
+      const scored = scoreCandidate(intent, candidate);
+      return {
+        ...candidate,
+        score: scored.score,
+        penalized: scored.penalized,
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
+export async function rankDiseaseCandidatesFast(
+  query: string,
+  candidates: DiseaseCandidate[],
+  limit = 8,
+): Promise<DiseaseCandidate[]> {
+  if (candidates.length === 0) return [];
+
+  const lexical = lexicalRankDiseaseCandidates(query, candidates);
+  const capped = lexical.slice(0, Math.max(1, limit));
+  if (!openai || capped.length <= 2) {
+    return capped.map((item) => ({
+      id: item.id,
+      name: item.name,
+      description: item.description,
+    }));
+  }
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      orderedIds: {
+        type: "array",
+        items: { type: "string" },
+      },
+    },
+    required: ["orderedIds"],
+  } as const;
+
+  const systemPrompt = [
+    "You rank disease entity autocomplete suggestions for a biomedical user query.",
+    "Prefer canonical disease entities over biomarker or measurement variants.",
+    "Use only provided candidates and return orderedIds only.",
+  ].join(" ");
+
+  const userPrompt = JSON.stringify(
+    {
+      query,
+      candidates: capped.map(({ id, name, description }) => ({
+        id,
+        name,
+        description,
+      })),
+    },
+    null,
+    2,
+  );
+
+  try {
+    const response = await Promise.race([
+      openai.responses.create({
+        model: appConfig.openai.smallModel,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: systemPrompt }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: userPrompt }],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "disease_autocomplete_ranking",
+            schema,
+            strict: true,
+          },
+        },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("autocomplete timeout")), 800),
+      ),
+    ]);
+
+    const parsed = JSON.parse(response.output_text) as {
+      orderedIds?: string[];
+    };
+    const rankedMap = new Map(capped.map((item) => [item.id, item]));
+    const ordered = (parsed.orderedIds ?? [])
+      .map((id) => rankedMap.get(id))
+      .filter(Boolean) as RankedCandidate[];
+
+    for (const candidate of capped) {
+      if (!ordered.some((item) => item.id === candidate.id)) {
+        ordered.push(candidate);
+      }
+    }
+
+    return ordered
+      .slice(0, Math.max(1, limit))
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description,
+      }));
+  } catch {
+    return capped.map((item) => ({
+      id: item.id,
+      name: item.name,
+      description: item.description,
+    }));
+  }
 }
 
 function lexicalFallback(query: string, candidates: DiseaseCandidate[]): {

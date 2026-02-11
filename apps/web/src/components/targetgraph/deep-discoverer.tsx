@@ -14,24 +14,6 @@ type Props = {
   onFocusEntities: (entities: DiscoverEntity[]) => void;
 };
 
-const CASE_TEMPLATES = [
-  {
-    label: "RA Rescue Thread",
-    question:
-      "For TNF-inhibitor refractory rheumatoid arthritis, identify one pathway -> target -> drug thread with the strongest translational plausibility and explain caveats.",
-  },
-  {
-    label: "NSCLC Resistance",
-    question:
-      "For NSCLC, map a resistance-aware pathway thread and suggest one tractable target-drug axis that complements EGFR-driven biology.",
-  },
-  {
-    label: "Alzheimer Mechanism",
-    question:
-      "For Alzheimer's disease, propose one mechanistic thread linking high-evidence targets, pathways, and compounds, then list data gaps before wet-lab follow-up.",
-  },
-];
-
 const sourceTone: Record<string, string> = {
   agent: "bg-[#ede9ff] text-[#4a4390]",
   opentargets: "bg-[#e8f6ff] text-[#165e8d]",
@@ -43,7 +25,11 @@ const sourceTone: Record<string, string> = {
 
 export function DeepDiscoverer({ diseaseQuery, diseaseId, onFocusEntities }: Props) {
   const stream = useDeepDiscoverStream();
-  const [question, setQuestion] = useState(CASE_TEMPLATES[0]?.question ?? "");
+  const [question, setQuestion] = useState(() => {
+    const scopedDisease = diseaseQuery.trim();
+    if (!scopedDisease) return "";
+    return `For ${scopedDisease}, identify one disease->pathway->target->drug mechanism thread with strongest translational plausibility and explicit caveats.`;
+  });
 
   const totalEntityRefs = useMemo(
     () => stream.entries.reduce((acc, entry) => acc + entry.entities.length, 0),
@@ -57,28 +43,15 @@ export function DeepDiscoverer({ diseaseQuery, diseaseId, onFocusEntities }: Pro
           <CardTitle className="text-sm text-[#342f7b]">Deep Discoverer</CardTitle>
           <Badge className="bg-[#f1efff] text-[#4a4390]">
             <Workflow className="mr-1 h-3.5 w-3.5" />
-            LangGraph DeepAgents-style
+            Agentic workflow
           </Badge>
         </div>
         <p className="text-xs text-[#6b65aa]">
-          Ask a translational question. The agent fans out across MCP tools and streams its
-          evidence journey live.
+          Ask a translational question. The agent fans out across MCP tools and streams the
+          evidence journey in real time.
         </p>
       </CardHeader>
       <CardContent className="space-y-3 text-xs text-[#5a549c]">
-        <div className="flex flex-wrap gap-2">
-          {CASE_TEMPLATES.map((template) => (
-            <button
-              key={template.label}
-              type="button"
-              className="rounded-full border border-[#ddd9ff] bg-[#f6f4ff] px-3 py-1 text-[11px] text-[#4a4390] hover:bg-[#eee9ff]"
-              onClick={() => setQuestion(template.question)}
-            >
-              {template.label}
-            </button>
-          ))}
-        </div>
-
         <div className="rounded-lg border border-[#ddd9ff] bg-[#f9f8ff] p-2">
           <div className="mb-1 flex items-center gap-1 text-[11px] font-semibold text-[#4a4390]">
             <Telescope className="h-3.5 w-3.5" />

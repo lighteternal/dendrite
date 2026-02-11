@@ -135,13 +135,17 @@ export function rankTargetsFallback(rows: RankingInputRow[]): RankingResponse {
       rank: idx + 1,
       score: Number(target.score.toFixed(4)),
       reasons: [
-        `OpenTargets evidence ${target.openTargetsEvidence.toFixed(2)}`,
-        `Drug actionability ${target.drugActionability.toFixed(2)} with ${target.drugCount} linked drugs`,
+        `OpenTargets evidence ${target.openTargetsEvidence.toFixed(2)}; pathway hooks ${target.pathwayIds.length}.`,
+        `Drug actionability ${target.drugActionability.toFixed(2)} with ${target.drugCount} linked compounds.`,
+        `Network centrality ${target.networkCentrality.toFixed(2)} across ${target.interactionCount} interaction edges.`,
       ],
       caveats: [
         target.articleCount === 0
           ? "No literature snippets provided"
           : `${target.articleCount} article snippets provided`,
+        target.trialCount === 0
+          ? "No trial snippets provided"
+          : `${target.trialCount} trial snippets provided`,
       ],
       pathwayHooks: target.pathwayIds.slice(0, 3),
       drugHooks: [`${target.drugCount} compounds`],
@@ -235,8 +239,10 @@ export async function rankTargets(rows: RankingInputRow[]): Promise<RankingRespo
   };
 
   const systemPrompt = [
-    "You rank disease targets from an evidence table.",
+    "You are a translational biology target-ranking assistant.",
+    "Rank targets from a disease evidence table for mechanism triage.",
     "Use ONLY the provided fields and node IDs.",
+    "Rationales must mention concrete evidence values or counts from evidenceRefs.",
     "If information is missing, explicitly state 'not provided'.",
     "Never claim efficacy or provide clinical recommendation.",
     "Output must satisfy the supplied JSON schema.",

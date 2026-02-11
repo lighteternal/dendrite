@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { searchDiseases } from "@/server/mcp/opentargets";
+import {
+  extractDiseaseIntent,
+  rankDiseaseCandidatesFast,
+  type DiseaseCandidate,
+} from "@/server/openai/disease-resolver";
 
 export const runtime = "nodejs";
 
@@ -12,15 +17,20 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const results = await searchDiseases(query, 8);
+    const intent = extractDiseaseIntent(query);
+    const searchQuery = intent.length >= 2 ? intent : query;
+    const results = await searchDiseases(searchQuery, 12);
+    const candidates: DiseaseCandidate[] = results
+      .filter((disease) => diseaseIdPattern.test(disease.id))
+      .map((disease) => ({
+        id: disease.id,
+        name: disease.name,
+        description: disease.description,
+      }));
+
+    const ranked = await rankDiseaseCandidatesFast(searchQuery, candidates, 8);
     return NextResponse.json({
-      results: results
-        .filter((disease) => diseaseIdPattern.test(disease.id))
-        .map((disease) => ({
-          id: disease.id,
-          name: disease.name,
-          description: disease.description,
-        })),
+      results: ranked,
     });
   } catch {
     return NextResponse.json({ results: [] });

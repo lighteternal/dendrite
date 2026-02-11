@@ -141,44 +141,12 @@ function inferBiomedicalCase(diseaseName: string | undefined): {
   title: string;
   whyAgentic: string;
 } {
-  const label = (diseaseName ?? "").toLowerCase();
-
-  if (label.includes("rheumatoid")) {
-    return {
-      title: "TNF-inhibitor refractory rheumatoid arthritis (program triage)",
-      whyAgentic:
-        "This case needs concurrent pathway bottleneck mapping and tractability scouting before selecting one mechanism thread for validation.",
-    };
-  }
-
-  if (label.includes("non-small cell") || label.includes("nsclc")) {
-    return {
-      title: "EGFR-driven NSCLC with resistance progression (combination design)",
-      whyAgentic:
-        "Parallel mechanism and compound scouting is needed to surface resistance-aware target-drug threads with explicit caveats.",
-    };
-  }
-
-  if (label.includes("alzheimer")) {
-    return {
-      title: "Early Alzheimer's translational prioritization (mechanism triage)",
-      whyAgentic:
-        "This workflow requires simultaneous mapping of target evidence, pathway coherence, and intervention tractability before choosing one experimental thread.",
-    };
-  }
-
-  if (label.includes("acute myeloid") || label.includes("aml")) {
-    return {
-      title: "Acute myeloid leukemia resistance-aware prioritization",
-      whyAgentic:
-        "Agentic parallel retrieval helps compare pathway hooks, target centrality, and available compounds before committing wet-lab resources.",
-    };
-  }
-
   return {
-    title: "Translational mechanism triage",
+    title: diseaseName
+      ? `${diseaseName}: translational mechanism triage`
+      : "Translational mechanism triage",
     whyAgentic:
-      "This workflow benefits from parallel evidence retrieval across targets, pathways, compounds, interactions, and literature context.",
+      "This workflow benefits from parallel evidence retrieval across targets, pathways, compounds, interactions, and literature context before selecting one validation thread.",
   };
 }
 
@@ -653,9 +621,12 @@ export async function runDeepDiscoverer({
       description:
         "Maps disease -> target -> pathway -> interaction structure and identifies mechanistic bottlenecks.",
       systemPrompt: [
-        "You are a pathway cartographer for translational biology programs.",
-        "Use resolve_disease, get_top_targets, get_pathways_for_targets, and get_interaction_neighborhood.",
-        "Return mechanistic storylines and explicit data gaps.",
+        "You are a pathway cartographer supporting a translational biologist.",
+        "Objective: find one biologically coherent disease -> target -> pathway -> interaction thread.",
+        "Tool plan: resolve_disease -> get_top_targets (8-12) -> get_pathways_for_targets -> get_interaction_neighborhood.",
+        "Prioritize pathway coherence and network plausibility over novelty for novelty's sake.",
+        "Report outputs with named entities and explicit unknowns.",
+        "Never invent pathway IDs, interaction evidence, or biological claims beyond returned tools.",
       ].join(" "),
       tools,
       model,
@@ -665,9 +636,12 @@ export async function runDeepDiscoverer({
       description:
         "Maps target -> compound -> evidence layers and proposes tractable intervention threads.",
       systemPrompt: [
-        "You are a translational scout.",
-        "Use resolve_disease, get_top_targets, get_drugs_for_targets, and get_literature_trials_for_targets.",
-        "Prioritize tractable intervention threads and caveats.",
+        "You are a translational scout supporting target nomination decisions.",
+        "Objective: identify tractable compounds and translational caveats for top targets.",
+        "Tool plan: resolve_disease -> get_top_targets (8-12) -> get_drugs_for_targets -> get_literature_trials_for_targets.",
+        "Rank threads by tractability and evidence support, not by speculative novelty.",
+        "Call out missing evidence explicitly (not provided / unavailable).",
+        "Never invent compounds, trials, or efficacy claims.",
       ].join(" "),
       tools,
       model,
@@ -687,10 +661,14 @@ export async function runDeepDiscoverer({
     ],
     responseFormat: agentResponseSchema,
     systemPrompt: [
-      "You are TargetGraph Discoverer, an agentic biomedical workflow assistant.",
-      "MUST use task tool to delegate in parallel to: pathway_mapper and translational_scout.",
-      "Only use tool outputs; do not invent papers, pathways, or compounds.",
-      "Produce concise, decision-grade output for a translational biology lead.",
+      "You are TargetGraph Discoverer, a biomedical decision-support orchestrator.",
+      "Your audience is a translational biology program lead deciding the next experiment.",
+      "You MUST delegate in parallel using task tool to pathway_mapper and translational_scout.",
+      "After subagent outputs, synthesize one primary mechanism thread and 2-3 alternates.",
+      "Use only tool outputs; do not invent pathways, compounds, literature, or trial evidence.",
+      "No clinical recommendation language. No efficacy claims.",
+      "If evidence is missing, write 'not provided' and list concrete follow-up assays/data pulls.",
+      "Keep language concise and technical enough for a domain expert.",
     ].join(" "),
   });
 
@@ -733,7 +711,11 @@ export async function runDeepDiscoverer({
             `Preferred disease ID (if provided): ${diseaseIdHint ?? "not provided"}`,
             `Question: ${question}`,
             "",
-            "Return a mechanistic and actionable synthesis with caveats and next actions.",
+            "Deliver exactly:",
+            "1) Direct answer in 2-4 sentences naming one primary disease->target->pathway->drug thread.",
+            "2) 3 concise mechanism findings with named entities.",
+            "3) Caveats focused on data gaps and degraded sources.",
+            "4) Next actions as concrete experiments/validation tasks a biologist can run.",
           ].join("\n"),
         },
       ],

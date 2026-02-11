@@ -10,6 +10,18 @@ type DiseaseHit = {
   description?: string;
 };
 
+export type TargetHit = {
+  id: string;
+  name: string;
+  description?: string;
+};
+
+export type DrugHit = {
+  id: string;
+  name: string;
+  description?: string;
+};
+
 export type DiseaseTarget = {
   targetId: string;
   targetSymbol: string;
@@ -31,6 +43,14 @@ const diseaseCache = createTTLCache<string, DiseaseHit[]>(
   appConfig.cache.maxEntries,
 );
 const targetSummaryCache = createTTLCache<string, DiseaseTarget[]>(
+  appConfig.cache.ttlMs,
+  appConfig.cache.maxEntries,
+);
+const targetSearchCache = createTTLCache<string, TargetHit[]>(
+  appConfig.cache.ttlMs,
+  appConfig.cache.maxEntries,
+);
+const drugSearchCache = createTTLCache<string, DrugHit[]>(
   appConfig.cache.ttlMs,
   appConfig.cache.maxEntries,
 );
@@ -68,6 +88,33 @@ function normalizeDiseaseHits(rawHits: any[], size: number): DiseaseHit[] {
     if (!normalized) continue;
     if (!deduped.has(normalized.id)) {
       deduped.set(normalized.id, normalized);
+    }
+  }
+  return [...deduped.values()].slice(0, size);
+}
+
+function normalizeEntityHits<T extends { id: string; name: string; description?: string }>(
+  rawHits: any[],
+  entityName: "target" | "drug",
+  size: number,
+): T[] {
+  const deduped = new Map<string, T>();
+  for (const raw of rawHits) {
+    const id = typeof raw?.id === "string" ? raw.id.trim() : "";
+    const name = typeof raw?.name === "string" ? raw.name.trim() : "";
+    const description =
+      typeof raw?.description === "string" ? raw.description : undefined;
+    const entity =
+      typeof raw?.entity === "string" ? raw.entity.toLowerCase() : undefined;
+
+    if (!id || !name) continue;
+    if (entity && entity !== entityName) continue;
+    if (!deduped.has(id)) {
+      deduped.set(id, {
+        id,
+        name,
+        description,
+      } as T);
     }
   }
   return [...deduped.values()].slice(0, size);
@@ -111,6 +158,88 @@ export async function searchDiseases(query: string, size = 8): Promise<DiseaseHi
     const rawHits = response?.data?.search?.hits ?? [];
     const hits = normalizeDiseaseHits(rawHits, size);
     diseaseCache.set(cacheKey, hits);
+    return hits;
+  }
+}
+
+export async function searchTargets(query: string, size = 8): Promise<TargetHit[]> {
+  const cacheKey = `${query.toLowerCase()}::${size}`;
+  const cached = targetSearchCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const payload = await mcp.callTool<any>("search_targets", { query, size });
+    const rawHits = payload?.data?.search?.hits ?? payload?.hits ?? payload?.targets ?? [];
+    const hits = normalizeEntityHits<TargetHit>(rawHits, "target", size);
+    targetSearchCache.set(cacheKey, hits);
+    return hits;
+  } catch {
+    const response = await fetchJson<any>(
+      "https://api.platform.opentargets.org/api/v4/graphql",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          query: `
+            query SearchTargets($queryString: String!) {
+              search(queryString: $queryString, entityNames: ["target"]) {
+                hits {
+                  id
+                  name
+                  description
+                  entity
+                }
+              }
+            }
+          `,
+          variables: { queryString: query },
+        }),
+      },
+    );
+
+    const rawHits = response?.data?.search?.hits ?? [];
+    const hits = normalizeEntityHits<TargetHit>(rawHits, "target", size);
+    targetSearchCache.set(cacheKey, hits);
+    return hits;
+  }
+}
+
+export async function searchDrugs(query: string, size = 8): Promise<DrugHit[]> {
+  const cacheKey = `${query.toLowerCase()}::${size}`;
+  const cached = drugSearchCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const payload = await mcp.callTool<any>("search_drugs", { query, size });
+    const rawHits = payload?.data?.search?.hits ?? payload?.hits ?? payload?.drugs ?? [];
+    const hits = normalizeEntityHits<DrugHit>(rawHits, "drug", size);
+    drugSearchCache.set(cacheKey, hits);
+    return hits;
+  } catch {
+    const response = await fetchJson<any>(
+      "https://api.platform.opentargets.org/api/v4/graphql",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          query: `
+            query SearchDrugs($queryString: String!) {
+              search(queryString: $queryString, entityNames: ["drug"]) {
+                hits {
+                  id
+                  name
+                  description
+                  entity
+                }
+              }
+            }
+          `,
+          variables: { queryString: query },
+        }),
+      },
+    );
+
+    const rawHits = response?.data?.search?.hits ?? [];
+    const hits = normalizeEntityHits<DrugHit>(rawHits, "drug", size);
+    drugSearchCache.set(cacheKey, hits);
     return hits;
   }
 }

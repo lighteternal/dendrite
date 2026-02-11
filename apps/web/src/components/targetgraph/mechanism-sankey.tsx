@@ -1,8 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { sankey as d3Sankey, sankeyLinkHorizontal } from "d3-sankey";
-import type { SankeyLinkMinimal } from "d3-sankey";
+import { ResponsiveSankey } from "@nivo/sankey";
 import type { SankeyRow } from "@/lib/contracts";
 
 type Props = {
@@ -10,163 +9,192 @@ type Props = {
   onBandClick?: (source: string, target: string) => void;
 };
 
-type Link = SankeyLinkMinimal<{ name: string; type: string }, { value: number }>;
+type FlowNode = {
+  id: string;
+  label: string;
+  displayLabel: string;
+  type: string;
+};
+
+type FlowLink = {
+  source: string;
+  target: string;
+  value: number;
+};
+
+const typeColor: Record<string, string> = {
+  disease: "#e11d48",
+  target: "#1d4ed8",
+  pathway: "#0f766e",
+  drug: "#c2410c",
+  interaction: "#64748b",
+};
+
+function truncateLabel(value: string, max = 30): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max - 1)}…`;
+}
 
 export function MechanismSankey({ rows, onBandClick }: Props) {
-  const width = 980;
-  const height = 240;
-
-  const layout = useMemo(() => {
+  const { nodes, links, topFlows } = useMemo(() => {
     const aggregated = new Map<string, SankeyRow>();
+
     for (const row of rows) {
       if (!row.source || !row.target) continue;
-      const value = Number(row.value);
-      if (!Number.isFinite(value) || value <= 0) continue;
+      if (!Number.isFinite(row.value) || row.value <= 0) continue;
       if (row.source === row.target) continue;
 
       const key = `${row.sourceType}:${row.source}=>${row.targetType}:${row.target}`;
       const existing = aggregated.get(key);
       if (existing) {
-        existing.value += value;
+        existing.value += row.value;
       } else {
-        aggregated.set(key, { ...row, value });
+        aggregated.set(key, { ...row });
       }
     }
 
-    const safeRows = [...aggregated.values()]
+    const ranked = [...aggregated.values()]
       .sort((a, b) => b.value - a.value)
-      .slice(0, 90);
+      .slice(0, 28);
 
-    if (safeRows.length === 0) {
-      return {
-        nodes: [] as Array<{ name: string; type: string; x0?: number; x1?: number; y0?: number; y1?: number }>,
-        links: [] as Array<Link>,
-      };
+    const nodesById = new Map<string, FlowNode>();
+    const links: FlowLink[] = [];
+
+    for (const row of ranked) {
+      const sourceId = `${row.sourceType}:${row.source}`;
+      const targetId = `${row.targetType}:${row.target}`;
+
+      nodesById.set(sourceId, {
+        id: sourceId,
+        label: row.source,
+        displayLabel: truncateLabel(row.source),
+        type: row.sourceType,
+      });
+      nodesById.set(targetId, {
+        id: targetId,
+        label: row.target,
+        displayLabel: truncateLabel(row.target),
+        type: row.targetType,
+      });
+
+      links.push({
+        source: sourceId,
+        target: targetId,
+        value: Math.max(0.1, row.value),
+      });
     }
 
-    const nodeIndex = new Map<string, number>();
-    const nodes: Array<{ name: string; type: string }> = [];
-    const links: Array<{ source: number; target: number; value: number }> = [];
-
-    const getNodeIndex = (name: string, type: string) => {
-      const key = `${type}:${name}`;
-      if (!nodeIndex.has(key)) {
-        nodeIndex.set(key, nodes.length);
-        nodes.push({ name, type });
-      }
-      return nodeIndex.get(key)!;
+    return {
+      nodes: [...nodesById.values()],
+      links,
+      topFlows: ranked.slice(0, 8),
     };
-
-    for (const row of safeRows) {
-      const source = getNodeIndex(row.source, row.sourceType);
-      const target = getNodeIndex(row.target, row.targetType);
-      links.push({ source, target, value: Math.max(0.1, row.value) });
-    }
-
-    if (nodes.length > 45) {
-      const allowed = new Set<number>(
-        links
-          .slice(0, 80)
-          .flatMap((link) => [link.source, link.target])
-          .slice(0, 45),
-      );
-      const remap = new Map<number, number>();
-      const cappedNodes: Array<{ name: string; type: string }> = [];
-
-      [...allowed].forEach((oldIdx) => {
-        remap.set(oldIdx, cappedNodes.length);
-        cappedNodes.push(nodes[oldIdx]!);
-      });
-
-      const cappedLinks = links
-        .filter((link) => allowed.has(link.source) && allowed.has(link.target))
-        .map((link) => ({
-          source: remap.get(link.source)!,
-          target: remap.get(link.target)!,
-          value: link.value,
-        }));
-
-      nodes.splice(0, nodes.length, ...cappedNodes);
-      links.splice(0, links.length, ...cappedLinks);
-    }
-
-    const sankey = d3Sankey<{ name: string; type: string }, { value: number }>()
-      .nodeWidth(14)
-      .nodePadding(10)
-      .extent([
-        [0, 0],
-        [width - 20, height - 20],
-      ]);
-
-    try {
-      return sankey({
-        nodes: nodes.map((n) => ({ ...n })),
-        links: links.map((l) => ({ ...l })),
-      });
-    } catch {
-      return {
-        nodes: [] as Array<{ name: string; type: string; x0?: number; x1?: number; y0?: number; y1?: number }>,
-        links: [] as Array<Link>,
-      };
-    }
   }, [rows]);
 
-  return (
-    <div className="w-full overflow-x-auto rounded-md border border-white/10 bg-[#0a1320] p-2">
-      {layout.nodes.length === 0 ? (
-        <div className="flex h-[220px] items-center justify-center rounded-md border border-dashed border-white/15 bg-[#0e192a] text-xs text-[#89a4bf]">
-          Mechanism trail appears once pathway-target edges are available.
-        </div>
-      ) : null}
-      <svg
-        width={width}
-        height={height}
-        className={`max-w-full ${layout.nodes.length === 0 ? "hidden" : "block"}`}
-      >
-        <g transform="translate(10,10)">
-          {layout.links.map((link, idx) => (
-            <path
-              key={`link-${idx}`}
-              d={sankeyLinkHorizontal()(link as Link) ?? ""}
-              stroke="#7ab6ff"
-              strokeOpacity={0.5}
-              strokeWidth={Math.max(1, link.width ?? 1)}
-              fill="none"
-              className="cursor-pointer transition hover:stroke-[#ff9f43] hover:stroke-opacity-90"
-              onClick={() => {
-                const src = typeof link.source === "object" ? link.source.name : "";
-                const tgt = typeof link.target === "object" ? link.target.name : "";
-                if (src && tgt) onBandClick?.(src, tgt);
-              }}
-            />
-          ))}
+  if (nodes.length === 0 || links.length === 0) {
+    return (
+      <div className="flex h-[300px] items-center justify-center rounded-xl border border-dashed border-[#c8daf7] bg-[#f9fbff] text-sm text-[#5d7da4]">
+        Mechanism trail becomes available after target-pathway and target-drug links stream in.
+      </div>
+    );
+  }
 
-          {layout.nodes.map((node, idx) => (
-            <g key={`node-${idx}`}>
-              <rect
-                x={node.x0}
-                y={node.y0}
-                width={Math.max(1, (node.x1 ?? 0) - (node.x0 ?? 0))}
-                height={Math.max(1, (node.y1 ?? 0) - (node.y0 ?? 0))}
-                fill="#2fbf9d"
-                fillOpacity={0.7}
-                stroke="#94ffe2"
-                strokeWidth={1}
-                rx={2}
-              />
-              <text
-                x={(node.x1 ?? 0) + 6}
-                y={((node.y0 ?? 0) + (node.y1 ?? 0)) / 2}
-                fontSize={10}
-                dominantBaseline="middle"
-                fill="#d6ebff"
-              >
-                {node.name}
-              </text>
-            </g>
+  return (
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_280px]">
+      <div className="h-[360px] rounded-xl border border-[#c8daf7] bg-[#fbfdff] p-2">
+        <ResponsiveSankey
+          data={{
+            nodes,
+            links,
+          }}
+          margin={{ top: 18, right: 110, bottom: 18, left: 110 }}
+          align="justify"
+          sort="descending"
+          colors={(node) => typeColor[(node as { type?: string }).type ?? "interaction"] ?? "#64748b"}
+          nodeOpacity={0.96}
+          nodeBorderWidth={1}
+          nodeBorderColor="#dbe8fb"
+          nodeThickness={14}
+          nodeSpacing={18}
+          linkOpacity={0.46}
+          linkHoverOpacity={0.82}
+          linkBlendMode="multiply"
+          enableLinkGradient
+          label={(node) => String((node as { displayLabel?: string }).displayLabel ?? "")}
+          labelPosition="outside"
+          labelOrientation="horizontal"
+          labelPadding={12}
+          labelTextColor="#23476f"
+          animate
+          motionConfig="gentle"
+          onClick={(item) => {
+            const link = item as {
+              source?: { id?: string };
+              target?: { id?: string };
+            };
+            if (!link.source?.id || !link.target?.id) return;
+
+            const sourceLabel = link.source.id.split(":").slice(1).join(":");
+            const targetLabel = link.target.id.split(":").slice(1).join(":");
+            if (sourceLabel && targetLabel) {
+              onBandClick?.(sourceLabel, targetLabel);
+            }
+          }}
+          linkTooltip={(item) => {
+            const link = item as {
+              source?: { id?: string };
+              target?: { id?: string };
+              value?: number;
+            };
+            const sourceLabel = link.source?.id?.split(":").slice(1).join(":") ?? "unknown";
+            const targetLabel = link.target?.id?.split(":").slice(1).join(":") ?? "unknown";
+            return (
+              <div className="rounded-md border border-[#cadcf7] bg-white px-2 py-1 text-xs text-[#16385f] shadow-md">
+                <div className="font-semibold">{sourceLabel} → {targetLabel}</div>
+                <div>flow score: {(link.value ?? 0).toFixed(2)}</div>
+              </div>
+            );
+          }}
+          theme={{
+            tooltip: {
+              container: {
+                background: "transparent",
+                boxShadow: "none",
+              },
+            },
+            labels: {
+              text: {
+                fill: "#274b74",
+                fontSize: 11,
+              },
+            },
+          }}
+        />
+      </div>
+
+      <aside className="rounded-xl border border-[#c8daf7] bg-[#fbfdff] p-3">
+        <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-[#587ca5]">
+          Top Mechanism Flows
+        </div>
+        <div className="space-y-2">
+          {topFlows.map((flow, index) => (
+            <button
+              key={`${flow.sourceType}-${flow.source}-${flow.targetType}-${flow.target}`}
+              type="button"
+              className="w-full rounded-lg border border-[#d6e4f9] bg-white px-2.5 py-2 text-left text-xs text-[#23446c] transition hover:bg-[#eef5ff]"
+              onClick={() => onBandClick?.(flow.source, flow.target)}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold">#{index + 1}</span>
+                <span className="text-[#5d7da2]">{flow.value.toFixed(2)}</span>
+              </div>
+              <div className="mt-1 line-clamp-2">
+                {truncateLabel(flow.source, 26)} → {truncateLabel(flow.target, 26)}
+              </div>
+            </button>
           ))}
-        </g>
-      </svg>
+        </div>
+      </aside>
     </div>
   );
 }

@@ -1,11 +1,15 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import CytoscapeComponent from "react-cytoscapejs";
-import type cytoscape from "cytoscape";
+import dynamic from "next/dynamic";
+import type { ForceGraphMethods, LinkObject, NodeObject } from "react-force-graph-2d";
 import { Camera, LocateFixed, Maximize2, Minimize2 } from "lucide-react";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
 import { Button } from "@/components/ui/button";
+
+const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
+  ssr: false,
+});
 
 type Props = {
   nodes: GraphNode[];
@@ -16,124 +20,114 @@ type Props = {
   highlightedEdgeIds?: Set<string>;
 };
 
-const styles = [
-  {
-    selector: "node",
-    style: {
-      label: "data(label)",
-      color: "#dff0ff",
-      "font-size": 10,
-      "text-wrap": "wrap",
-      "text-max-width": 100,
-      "background-color": "#6ca2ff",
-      "border-color": "#e8f5ff",
-      "border-width": 1,
-      width: "mapData(size, 12, 80, 16, 54)",
-      height: "mapData(size, 12, 80, 16, 54)",
-      "text-halign": "center",
-      "text-valign": "center",
-      "overlay-opacity": 0,
-      "shadow-blur": "mapData(score, 0, 1, 3, 26)",
-      "shadow-color": "#7dd3fc",
-      "shadow-opacity": 0.7,
-    },
-  },
-  {
-    selector: 'node[type = "disease"]',
-    style: {
-      shape: "ellipse",
-      "background-color": "#ff6f59",
-      "font-weight": 700,
-      "font-size": 11,
-      "shadow-color": "#ff8d7b",
-    },
-  },
-  {
-    selector: 'node[type = "target"]',
-    style: {
-      shape: "round-rectangle",
-      "background-color": "#35a7ff",
-      "shadow-color": "#9fd9ff",
-    },
-  },
-  {
-    selector: 'node[type = "pathway"]',
-    style: {
-      shape: "round-tag",
-      "background-color": "#2ebfa5",
-      color: "#06382f",
-      "font-size": 9,
-      "shadow-color": "#61f2d0",
-    },
-  },
-  {
-    selector: 'node[type = "drug"]',
-    style: {
-      shape: "diamond",
-      "background-color": "#ffd166",
-      color: "#5b3c00",
-      "font-size": 9,
-      "shadow-color": "#ffe5a3",
-    },
-  },
-  {
-    selector: 'node[type = "interaction"]',
-    style: {
-      shape: "hexagon",
-      "background-color": "#b8c1ec",
-      color: "#1f2540",
-      "font-size": 8,
-      "shadow-color": "#d7dcf6",
-    },
-  },
-  {
-    selector: "edge",
-    style: {
-      width: "mapData(weight, 0, 1, 1, 6)",
-      "line-color": "#84a6c8",
-      "curve-style": "bezier",
-      opacity: 0.7,
-      "target-arrow-shape": "none",
-      "overlay-opacity": 0,
-    },
-  },
-  {
-    selector: 'edge[type = "target_drug"]',
-    style: {
-      "line-color": "#f3bd4e",
-    },
-  },
-  {
-    selector: 'edge[type = "target_pathway"]',
-    style: {
-      "line-color": "#3dd6b9",
-    },
-  },
-  {
-    selector: ".faded",
-    style: {
-      opacity: 0.08,
-    },
-  },
-  {
-    selector: ".highlighted",
-    style: {
-      opacity: 1,
-      "line-color": "#f77f00",
-      "background-color": "#fb8500",
-      "shadow-blur": 36,
-      "shadow-opacity": 1,
-      "z-index": 9999,
-    },
-  },
-  {
-    selector: ".selected",
-    style: {
-      "border-width": 3,
-      "border-color": "#ffbe0b",
-    },
-  },
-];
+type RenderNode = NodeObject & {
+  id: string;
+  type: GraphNode["type"];
+  label: string;
+  size: number;
+  score: number;
+  color: string;
+};
+
+type RenderLink = LinkObject<RenderNode> & {
+  id: string;
+  source: string | RenderNode;
+  target: string | RenderNode;
+  type: GraphEdge["type"];
+  weight: number;
+  color: string;
+};
+
+const nodeColors: Record<GraphNode["type"], string> = {
+  disease: "#ef4444",
+  target: "#2563eb",
+  pathway: "#0f766e",
+  drug: "#d97706",
+  interaction: "#64748b",
+};
+
+const edgeColors: Record<GraphEdge["type"], string> = {
+  disease_target: "#64748b",
+  target_pathway: "#0891b2",
+  target_drug: "#d97706",
+  target_target: "#7c3aed",
+  pathway_drug: "#0f766e",
+};
+
+const shortestPath = (startId: string, endId: string, adjacency: Map<string, string[]>) => {
+  if (startId === endId) return [startId];
+
+  const queue: string[] = [startId];
+  const visited = new Set<string>([startId]);
+  const parent = new Map<string, string>();
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const neighbors = adjacency.get(current) ?? [];
+
+    for (const next of neighbors) {
+      if (visited.has(next)) continue;
+      visited.add(next);
+      parent.set(next, current);
+      if (next === endId) {
+        const path = [endId];
+        let node = endId;
+        while (parent.has(node)) {
+          node = parent.get(node)!;
+          path.unshift(node);
+        }
+        return path;
+      }
+      queue.push(next);
+    }
+  }
+
+  return [];
+};
+
+function drawNode(ctx: CanvasRenderingContext2D, node: RenderNode, radius: number) {
+  switch (node.type) {
+    case "disease": {
+      ctx.beginPath();
+      ctx.arc(0, 0, radius * 1.14, 0, 2 * Math.PI, false);
+      ctx.fill();
+      break;
+    }
+    case "target": {
+      const w = radius * 2.2;
+      const h = radius * 1.3;
+      ctx.beginPath();
+      ctx.roundRect(-w / 2, -h / 2, w, h, 4);
+      ctx.fill();
+      break;
+    }
+    case "pathway": {
+      const w = radius * 2.3;
+      const h = radius * 1.2;
+      ctx.beginPath();
+      ctx.roundRect(-w / 2, -h / 2, w, h, h / 2);
+      ctx.fill();
+      break;
+    }
+    case "drug": {
+      ctx.beginPath();
+      ctx.moveTo(0, -radius * 1.1);
+      ctx.lineTo(radius * 1.1, 0);
+      ctx.lineTo(0, radius * 1.1);
+      ctx.lineTo(-radius * 1.1, 0);
+      ctx.closePath();
+      ctx.fill();
+      break;
+    }
+    case "interaction":
+    default: {
+      ctx.beginPath();
+      ctx.arc(0, 0, radius * 0.92, 0, 2 * Math.PI, false);
+      ctx.fill();
+      break;
+    }
+  }
+}
 
 export function GraphCanvas({
   nodes,
@@ -143,12 +137,171 @@ export function GraphCanvas({
   highlightedNodeIds,
   highlightedEdgeIds,
 }: Props) {
-  const cyRef = useRef<cytoscape.Core | null>(null);
-  const layoutRef = useRef<cytoscape.Layouts | null>(null);
-  const [fullscreen, setFullscreen] = useState(false);
-  const [pathAnchorNodeId, setPathAnchorNodeId] = useState<string | null>(null);
+  const fgRef = useRef<ForceGraphMethods<NodeObject, LinkObject> | undefined>(undefined);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const hasFittedRef = useRef(false);
+  const lastAutoFitNodeCountRef = useRef(0);
 
-  const nodeLookup = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const [width, setWidth] = useState(1000);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [hoverNodeId, setHoverNodeId] = useState<string | null>(null);
+  const [pathAnchorNodeId, setPathAnchorNodeId] = useState<string | null>(null);
+  const [localFocusNodeIds, setLocalFocusNodeIds] = useState<Set<string>>(new Set());
+  const [localFocusEdgeIds, setLocalFocusEdgeIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const root = containerRef.current;
+    if (!root) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const nextWidth = Math.max(360, Math.floor(entry.contentRect.width));
+      setWidth(nextWidth);
+    });
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, []);
+
+  const nodeMap = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+
+  const adjacency = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const edge of edges) {
+      const source = edge.source;
+      const target = edge.target;
+      map.set(source, [...(map.get(source) ?? []), target]);
+      map.set(target, [...(map.get(target) ?? []), source]);
+    }
+    return map;
+  }, [edges]);
+
+  const renderNodes = useMemo<RenderNode[]>(
+    () =>
+      nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        label: node.label,
+        size: node.size ?? 18,
+        score: node.score ?? 0,
+        color: nodeColors[node.type],
+      })),
+    [nodes],
+  );
+
+  const renderLinks = useMemo<RenderLink[]>(
+    () =>
+      edges.map((edge) => ({
+        id: edge.id,
+        source: edge.source,
+        target: edge.target,
+        type: edge.type,
+        weight: edge.weight ?? 0.4,
+        color: edgeColors[edge.type],
+      })),
+    [edges],
+  );
+
+  const activeNodeSet = useMemo(
+    () =>
+      highlightedNodeIds && highlightedNodeIds.size > 0 ? highlightedNodeIds : localFocusNodeIds,
+    [highlightedNodeIds, localFocusNodeIds],
+  );
+
+  const activeEdgeSet = useMemo(
+    () =>
+      highlightedEdgeIds && highlightedEdgeIds.size > 0 ? highlightedEdgeIds : localFocusEdgeIds,
+    [highlightedEdgeIds, localFocusEdgeIds],
+  );
+
+  const hasFocusedSubset = activeNodeSet.size > 0 || activeEdgeSet.size > 0;
+
+  useEffect(() => {
+    if (nodes.length === 0 || !fgRef.current) {
+      hasFittedRef.current = false;
+      lastAutoFitNodeCountRef.current = 0;
+      return;
+    }
+    const shouldFirstFit = !hasFittedRef.current;
+    const shouldWaveFit =
+      hasFittedRef.current &&
+      !selectedNodeId &&
+      !hasFocusedSubset &&
+      nodes.length - lastAutoFitNodeCountRef.current >= 18;
+
+    if (shouldFirstFit || shouldWaveFit) {
+      const timer = setTimeout(() => {
+        fgRef.current?.zoomToFit(360, shouldFirstFit ? 68 : 52);
+      }, 220);
+      hasFittedRef.current = true;
+      lastAutoFitNodeCountRef.current = nodes.length;
+      return () => clearTimeout(timer);
+    }
+    return;
+  }, [hasFocusedSubset, nodes.length, selectedNodeId]);
+
+  useEffect(() => {
+    const graph = fgRef.current as
+      | (ForceGraphMethods<NodeObject, LinkObject> & {
+          d3Force: (name: string) => unknown;
+          d3ReheatSimulation: () => void;
+        })
+      | undefined;
+    if (!graph) return;
+
+    const chargeForce = graph.d3Force("charge") as
+      | { strength: (value: number | ((node: RenderNode) => number)) => void }
+      | undefined;
+    chargeForce?.strength((node: RenderNode) => {
+      switch (node.type) {
+        case "disease":
+          return -760;
+        case "target":
+          return -360;
+        case "pathway":
+          return -280;
+        case "drug":
+          return -200;
+        case "interaction":
+        default:
+          return -155;
+      }
+    });
+
+    const linkForce = graph.d3Force("link") as
+      | {
+          distance: (value: number | ((link: RenderLink) => number)) => void;
+          strength: (value: number | ((link: RenderLink) => number)) => void;
+        }
+      | undefined;
+    linkForce?.distance((link: RenderLink) => {
+      switch (link.type) {
+        case "disease_target":
+          return 130;
+        case "target_pathway":
+          return 118;
+        case "target_drug":
+          return 86;
+        case "target_target":
+          return 78;
+        case "pathway_drug":
+        default:
+          return 102;
+      }
+    });
+    linkForce?.strength((link: RenderLink) => {
+      return link.type === "target_target" ? 0.08 : 0.14;
+    });
+
+    const collideForce = graph.d3Force("collide") as
+      | { radius: (value: number | ((node: RenderNode) => number)) => void }
+      | undefined;
+    collideForce?.radius((node: RenderNode) =>
+      Math.max(9, Math.min(28, 8 + (node.size ?? 16) * 0.24)),
+    );
+
+    graph.d3ReheatSimulation();
+  }, [edges.length, nodes.length]);
+
   const nodeCounts = useMemo(
     () =>
       nodes.reduce(
@@ -160,164 +313,30 @@ export function GraphCanvas({
       ),
     [nodes],
   );
-
-  const layoutOptions = useMemo<cytoscape.LayoutOptions>(
-    () => ({
-      name: "cose",
-      animate: false,
-      fit: true,
-      padding: 56,
-      randomize: false,
-      nodeRepulsion: nodes.length > 180 ? 10000 : 14000,
-      idealEdgeLength: nodes.length > 180 ? 100 : 126,
-      edgeElasticity: 90,
-      gravity: 0.35,
-      numIter: nodes.length > 220 ? 600 : 1000,
-      coolingFactor: 0.95,
-    }),
-    [nodes.length],
-  );
-
-  const elements = useMemo(
-    () => [
-      ...nodes.map((node) => ({
-        data: {
-          id: node.id,
-          label: node.label,
-          type: node.type,
-          score: node.score ?? 0,
-          size: node.size ?? 18,
-        },
-      })),
-      ...edges.map((edge) => ({
-        data: {
-          id: edge.id,
-          source: edge.source,
-          target: edge.target,
-          type: edge.type,
-          weight: edge.weight ?? 0.4,
-        },
-      })),
-    ],
-    [nodes, edges],
-  );
-
-  useEffect(() => {
-    const cy = cyRef.current;
-    if (!cy) return;
-
-    cy.off("tap", "node");
-    cy.off("cxttap", "node");
-
-    const onTap = (event: cytoscape.EventObjectNode) => {
-      const node = event.target;
-      const nodeId = node.id();
-
-      if ((event.originalEvent as MouseEvent).shiftKey && pathAnchorNodeId) {
-        const source = cy.getElementById(pathAnchorNodeId);
-        const target = cy.getElementById(nodeId);
-        if (source.nonempty() && target.nonempty()) {
-          const dij = cy.elements().dijkstra({
-            root: source,
-          });
-          const path = dij.pathTo(target);
-          cy.elements().removeClass("highlighted");
-          cy.elements().addClass("faded");
-          path.removeClass("faded");
-          path.addClass("highlighted");
-        }
-        setPathAnchorNodeId(null);
-      } else if ((event.originalEvent as MouseEvent).shiftKey && !pathAnchorNodeId) {
-        setPathAnchorNodeId(nodeId);
-      } else {
-        setPathAnchorNodeId(null);
-        cy.elements().removeClass("faded");
-        cy.elements().removeClass("highlighted");
-        onSelectNode(nodeLookup.get(nodeId) ?? null);
-      }
-    };
-
-    const onContextTap = (event: cytoscape.EventObjectNode) => {
-      const node = event.target;
-      const neighborhood = node.closedNeighborhood();
-      cy.elements().addClass("faded");
-      neighborhood.removeClass("faded");
-      neighborhood.addClass("highlighted");
-      onSelectNode(nodeLookup.get(node.id()) ?? null);
-    };
-
-    cy.on("tap", "node", onTap);
-    cy.on("cxttap", "node", onContextTap);
-
-    return () => {
-      cy.off("tap", "node", onTap);
-      cy.off("cxttap", "node", onContextTap);
-    };
-  }, [nodeLookup, onSelectNode, pathAnchorNodeId]);
-
-  useEffect(() => {
-    const cy = cyRef.current;
-    if (!cy) return;
-
-    cy.nodes().removeClass("selected");
-    cy.elements().removeClass("faded");
-    cy.elements().removeClass("highlighted");
-
-    if (selectedNodeId) {
-      cy.getElementById(selectedNodeId).addClass("selected");
-    }
-
-    if ((highlightedNodeIds?.size ?? 0) > 0 || (highlightedEdgeIds?.size ?? 0) > 0) {
-      cy.elements().addClass("faded");
-      highlightedNodeIds?.forEach((id) => {
-        cy.getElementById(id).removeClass("faded");
-        cy.getElementById(id).addClass("highlighted");
-      });
-      highlightedEdgeIds?.forEach((id) => {
-        cy.getElementById(id).removeClass("faded");
-        cy.getElementById(id).addClass("highlighted");
-      });
-    }
-  }, [selectedNodeId, highlightedNodeIds, highlightedEdgeIds]);
-
-  useEffect(() => {
-    const cy = cyRef.current;
-    if (!cy) return;
-
-    const timer = window.setTimeout(() => {
-      layoutRef.current?.stop();
-      const layout = cy.layout(layoutOptions);
-      layoutRef.current = layout;
-      layout.run();
-    }, 90);
-
-    return () => {
-      clearTimeout(timer);
-      layoutRef.current?.stop();
-    };
-  }, [layoutOptions, nodes.length, edges.length]);
+  const canvasHeight = fullscreen
+    ? Math.max(420, Math.floor(window.innerHeight - 48))
+    : Math.max(460, Math.floor(width * 0.56));
 
   return (
     <div
+      ref={containerRef}
       className={
         fullscreen
-          ? "fixed inset-0 z-40 bg-[#050a10] p-4"
-          : "relative h-[56vh] min-h-[460px] rounded-lg border border-white/10 bg-gradient-to-br from-[#09111c] via-[#07101a] to-[#081925] shadow-[0_22px_80px_rgba(4,12,26,0.65)] md:h-[62vh] md:min-h-[560px]"
+          ? "fixed inset-0 z-40 rounded-none border-0 bg-[#edf3fb] p-3"
+          : "relative min-h-[460px] overflow-hidden rounded-xl border border-[#c6daf8] bg-[linear-gradient(180deg,#f7fbff_0%,#eef4fd_100%)] shadow-[0_24px_70px_rgba(22,63,120,0.12)]"
       }
     >
-      <div className="absolute right-2 top-2 z-20 flex items-center gap-2">
+      <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
         <Button
           size="icon"
           variant="secondary"
           onClick={() => {
-            const cy = cyRef.current;
-            if (!cy) return;
-            cy.elements().removeClass("faded");
-            cy.elements().removeClass("highlighted");
-            cy.fit(undefined, 52);
-            cy.center();
+            setLocalFocusNodeIds(new Set());
+            setLocalFocusEdgeIds(new Set());
+            fgRef.current?.zoomToFit(360, 52);
           }}
           title="Fit graph"
+          className="border-[#bfd5f8] bg-white text-[#264d7b] hover:bg-[#e9f1ff]"
         >
           <LocateFixed className="h-4 w-4" />
         </Button>
@@ -325,52 +344,199 @@ export function GraphCanvas({
           size="icon"
           variant="secondary"
           onClick={() => {
-            const cy = cyRef.current;
-            if (!cy) return;
-            const png = cy.png({ full: true, scale: 2, bg: "#050a10" });
+            const canvas = containerRef.current?.querySelector("canvas");
+            if (!canvas) return;
             const a = document.createElement("a");
-            a.href = png;
+            a.href = canvas.toDataURL("image/png", 1);
             a.download = "targetgraph-network.png";
             a.click();
           }}
+          className="border-[#bfd5f8] bg-white text-[#264d7b] hover:bg-[#e9f1ff]"
         >
           <Camera className="h-4 w-4" />
         </Button>
-        <Button size="icon" variant="secondary" onClick={() => setFullscreen((prev) => !prev)}>
+        <Button
+          size="icon"
+          variant="secondary"
+          onClick={() => setFullscreen((prev) => !prev)}
+          className="border-[#bfd5f8] bg-white text-[#264d7b] hover:bg-[#e9f1ff]"
+        >
           {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
         </Button>
       </div>
-      <div className="pointer-events-none absolute left-2 top-2 z-20 rounded-md border border-white/10 bg-[#07101a]/90 p-2 text-[10px] text-[#98b7d4]">
-        <div className="mb-1 font-semibold text-[#d8ebff]">Legend</div>
-        <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-          <div>Disease: {nodeCounts.disease ?? 0}</div>
-          <div>Targets: {nodeCounts.target ?? 0}</div>
-          <div>Pathways: {nodeCounts.pathway ?? 0}</div>
-          <div>Drugs: {nodeCounts.drug ?? 0}</div>
-          <div>Interactions: {nodeCounts.interaction ?? 0}</div>
-          <div>Edges: {edges.length}</div>
+
+      <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-xl border border-[#cfe1fb] bg-white/92 px-3 py-2 text-[11px] text-[#355981] backdrop-blur">
+        <div className="mb-1 font-semibold text-[#133660]">Live Graph</div>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+          <span>Disease: {nodeCounts.disease ?? 0}</span>
+          <span>Targets: {nodeCounts.target ?? 0}</span>
+          <span>Pathways: {nodeCounts.pathway ?? 0}</span>
+          <span>Drugs: {nodeCounts.drug ?? 0}</span>
+          <span>Interactions: {nodeCounts.interaction ?? 0}</span>
+          <span>Edges: {edges.length}</span>
         </div>
       </div>
-      <CytoscapeComponent
-        elements={elements}
-        stylesheet={styles}
-        style={{ width: "100%", height: "100%" }}
-        minZoom={0.14}
-        maxZoom={2.4}
-        wheelSensitivity={0.25}
-        cy={(cy) => {
-          cyRef.current = cy;
+
+      <ForceGraph2D
+        ref={fgRef}
+        width={width}
+        height={canvasHeight}
+        graphData={{
+          nodes: renderNodes,
+          links: renderLinks,
         }}
+        backgroundColor="rgba(0,0,0,0)"
+        nodeLabel={() => ""}
+        linkDirectionalArrowLength={2.2}
+        linkDirectionalArrowRelPos={0.98}
+        linkDirectionalParticles={(link) => (activeEdgeSet.has(link.id) ? 2 : 0)}
+        linkDirectionalParticleWidth={2.8}
+        linkDirectionalParticleSpeed={0.006}
+        d3AlphaDecay={0.028}
+        d3VelocityDecay={0.24}
+        cooldownTicks={170}
+        onBackgroundClick={() => {
+          setPathAnchorNodeId(null);
+          setLocalFocusNodeIds(new Set());
+          setLocalFocusEdgeIds(new Set());
+          onSelectNode(null);
+        }}
+        onNodeHover={(node) => setHoverNodeId(node ? String(node.id) : null)}
+        onNodeClick={(node, event) => {
+          const nodeId = String(node.id);
+          const mouseEvent = event as MouseEvent;
+          if (mouseEvent.shiftKey && pathAnchorNodeId) {
+            const path = shortestPath(pathAnchorNodeId, nodeId, adjacency);
+            if (path.length > 0) {
+              const focusNodes = new Set(path);
+              const focusEdges = new Set<string>();
+              for (let i = 0; i < path.length - 1; i += 1) {
+                const from = path[i]!;
+                const to = path[i + 1]!;
+                const hit = edges.find(
+                  (edge) =>
+                    (edge.source === from && edge.target === to) ||
+                    (edge.source === to && edge.target === from),
+                );
+                if (hit) focusEdges.add(hit.id);
+              }
+              setLocalFocusNodeIds(focusNodes);
+              setLocalFocusEdgeIds(focusEdges);
+            }
+            setPathAnchorNodeId(null);
+          } else if (mouseEvent.shiftKey) {
+            setPathAnchorNodeId(nodeId);
+          } else {
+            setPathAnchorNodeId(null);
+            setLocalFocusNodeIds(new Set());
+            setLocalFocusEdgeIds(new Set());
+            onSelectNode(nodeMap.get(nodeId) ?? null);
+          }
+        }}
+        onNodeRightClick={(node) => {
+          const nodeId = String(node.id);
+          const neighbors = adjacency.get(nodeId) ?? [];
+          const neighborhood = new Set<string>([nodeId, ...neighbors]);
+          const focusEdges = new Set<string>();
+          for (const edge of edges) {
+            if (neighborhood.has(edge.source) && neighborhood.has(edge.target)) {
+              focusEdges.add(edge.id);
+            }
+          }
+          setLocalFocusNodeIds(neighborhood);
+          setLocalFocusEdgeIds(focusEdges);
+          onSelectNode(nodeMap.get(nodeId) ?? null);
+        }}
+        nodeCanvasObject={(node, ctx, globalScale) => {
+          const n = node as RenderNode;
+          const selected = selectedNodeId === n.id;
+          const focused = !hasFocusedSubset || activeNodeSet.has(n.id);
+          const radius = Math.max(6.4, Math.min(18, 5.8 + (n.size ?? 14) * 0.24));
+
+          const glow =
+            selected
+              ? 10
+              : n.type === "target"
+                ? 4 + (n.score ?? 0) * 14
+                : n.type === "disease"
+                  ? 6
+                  : 0;
+
+          if (glow > 0) {
+            ctx.save();
+            ctx.globalAlpha = focused ? 0.82 : 0.14;
+            ctx.shadowColor = selected ? "#f59e0b" : n.color;
+            ctx.shadowBlur = glow;
+            ctx.fillStyle = selected ? "#1d4ed8" : n.color;
+            drawNode(ctx, n, radius * 0.98);
+            ctx.restore();
+          }
+
+          ctx.save();
+          ctx.globalAlpha = focused ? 0.95 : 0.16;
+          ctx.fillStyle = selected ? "#1d4ed8" : n.color;
+          ctx.strokeStyle = selected ? "#f59e0b" : "#ffffff";
+          ctx.lineWidth = selected ? 2.2 : 1;
+          drawNode(ctx, n, radius);
+          ctx.stroke();
+          ctx.restore();
+
+          const showLabel =
+            n.type === "disease" ||
+            n.type === "target" ||
+            selected ||
+            activeNodeSet.has(n.id) ||
+            hoverNodeId === n.id ||
+            globalScale > 2.1;
+
+          if (!showLabel) return;
+
+          const label = n.label;
+          const fontSize = Math.max(9, 11 / globalScale);
+          ctx.font = `${fontSize}px var(--font-body)`;
+          const widthWithPadding = ctx.measureText(label).width + 8;
+          const x = 0;
+          const y = radius + fontSize + 4;
+
+          ctx.save();
+          ctx.globalAlpha = focused ? 0.95 : 0.2;
+          ctx.fillStyle = "rgba(255,255,255,0.92)";
+          ctx.strokeStyle = "rgba(149,172,205,0.7)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(x - widthWithPadding / 2, y - fontSize, widthWithPadding, fontSize + 6, 4);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#16365d";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(label, x, y - fontSize / 2 + 2);
+          ctx.restore();
+        }}
+        linkColor={(link) => {
+          const l = link as RenderLink;
+          if (!hasFocusedSubset) return l.color;
+          return activeEdgeSet.has(l.id) ? l.color : "rgba(141,165,196,0.2)";
+        }}
+        linkWidth={(link) => {
+          const l = link as RenderLink;
+          const base = Math.max(0.7, Math.min(3.2, l.weight * 2.4));
+          if (!hasFocusedSubset) return base;
+          return activeEdgeSet.has(l.id) ? Math.max(base, 2.4) : 0.6;
+        }}
+        linkCurvature={(link) => ((link as RenderLink).type === "target_target" ? 0.18 : 0.08)}
       />
+
       {nodes.length === 0 ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-          <div className="rounded-md border border-cyan-300/20 bg-[#07101a]/90 px-4 py-2 text-xs text-[#b8d4ef]">
-            Waiting for graph batches...
+          <div className="rounded-full border border-[#c9dcf9] bg-white px-4 py-2 text-xs font-medium text-[#325983]">
+            Building core network...
           </div>
         </div>
       ) : null}
-      <div className="pointer-events-none absolute bottom-2 left-2 rounded bg-[#07101a]/90 p-2 text-[10px] text-[#89a8c5]">
-        Right-click node: focus neighborhood • Shift-click 2 nodes: shortest path
+
+      <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-[#cadcf8] bg-white/92 px-2.5 py-1.5 text-[10px] text-[#4a678a]">
+        Right-click: neighborhood focus • Shift-click two nodes: shortest path
       </div>
     </div>
   );

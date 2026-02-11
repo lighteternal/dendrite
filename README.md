@@ -147,5 +147,17 @@ Validated locally in this repository:
 
 - `npm --prefix apps/web run lint` ✅
 - `npm --prefix apps/web run build` ✅
+- Chromium automation (Playwright) across 5 diseases ✅
+  - Alzheimer disease
+  - Non-small cell lung cancer
+  - Rheumatoid arthritis
+  - Crohn disease
+  - Acute myeloid leukemia
+  - Full pipeline completion observed on each run with no browser runtime errors
+
+Recent observed timings (full profile enabled, `maxTargets=8`):
+
+- API stream completion: ~3.6s to ~4.1s
+- Browser-observed end-to-end completion: ~2.4s to ~2.6s (warm cache)
 
 Runtime validation with live MCP services depends on your local Docker runtime and API/network availability.

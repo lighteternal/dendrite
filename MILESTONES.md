@@ -6,3 +6,7 @@
 - [x] M4: Implement landing page and graph workbench UI with Cytoscape + Sankey + Hypothesis Mode.
 - [x] M5: Wire local MCP service orchestration via Docker Compose.
 - [x] M6: Finalize docs, runbook, credibility links, and validation checklist.
+- [x] M7: Redesign UI/UX to high-contrast translational workbench (light theme, improved typography, clearer cards).
+- [x] M8: Upgrade graph rendering to force-directed canvas + robust Sankey readability and interaction polish.
+- [x] M9: Improve customer workflow (main-search navigation, in-workbench rerun, executive readout, clearer value framing).
+- [x] M10: End-to-end validation via Chromium automation on 5 diseases + lint/build checks.

@@ -48,7 +48,7 @@ function downloadJson(data: unknown, filename: string) {
 export function GraphWorkbench({ diseaseQuery, defaults }: Props) {
   const stream = useGraphStream();
   const { start, stop } = stream;
-  const [maxTargets, setMaxTargets] = useState(10);
+  const [maxTargets, setMaxTargets] = useState(6);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [sankeyOpen, setSankeyOpen] = useState(true);
   const [showPathways, setShowPathways] = useState(defaults?.pathways ?? true);

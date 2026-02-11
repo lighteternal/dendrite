@@ -1,0 +1,761 @@
+import { NextRequest } from "next/server";
+import {
+  type GraphEdge,
+  type GraphNode,
+  type SourceName,
+  type StreamEventPayload,
+} from "@/lib/contracts";
+import {
+  chunkArray,
+  makeEdgeId,
+  makeNodeId,
+  normalizeScore,
+  sleep,
+  toSankeyRows,
+} from "@/lib/graph";
+import { getLiteratureAndTrials } from "@/server/mcp/biomcp";
+import { getTargetActivityDrugs } from "@/server/mcp/chembl";
+import {
+  getDiseaseTargetsSummary,
+  getKnownDrugsForTarget,
+  searchDiseases,
+} from "@/server/mcp/opentargets";
+import { findPathwaysByGene } from "@/server/mcp/reactome";
+import { getInteractionNetwork } from "@/server/mcp/stringdb";
+import { rankTargets } from "@/server/openai/ranking";
+import { appConfig, assertRuntimeConfig } from "@/server/config";
+import { encodeSseEvent, randomInt } from "@/server/pipeline/sse";
+
+export const runtime = "nodejs";
+
+type PipelinePhase = "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6";
+
+type SourceHealthState = Record<SourceName, "green" | "yellow" | "red">;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error(`timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise
+      .then((result) => {
+        clearTimeout(timeout);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+  });
+}
+
+export async function GET(request: NextRequest) {
+  assertRuntimeConfig();
+
+  const { searchParams } = new URL(request.url);
+  const diseaseQuery = searchParams.get("diseaseQuery")?.trim();
+  const maxTargets = Number(searchParams.get("maxTargets") ?? 20);
+
+  if (!diseaseQuery) {
+    return new Response("Missing diseaseQuery", { status: 400 });
+  }
+
+  const nodeMap = new Map<string, GraphNode>();
+  const edgeMap = new Map<string, GraphEdge>();
+
+  const sourceHealth: SourceHealthState = {
+    opentargets: "green",
+    reactome: "green",
+    string: "green",
+    chembl: "green",
+    biomcp: "green",
+    openai: "green",
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const startedAt = Date.now();
+      const phaseTimeoutMs = appConfig.stream.phaseTimeoutMs;
+
+      const emit = (event: StreamEventPayload) => {
+        controller.enqueue(encodeSseEvent(event));
+      };
+
+      const emitStatus = (
+        phase: PipelinePhase,
+        message: string,
+        pct: number,
+        counts: Record<string, number> = {},
+        partial = false,
+      ) => {
+        emit({
+          event: "status",
+          data: {
+            phase,
+            message,
+            pct,
+            counts,
+            sourceHealth,
+            partial,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: phaseTimeoutMs,
+          },
+        });
+      };
+
+      const emitGraph = (nodes: GraphNode[], edges: GraphEdge[]) => {
+        if (nodes.length === 0 && edges.length === 0) {
+          return;
+        }
+
+        emit({
+          event: "partial_graph",
+          data: {
+            nodes,
+            edges,
+            stats: {
+              totalNodes: nodeMap.size,
+              totalEdges: edgeMap.size,
+            },
+          },
+        });
+      };
+
+      const pushNodesEdges = (incomingNodes: GraphNode[], incomingEdges: GraphEdge[]) => {
+        const newNodes: GraphNode[] = [];
+        const newEdges: GraphEdge[] = [];
+
+        for (const node of incomingNodes) {
+          const existing = nodeMap.get(node.id);
+          if (!existing) {
+            nodeMap.set(node.id, node);
+            newNodes.push(node);
+          } else {
+            const merged = {
+              ...existing,
+              ...node,
+              meta: {
+                ...existing.meta,
+                ...node.meta,
+              },
+            };
+            nodeMap.set(node.id, merged);
+            newNodes.push(merged);
+          }
+        }
+
+        for (const edge of incomingEdges) {
+          if (!edgeMap.has(edge.id)) {
+            edgeMap.set(edge.id, edge);
+            newEdges.push(edge);
+          }
+        }
+
+        emitGraph(newNodes, newEdges);
+      };
+
+      const run = async () => {
+        let diseaseId = "";
+        let diseaseName = diseaseQuery;
+        let targetCount = 0;
+        let pathwayCount = 0;
+        let drugCount = 0;
+        let interactionCount = 0;
+
+        const targetNodeIds: string[] = [];
+        const targetSymbolByNodeId = new Map<string, string>();
+        const pathwaysByTargetId = new Map<string, Set<string>>();
+        const drugsByTargetId = new Map<string, Set<string>>();
+        const interactionsByTargetId = new Map<string, number>();
+        const literatureByTargetId = new Map<string, { articleCount: number; trialCount: number }>();
+
+        try {
+          emitStatus("P0", "Resolving disease query", 5);
+          const diseases = await withTimeout(searchDiseases(diseaseQuery, 8), phaseTimeoutMs);
+          const disease = diseases[0];
+          diseaseId = disease?.id ?? `QUERY_${diseaseQuery.replace(/\s+/g, "_")}`;
+          diseaseName = disease?.name ?? diseaseQuery;
+
+          const diseaseNode: GraphNode = {
+            id: makeNodeId("disease", diseaseId),
+            type: "disease",
+            primaryId: diseaseId,
+            label: diseaseName,
+            score: 1,
+            size: 80,
+            meta: {
+              description: disease?.description,
+              query: diseaseQuery,
+            },
+          };
+
+          nodeMap.set(diseaseNode.id, diseaseNode);
+          emitGraph([diseaseNode], []);
+          emitStatus("P0", `Resolved to ${diseaseName} (${diseaseId})`, 12);
+        } catch (error) {
+          sourceHealth.opentargets = "red";
+          emit({
+            event: "error",
+            data: {
+              phase: "P0",
+              message: `Disease resolution failed: ${error instanceof Error ? error.message : "unknown"}`,
+              recoverable: true,
+            },
+          });
+
+          diseaseId = `QUERY_${diseaseQuery.replace(/\s+/g, "_")}`;
+          const diseaseNode: GraphNode = {
+            id: makeNodeId("disease", diseaseId),
+            type: "disease",
+            primaryId: diseaseId,
+            label: diseaseQuery,
+            score: 0.5,
+            size: 80,
+            meta: {
+              degraded: true,
+            },
+          };
+          nodeMap.set(diseaseNode.id, diseaseNode);
+          emitGraph([diseaseNode], []);
+        }
+
+        try {
+          emitStatus("P1", "Fetching target evidence from OpenTargets", 18);
+          const targets = await withTimeout(
+            getDiseaseTargetsSummary(diseaseId, Math.min(40, Math.max(5, maxTargets))),
+            phaseTimeoutMs,
+          );
+
+          const diseaseNodeId = makeNodeId("disease", diseaseId);
+          for (const batch of chunkArray(targets.slice(0, maxTargets), 5)) {
+            const nodes: GraphNode[] = [];
+            const edges: GraphEdge[] = [];
+
+            for (const target of batch) {
+              const targetNodeId = makeNodeId("target", target.targetId);
+              const score = normalizeScore(target.associationScore);
+              targetSymbolByNodeId.set(targetNodeId, target.targetSymbol);
+              targetNodeIds.push(targetNodeId);
+              pathwaysByTargetId.set(targetNodeId, new Set<string>());
+              drugsByTargetId.set(targetNodeId, new Set<string>());
+
+              nodes.push({
+                id: targetNodeId,
+                type: "target",
+                primaryId: target.targetId,
+                label: target.targetSymbol,
+                score,
+                size: 24 + score * 30,
+                meta: {
+                  targetName: target.targetName,
+                  openTargetsEvidence: score,
+                  stage: "P1",
+                },
+              });
+
+              edges.push({
+                id: makeEdgeId(diseaseNodeId, targetNodeId, "disease_target"),
+                source: diseaseNodeId,
+                target: targetNodeId,
+                type: "disease_target",
+                weight: score,
+                meta: {
+                  source: "OpenTargets",
+                },
+              });
+            }
+
+            pushNodesEdges(nodes, edges);
+            targetCount += batch.length;
+            emitStatus("P1", `${targetCount}/${Math.min(maxTargets, targets.length)} targets enriched`, 30, {
+              targets: targetCount,
+            });
+            await sleep(randomInt(appConfig.stream.batchMinDelayMs, appConfig.stream.batchMaxDelayMs));
+          }
+        } catch (error) {
+          sourceHealth.opentargets = "yellow";
+          emit({
+            event: "error",
+            data: {
+              phase: "P1",
+              message: `OpenTargets target enrichment degraded: ${error instanceof Error ? error.message : "unknown"}`,
+              recoverable: true,
+            },
+          });
+        }
+
+        try {
+          emitStatus("P2", "Fetching pathways from Reactome", 36, {
+            targets: targetCount,
+          });
+
+          const seededTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, maxTargets));
+
+          for (const batch of chunkArray(seededTargets, 4)) {
+            const resolved = await Promise.all(
+              batch.map(async (targetNodeId) => {
+                const symbol = targetSymbolByNodeId.get(targetNodeId);
+                if (!symbol) return { targetNodeId, pathways: [] as Awaited<ReturnType<typeof findPathwaysByGene>> };
+
+                const pathways = await withTimeout(findPathwaysByGene(symbol), phaseTimeoutMs);
+                return {
+                  targetNodeId,
+                  pathways: pathways.slice(0, 8),
+                };
+              }),
+            );
+
+            const nodes: GraphNode[] = [];
+            const edges: GraphEdge[] = [];
+
+            for (const item of resolved) {
+              for (const pathway of item.pathways) {
+                const pathwayNodeId = makeNodeId("pathway", pathway.id);
+                pathwaysByTargetId.get(item.targetNodeId)?.add(pathway.id);
+
+                nodes.push({
+                  id: pathwayNodeId,
+                  type: "pathway",
+                  primaryId: pathway.id,
+                  label: pathway.name,
+                  score: 0.6,
+                  size: 22,
+                  meta: {
+                    species: pathway.species,
+                    stage: "P2",
+                  },
+                });
+
+                edges.push({
+                  id: makeEdgeId(item.targetNodeId, pathwayNodeId, "target_pathway"),
+                  source: item.targetNodeId,
+                  target: pathwayNodeId,
+                  type: "target_pathway",
+                  weight: 0.65,
+                  meta: {
+                    source: "Reactome",
+                  },
+                });
+              }
+            }
+
+            pushNodesEdges(nodes, edges);
+            pathwayCount = [...nodeMap.values()].filter((node) => node.type === "pathway").length;
+            emitStatus("P2", `${pathwayCount} pathways linked`, 52, {
+              targets: targetCount,
+              pathways: pathwayCount,
+            });
+            await sleep(randomInt(appConfig.stream.batchMinDelayMs, appConfig.stream.batchMaxDelayMs));
+          }
+
+          emit({
+            event: "sankey",
+            data: {
+              rows: toSankeyRows([...nodeMap.values()], [...edgeMap.values()]),
+            },
+          });
+        } catch (error) {
+          sourceHealth.reactome = "yellow";
+          emit({
+            event: "error",
+            data: {
+              phase: "P2",
+              message: `Reactome pathway expansion degraded: ${error instanceof Error ? error.message : "unknown"}`,
+              recoverable: true,
+            },
+          });
+        }
+
+        try {
+          emitStatus("P3", "Fetching drugs from OpenTargets and ChEMBL", 58, {
+            targets: targetCount,
+            pathways: pathwayCount,
+          });
+
+          const seedTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, 10));
+
+          for (const targetNodeId of seedTargets) {
+            const targetPrimaryId = nodeMap.get(targetNodeId)?.primaryId;
+            const targetSymbol = targetSymbolByNodeId.get(targetNodeId);
+            if (!targetPrimaryId || !targetSymbol) continue;
+
+            const [knownDrugs, activityDrugs] = await Promise.allSettled([
+              withTimeout(getKnownDrugsForTarget(targetPrimaryId, 8), phaseTimeoutMs),
+              withTimeout(getTargetActivityDrugs(targetSymbol, 8), phaseTimeoutMs),
+            ]);
+
+            const nodes: GraphNode[] = [];
+            const edges: GraphEdge[] = [];
+
+            if (knownDrugs.status === "fulfilled") {
+              for (const drug of knownDrugs.value) {
+                const drugNodeId = makeNodeId("drug", drug.drugId);
+                drugsByTargetId.get(targetNodeId)?.add(drug.drugId);
+
+                nodes.push({
+                  id: drugNodeId,
+                  type: "drug",
+                  primaryId: drug.drugId,
+                  label: drug.name,
+                  score: normalizeScore((drug.phase ?? 0) / 4),
+                  size: 18 + (drug.phase ?? 0) * 2,
+                  meta: {
+                    phase: drug.phase,
+                    status: drug.status,
+                    modality: drug.drugType,
+                    mechanism: drug.mechanismOfAction,
+                    stage: "P3",
+                  },
+                });
+
+                edges.push({
+                  id: makeEdgeId(targetNodeId, drugNodeId, "target_drug"),
+                  source: targetNodeId,
+                  target: drugNodeId,
+                  type: "target_drug",
+                  weight: normalizeScore((drug.phase ?? 0) / 4),
+                  meta: {
+                    source: "OpenTargets",
+                  },
+                });
+              }
+            }
+
+            if (activityDrugs.status === "fulfilled") {
+              for (const drug of activityDrugs.value) {
+                const drugNodeId = makeNodeId("drug", drug.moleculeId);
+                drugsByTargetId.get(targetNodeId)?.add(drug.moleculeId);
+
+                nodes.push({
+                  id: drugNodeId,
+                  type: "drug",
+                  primaryId: drug.moleculeId,
+                  label: drug.name,
+                  score: drug.potency ? normalizeScore(1 / (1 + drug.potency / 1000)) : 0.4,
+                  size: 18,
+                  meta: {
+                    activityType: drug.activityType,
+                    potency: drug.potency,
+                    potencyUnits: drug.potencyUnits,
+                    stage: "P3",
+                  },
+                });
+
+                edges.push({
+                  id: makeEdgeId(targetNodeId, drugNodeId, "target_drug"),
+                  source: targetNodeId,
+                  target: drugNodeId,
+                  type: "target_drug",
+                  weight: drug.potency ? normalizeScore(1 / (1 + drug.potency / 1000)) : 0.4,
+                  meta: {
+                    source: "ChEMBL",
+                  },
+                });
+              }
+            }
+
+            pushNodesEdges(nodes, edges);
+            drugCount = [...nodeMap.values()].filter((node) => node.type === "drug").length;
+            emitStatus("P3", `${drugCount} compounds linked`, 68, {
+              targets: targetCount,
+              pathways: pathwayCount,
+              drugs: drugCount,
+            });
+            await sleep(randomInt(160, 480));
+          }
+
+          emit({
+            event: "sankey",
+            data: {
+              rows: toSankeyRows([...nodeMap.values()], [...edgeMap.values()]),
+            },
+          });
+        } catch (error) {
+          sourceHealth.chembl = "yellow";
+          emit({
+            event: "error",
+            data: {
+              phase: "P3",
+              message: `Drug enrichment degraded: ${error instanceof Error ? error.message : "unknown"}`,
+              recoverable: true,
+            },
+          });
+        }
+
+        try {
+          emitStatus("P4", "Fetching STRING interaction neighborhood", 72, {
+            targets: targetCount,
+            drugs: drugCount,
+          });
+
+          const seedSymbols = targetNodeIds
+            .slice(0, Math.min(12, targetNodeIds.length))
+            .map((id) => targetSymbolByNodeId.get(id))
+            .filter((symbol): symbol is string => Boolean(symbol));
+
+          if (seedSymbols.length > 1) {
+            const interaction = await withTimeout(
+              getInteractionNetwork(
+                seedSymbols,
+                appConfig.string.confidenceDefault,
+                appConfig.string.maxNeighborsPerSeed,
+              ),
+              phaseTimeoutMs,
+            );
+
+            const nodes: GraphNode[] = [];
+            const edges: GraphEdge[] = [];
+
+            for (const node of interaction.nodes.slice(0, appConfig.string.maxAddedNodes)) {
+              const existingTarget = targetNodeIds.find(
+                (id) => targetSymbolByNodeId.get(id) === node.symbol,
+              );
+              if (existingTarget) continue;
+
+              const nodeId = makeNodeId("interaction", node.symbol);
+              nodes.push({
+                id: nodeId,
+                type: "interaction",
+                primaryId: node.symbol,
+                label: node.symbol,
+                score: 0.35,
+                size: 16,
+                meta: {
+                  annotation: node.annotation,
+                  stage: "P4",
+                },
+              });
+            }
+
+            for (const edge of interaction.edges.slice(0, appConfig.string.maxAddedEdges)) {
+              const sourceTargetId = targetNodeIds.find(
+                (id) => targetSymbolByNodeId.get(id) === edge.sourceSymbol,
+              );
+              const targetTargetId = targetNodeIds.find(
+                (id) => targetSymbolByNodeId.get(id) === edge.targetSymbol,
+              );
+
+              const sourceId = sourceTargetId ?? makeNodeId("interaction", edge.sourceSymbol);
+              const targetId = targetTargetId ?? makeNodeId("interaction", edge.targetSymbol);
+
+              if (sourceId === targetId) continue;
+
+              edges.push({
+                id: makeEdgeId(sourceId, targetId, "target_target"),
+                source: sourceId,
+                target: targetId,
+                type: "target_target",
+                weight: normalizeScore(edge.score),
+                meta: {
+                  source: "STRING",
+                  evidence: edge.evidence,
+                },
+              });
+
+              if (sourceTargetId) {
+                interactionsByTargetId.set(
+                  sourceTargetId,
+                  (interactionsByTargetId.get(sourceTargetId) ?? 0) + 1,
+                );
+              }
+              if (targetTargetId) {
+                interactionsByTargetId.set(
+                  targetTargetId,
+                  (interactionsByTargetId.get(targetTargetId) ?? 0) + 1,
+                );
+              }
+            }
+
+            pushNodesEdges(nodes, edges);
+            interactionCount = edges.length;
+          }
+
+          emitStatus("P4", `${interactionCount} interaction edges added`, 80, {
+            interactions: interactionCount,
+            targets: targetCount,
+            drugs: drugCount,
+          });
+        } catch (error) {
+          sourceHealth.string = "yellow";
+          emit({
+            event: "error",
+            data: {
+              phase: "P4",
+              message: `STRING interactions degraded: ${error instanceof Error ? error.message : "unknown"}`,
+              recoverable: true,
+            },
+          });
+        }
+
+        try {
+          emitStatus("P5", "Fetching literature and trial snippets", 84, {
+            targets: targetCount,
+            pathways: pathwayCount,
+            drugs: drugCount,
+            interactions: interactionCount,
+          });
+
+          const linkByNodeId: Record<string, { articles: unknown[]; trials: unknown[] }> = {};
+          const focusTargets = targetNodeIds.slice(0, Math.min(8, targetNodeIds.length));
+
+          for (const targetNodeId of focusTargets) {
+            const targetSymbol = targetSymbolByNodeId.get(targetNodeId);
+            if (!targetSymbol) continue;
+
+            const firstDrugId = [...(drugsByTargetId.get(targetNodeId) ?? [])][0];
+            const firstDrugName =
+              firstDrugId && nodeMap.get(makeNodeId("drug", firstDrugId))?.label
+                ? nodeMap.get(makeNodeId("drug", firstDrugId))?.label
+                : undefined;
+
+            const enrichment = await withTimeout(
+              getLiteratureAndTrials(diseaseName, targetSymbol, firstDrugName),
+              phaseTimeoutMs,
+            );
+
+            linkByNodeId[targetNodeId] = {
+              articles: enrichment.articles,
+              trials: enrichment.trials,
+            };
+
+            literatureByTargetId.set(targetNodeId, {
+              articleCount: enrichment.articles.length,
+              trialCount: enrichment.trials.length,
+            });
+
+            const current = nodeMap.get(targetNodeId);
+            if (current) {
+              current.meta.articleCount = enrichment.articles.length;
+              current.meta.trialCount = enrichment.trials.length;
+              nodeMap.set(targetNodeId, current);
+              emitGraph([current], []);
+            }
+
+            emitStatus(
+              "P5",
+              `${Object.keys(linkByNodeId).length}/${focusTargets.length} targets enriched with literature/trials`,
+              90,
+              {
+                literatureTargets: Object.keys(linkByNodeId).length,
+              },
+            );
+            await sleep(120);
+          }
+
+          emit({
+            event: "enrichment_ready",
+            data: {
+              linksByNodeId: linkByNodeId,
+            },
+          });
+        } catch (error) {
+          sourceHealth.biomcp = "yellow";
+          emit({
+            event: "error",
+            data: {
+              phase: "P5",
+              message: `BioMCP enrichment degraded: ${error instanceof Error ? error.message : "unknown"}`,
+              recoverable: true,
+            },
+          });
+        }
+
+        emitStatus("P6", "Ranking targets and generating summary", 94, {
+          targets: targetCount,
+          pathways: pathwayCount,
+          drugs: drugCount,
+          interactions: interactionCount,
+        });
+
+        try {
+          const rankingRows = targetNodeIds.map((targetNodeId) => {
+            const node = nodeMap.get(targetNodeId);
+            const pathways = [...(pathwaysByTargetId.get(targetNodeId) ?? new Set<string>())];
+            const drugs = [...(drugsByTargetId.get(targetNodeId) ?? new Set<string>())];
+            const interactions = interactionsByTargetId.get(targetNodeId) ?? 0;
+            const literature = literatureByTargetId.get(targetNodeId) ?? {
+              articleCount: 0,
+              trialCount: 0,
+            };
+
+            return {
+              id: node?.primaryId ?? targetNodeId,
+              symbol: String(node?.label ?? targetNodeId),
+              pathwayIds: pathways,
+              openTargetsEvidence: Number(node?.meta?.openTargetsEvidence ?? node?.score ?? 0),
+              drugActionability: Math.min(1, drugs.length / 8),
+              networkCentrality: Math.min(1, interactions / 8),
+              literatureSupport: Math.min(1, (literature.articleCount + literature.trialCount) / 10),
+              drugCount: drugs.length,
+              interactionCount: interactions,
+              articleCount: literature.articleCount,
+              trialCount: literature.trialCount,
+            };
+          });
+
+          const ranking = await withTimeout(rankTargets(rankingRows), phaseTimeoutMs * 2);
+          emit({ event: "ranking", data: ranking });
+        } catch (error) {
+          sourceHealth.openai = "yellow";
+          emit({
+            event: "error",
+            data: {
+              phase: "P6",
+              message: `Ranking degraded: ${error instanceof Error ? error.message : "unknown"}`,
+              recoverable: true,
+            },
+          });
+        }
+
+        emitStatus("P6", "Build complete", 100, {
+          totalNodes: nodeMap.size,
+          totalEdges: edgeMap.size,
+          targets: targetCount,
+          pathways: pathwayCount,
+          drugs: drugCount,
+          interactions: interactionCount,
+        });
+
+        emit({
+          event: "done",
+          data: {
+            stats: {
+              totalNodes: nodeMap.size,
+              totalEdges: edgeMap.size,
+              targets: targetCount,
+              pathways: pathwayCount,
+              drugs: drugCount,
+              interactions: interactionCount,
+            },
+          },
+        });
+
+        controller.close();
+      };
+
+      run().catch((error) => {
+        controller.enqueue(
+          encodeSseEvent({
+            event: "error",
+            data: {
+              phase: "fatal",
+              message: error instanceof Error ? error.message : "unknown",
+              recoverable: false,
+            },
+          }),
+        );
+        controller.close();
+      });
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}

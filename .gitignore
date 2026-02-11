@@ -23,3 +23,15 @@ coverage
 # Editor
 .vscode
 .idea
+
+# Local cloned MCP services (keep directory placeholders only)
+services/mcp-opentargets/*
+!services/mcp-opentargets/.gitkeep
+services/mcp-reactome/*
+!services/mcp-reactome/.gitkeep
+services/mcp-string/*
+!services/mcp-string/.gitkeep
+services/mcp-chembl/*
+!services/mcp-chembl/.gitkeep
+services/biomcp/*
+!services/biomcp/.gitkeep

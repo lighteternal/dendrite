@@ -1,0 +1,12 @@
+{
+  "name": "targetgraph",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:web": "npm --prefix apps/web run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "lint:web": "npm --prefix apps/web run lint",
+    "services:up": "docker compose up --build",
+    "services:down": "docker compose down"
+  }
+}

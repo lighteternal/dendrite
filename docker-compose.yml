@@ -1,0 +1,104 @@
+version: "3.9"
+
+services:
+  mcp-opentargets:
+    image: node:20-bullseye
+    working_dir: /app
+    command: >-
+      bash -lc "npm install && npm run build && npx -y mcp-proxy --port 7010 --stateless -- node build/index.js"
+    volumes:
+      - ./services/mcp-opentargets:/app
+    ports:
+      - "7010:7010"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:7010/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  mcp-reactome:
+    image: node:20-bullseye
+    working_dir: /app
+    command: >-
+      bash -lc "npm install && npm run build && npx -y mcp-proxy --port 7020 --stateless -- node build/index.js"
+    volumes:
+      - ./services/mcp-reactome:/app
+    ports:
+      - "7020:7020"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:7020/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  mcp-string:
+    image: node:20-bullseye
+    working_dir: /app
+    command: >-
+      bash -lc "npm install && npm run build && npx -y mcp-proxy --port 7030 --stateless -- node build/index.js"
+    volumes:
+      - ./services/mcp-string:/app
+    ports:
+      - "7030:7030"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:7030/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  mcp-chembl:
+    image: node:20-bullseye
+    working_dir: /app
+    command: >-
+      bash -lc "npm install && npm run build && npx -y mcp-proxy --port 7040 --stateless -- node build/index.js"
+    volumes:
+      - ./services/mcp-chembl:/app
+    ports:
+      - "7040:7040"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:7040/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  biomcp:
+    image: python:3.11-slim
+    command: >-
+      bash -lc "pip install --no-cache-dir biomcp-python && biomcp run --mode streamable_http --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); s.close()",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5

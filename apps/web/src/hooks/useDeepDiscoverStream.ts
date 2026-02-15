@@ -1,9 +1,20 @@
 "use client";
 
 import { useCallback, useMemo, useRef, useState } from "react";
+import type { GraphEdge, GraphNode } from "@/lib/contracts";
 
 export type DiscoverEntity = {
-  type: "disease" | "target" | "pathway" | "drug" | "interaction";
+  type:
+    | "disease"
+    | "target"
+    | "pathway"
+    | "drug"
+    | "interaction"
+    | "phenotype"
+    | "anatomy"
+    | "effect"
+    | "molecule"
+    | "protein";
   label: string;
   primaryId?: string;
 };
@@ -11,11 +22,32 @@ export type DiscoverEntity = {
 export type DiscoverJourneyEntry = {
   id: string;
   ts: string;
-  kind: "phase" | "tool_start" | "tool_result" | "insight" | "warning";
+  kind:
+    | "phase"
+    | "tool_start"
+    | "tool_result"
+    | "insight"
+    | "warning"
+    | "handoff"
+    | "followup"
+    | "branch";
   title: string;
   detail: string;
-  source: "agent" | "opentargets" | "reactome" | "chembl" | "string" | "biomcp";
+  source:
+    | "agent"
+    | "planner"
+    | "opentargets"
+    | "reactome"
+    | "chembl"
+    | "string"
+    | "biomcp"
+    | "pubmed";
+  pathState?: "active" | "candidate" | "discarded";
   entities: DiscoverEntity[];
+  graphPatch?: {
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+  };
 };
 
 export type DiscovererFinal = {
@@ -48,6 +80,7 @@ type StartParams = {
 
 export function useDeepDiscoverStream() {
   const sourceRef = useRef<EventSource | null>(null);
+  const finalRef = useRef<DiscovererFinal | null>(null);
 
   const [entries, setEntries] = useState<DiscoverJourneyEntry[]>([]);
   const [final, setFinal] = useState<DiscovererFinal | null>(null);
@@ -70,6 +103,7 @@ export function useDeepDiscoverStream() {
     setStatus(null);
     setError(null);
     setElapsedMs(null);
+    finalRef.current = null;
   }, []);
 
   const start = useCallback(
@@ -115,6 +149,7 @@ export function useDeepDiscoverStream() {
         try {
           const payload = JSON.parse((event as MessageEvent<string>).data) as DiscovererFinal;
           setFinal(payload);
+          finalRef.current = payload;
         } catch {
           // noop
         }
@@ -145,13 +180,13 @@ export function useDeepDiscoverStream() {
 
       source.onerror = () => {
         setIsRunning(false);
-        if (!final) {
+        if (!finalRef.current) {
           setError((prev) => prev ?? "Discoverer stream interrupted");
         }
         source.close();
       };
     },
-    [final, reset, stop],
+    [reset, stop],
   );
 
   return useMemo(

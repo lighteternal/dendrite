@@ -9,8 +9,25 @@ export class McpClient {
     this.endpoint = endpoint;
   }
 
-  async callToolRaw(toolName: string, args: Record<string, unknown>): Promise<string> {
-    const transport = new StreamableHTTPClientTransport(new URL(this.endpoint));
+  async callToolRaw(
+    toolName: string,
+    args: Record<string, unknown>,
+    timeoutMs = 12_000,
+  ): Promise<string> {
+    const abortController = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      abortController.abort(
+        new Error(`MCP tool timeout (${toolName}) after ${timeoutMs}ms`),
+      );
+    }, timeoutMs);
+
+    const transport = new StreamableHTTPClientTransport(new URL(this.endpoint), {
+      requestInit: {
+        signal: abortController.signal,
+      },
+    });
     const client = new Client(
       {
         name: "targetgraph-web",
@@ -38,14 +55,24 @@ export class McpClient {
         .filter((item) => item.type === "text")
         .map((item) => item.text ?? "")
         .join("\n");
+    } catch (error) {
+      if (timedOut || abortController.signal.aborted) {
+        throw new Error(`MCP tool timeout (${toolName}) after ${timeoutMs}ms`);
+      }
+      throw error;
     } finally {
-      await client.close();
-      await transport.close();
+      clearTimeout(timeout);
+      await client.close().catch(() => undefined);
+      await transport.close().catch(() => undefined);
     }
   }
 
-  async callTool<T>(toolName: string, args: Record<string, unknown>): Promise<T> {
-    const raw = await this.callToolRaw(toolName, args);
+  async callTool<T>(
+    toolName: string,
+    args: Record<string, unknown>,
+    timeoutMs = 12_000,
+  ): Promise<T> {
+    const raw = await this.callToolRaw(toolName, args, timeoutMs);
     return parsePossibleJson<T>(raw);
   }
 }

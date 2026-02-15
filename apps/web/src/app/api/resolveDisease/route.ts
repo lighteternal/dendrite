@@ -1,13 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { searchDiseases } from "@/server/mcp/opentargets";
 import {
-  chooseBestDiseaseCandidate,
-  type DiseaseCandidate,
-} from "@/server/openai/disease-resolver";
+  resolveQueryEntitiesBundle,
+} from "@/server/agent/entity-resolution";
 
 export const runtime = "nodejs";
-
-const diseaseIdPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
 
 export async function GET(request: NextRequest) {
   const query = request.nextUrl.searchParams.get("query")?.trim();
@@ -22,30 +18,25 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const candidates: DiseaseCandidate[] = (await searchDiseases(query, 12))
-      .filter((item) => diseaseIdPattern.test(item.id))
-      .map((item) => ({
-        id: item.id,
-        name: item.name,
-        description: item.description,
-      }));
+    const bundled = await resolveQueryEntitiesBundle(query);
+    const candidates = bundled.diseaseCandidates;
 
     if (candidates.length === 0) {
       return NextResponse.json({
         query,
         selected: null,
         candidates: [],
-        rationale: "No disease entity candidates found.",
+        rationale: bundled.rationale || "No disease entity candidates found.",
+        openAiCalls: bundled.openAiCalls,
       });
     }
 
-    const { selected, rationale } = await chooseBestDiseaseCandidate(query, candidates);
-
     return NextResponse.json({
       query,
-      selected,
+      selected: bundled.selectedDisease,
       candidates,
-      rationale,
+      rationale: bundled.rationale,
+      openAiCalls: bundled.openAiCalls,
     });
   } catch {
     return NextResponse.json(

@@ -4,6 +4,13 @@ import {
   type DiscoverJourneyEntry,
   type DiscovererFinal,
 } from "@/server/agent/deep-discoverer";
+import {
+  endRequestLog,
+  errorRequestLog,
+  startRequestLog,
+  stepRequestLog,
+  warnRequestLog,
+} from "@/server/telemetry";
 
 export const runtime = "nodejs";
 
@@ -18,8 +25,14 @@ export async function GET(request: NextRequest) {
   const diseaseQuery = searchParams.get("diseaseQuery")?.trim();
   const question = searchParams.get("question")?.trim();
   const diseaseId = searchParams.get("diseaseId")?.trim();
+  const log = startRequestLog("/api/agentDiscover", {
+    diseaseQuery: diseaseQuery?.slice(0, 120),
+    questionLength: question?.length ?? 0,
+    hasDiseaseIdHint: Boolean(diseaseId),
+  });
 
   if (!diseaseQuery || !question) {
+    endRequestLog(log, { rejected: true, reason: "missing_disease_or_question" });
     return new Response("Missing diseaseQuery or question", { status: 400 });
   }
 
@@ -49,32 +62,91 @@ export async function GET(request: NextRequest) {
       };
 
       const run = async () => {
+        const heartbeat = setInterval(() => {
+          emit("status", {
+            phase: "A1",
+            message: "I am investigating the evidence graph and testing branch hypotheses",
+            elapsedMs: Date.now() - startedAt,
+          });
+        }, 2500);
+
         emit("status", {
           phase: "A0",
-          message: "Initializing agentic discovery workflow",
+          message: "I am initializing the multi-agent discovery workflow",
           elapsedMs: Date.now() - startedAt,
         });
 
-        const final = await runDeepDiscoverer({
-          diseaseQuery,
-          diseaseIdHint: diseaseId ?? undefined,
-          question,
-          emitJourney: (entry: DiscoverJourneyEntry) => {
-            emit("journey", entry);
-          },
-        });
+        try {
+          const final = await runDeepDiscoverer({
+            diseaseQuery,
+            diseaseIdHint: diseaseId ?? undefined,
+            question,
+            emitJourney: (entry: DiscoverJourneyEntry) => {
+              emit("journey", entry);
+              if (entry.kind === "tool_start") {
+                emit("subagent_start", {
+                  title: entry.title,
+                  detail: entry.detail,
+                  source: entry.source,
+                  entities: entry.entities,
+                });
+              } else if (entry.kind === "handoff") {
+                emit("subagent_result", {
+                  title: entry.title,
+                  detail: entry.detail,
+                  source: entry.source,
+                  pathState: entry.pathState,
+                  entities: entry.entities,
+                });
+              } else if (entry.kind === "followup") {
+                emit("followup_question_spawned", {
+                  title: entry.title,
+                  detail: entry.detail,
+                  source: entry.source,
+                  pathState: entry.pathState,
+                });
+              } else if (entry.kind === "branch") {
+                emit("branch_update", {
+                  title: entry.title,
+                  detail: entry.detail,
+                  source: entry.source,
+                  pathState: entry.pathState,
+                  entities: entry.entities,
+                });
+              }
+              if (entry.kind === "warning") {
+                warnRequestLog(log, "agent_discover.journey_warning", {
+                  title: entry.title,
+                  source: entry.source,
+                  pathState: entry.pathState,
+                });
+              }
+            },
+          });
 
-        emit("final", final satisfies DiscovererFinal);
-        emit("done", {
-          elapsedMs: Date.now() - startedAt,
-        });
-        close();
+          emit("final", final satisfies DiscovererFinal);
+          stepRequestLog(log, "agent_discover.final", {
+            focusTarget: final.focusThread.target,
+            focusPathway: final.focusThread.pathway,
+            focusDrug: final.focusThread.drug,
+            caveatCount: final.caveats.length,
+          });
+          emit("done", {
+            elapsedMs: Date.now() - startedAt,
+          });
+          endRequestLog(log, { completed: true, elapsedMs: Date.now() - startedAt });
+          close();
+        } finally {
+          clearInterval(heartbeat);
+        }
       };
 
       run().catch((error) => {
         emit("error", {
           message: error instanceof Error ? error.message : "unknown discoverer error",
         });
+        errorRequestLog(log, "agent_discover.fatal", error);
+        endRequestLog(log, { completed: false });
         close();
       });
     },

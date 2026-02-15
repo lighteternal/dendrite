@@ -7,7 +7,9 @@
     "build:web": "npm --prefix apps/web run build",
     "lint:web": "npm --prefix apps/web run lint",
     "services:up": "docker compose up --build",
-    "services:down": "docker compose down"
+    "services:down": "docker compose down",
+    "test:ui-regression": "node scripts/ui-regression.mjs",
+    "test:e2e-gate": "node scripts/e2e-multihop-gate.mjs"
   },
   "devDependencies": {
     "playwright": "^1.58.2"

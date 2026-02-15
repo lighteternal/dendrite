@@ -1,5 +1,7 @@
 import OpenAI from "openai";
 import { appConfig } from "@/server/config";
+import { handleOpenAiRateLimit, isOpenAiRateLimited } from "@/server/openai/rate-limit";
+import { chooseDiseaseAutocompleteRankingModel } from "@/server/openai/model-router";
 
 export type DiseaseCandidate = {
   id: string;
@@ -7,39 +9,15 @@ export type DiseaseCandidate = {
   description?: string;
 };
 
+export type DiseaseAliasExpansion = {
+  isDisease: boolean;
+  aliases: string[];
+  rationale: string;
+};
+
 const openai = appConfig.openAiApiKey
   ? new OpenAI({ apiKey: appConfig.openAiApiKey })
   : null;
-
-const penalizedQualifierTerms = [
-  "biomarker",
-  "measurement",
-  "susceptibility",
-  "risk",
-  "severity",
-  "progression",
-  "response",
-  "remission",
-  "stage",
-  "screening",
-  "finding",
-  "neuropathologic",
-  "change",
-  "trait",
-];
-
-const diseaseAffirmationTerms = [
-  "disease",
-  "cancer",
-  "carcinoma",
-  "arthritis",
-  "leukemia",
-  "lymphoma",
-  "melanoma",
-  "syndrome",
-  "colitis",
-  "asthma",
-];
 
 function normalizeText(value: string): string {
   return value
@@ -51,39 +29,8 @@ function normalizeText(value: string): string {
 }
 
 export function extractDiseaseIntent(query: string): string {
-  let value = normalizeText(query);
-  value = value.replace(/^(for|in|about|regarding)\s+/, "");
-
-  const splitters = [
-    ",",
-    "?",
-    " what ",
-    " which ",
-    " where ",
-    " when ",
-    " how ",
-    " should ",
-    " would ",
-    " with ",
-    " showing ",
-    " to identify ",
-    " to evaluate ",
-    " refractory to ",
-    " resistant to ",
-    " treated with ",
-    " failed ",
-    " relapse ",
-    " progressing on ",
-  ];
-
-  for (const splitter of splitters) {
-    const idx = value.indexOf(splitter);
-    if (idx > 0) {
-      value = value.slice(0, idx).trim();
-    }
-  }
-
-  return value.trim();
+  // Keep full normalized query context; do not apply stopword/splitter pruning.
+  return normalizeText(query);
 }
 
 function tokenize(value: string): string[] {
@@ -92,21 +39,30 @@ function tokenize(value: string): string[] {
   return normalized
     .split(" ")
     .filter((token) => token.length > 1)
-    .map((token) => {
-      let normalizedToken = token;
-      if (normalizedToken.endsWith("s") && normalizedToken.length > 4) {
-        normalizedToken = normalizedToken.slice(0, -1);
-      }
-      if (normalizedToken === "carcinoma") normalizedToken = "cancer";
-      if (normalizedToken === "tumour") normalizedToken = "tumor";
-      return normalizedToken;
-    });
+    .map((token) =>
+      token.endsWith("s") && token.length > 4 ? token.slice(0, -1) : token,
+    );
 }
 
-function scoreCandidate(intent: string, candidate: DiseaseCandidate): {
-  score: number;
-  penalized: boolean;
-} {
+function alnumCompact(value: string): string {
+  return value.replace(/[^a-z0-9]/g, "");
+}
+
+function initials(tokens: string[]): string {
+  return tokens
+    .map((token) => alnumCompact(token))
+    .filter((token) => token.length > 0)
+    .map((token) => token[0] ?? "")
+    .join("");
+}
+
+function ontologyAdjustment(candidateId: string): number {
+  if (/^(EFO|MONDO|DOID|ORPHANET)_/i.test(candidateId)) return 1.5;
+  if (/^HP_/i.test(candidateId)) return -2;
+  return 0;
+}
+
+function scoreCandidate(intent: string, candidate: DiseaseCandidate): number {
   const candidateNorm = normalizeText(candidate.name);
   const intentNorm = normalizeText(intent);
 
@@ -116,7 +72,7 @@ function scoreCandidate(intent: string, candidate: DiseaseCandidate): {
     score += 7;
   }
 
-  if (candidateNorm.startsWith(intentNorm) && intentNorm.length > 3) {
+  if (candidateNorm.startsWith(intentNorm) && intentNorm.length >= 3) {
     score += 2.4;
   }
 
@@ -128,6 +84,26 @@ function scoreCandidate(intent: string, candidate: DiseaseCandidate): {
   const candidateTokens = tokenize(candidateNorm);
   const candidateSet = new Set(candidateTokens);
   const intentSet = new Set(intentTokens);
+  const intentCompact = alnumCompact(intentTokens.join(""));
+  const candidateInitials = initials(candidateTokens);
+
+  if (intentTokens.length === 1) {
+    const token = alnumCompact(intentTokens[0] ?? "");
+    if (token && candidateInitials === token) {
+      score += 8.4;
+    }
+    if (
+      token &&
+      candidateTokens.some((candidateToken) =>
+        alnumCompact(candidateToken).startsWith(token),
+      )
+    ) {
+      score += 1.6;
+    }
+  } else if (intentCompact && candidateInitials && intentCompact === candidateInitials) {
+    score += 4.8;
+  }
+
   const shared = intentTokens.filter((token) => candidateSet.has(token));
   if (shared.length > 0) {
     score += shared.length * 1.35;
@@ -145,40 +121,29 @@ function scoreCandidate(intent: string, candidate: DiseaseCandidate): {
     score -= 2;
   }
 
-  const hasDiseaseAffirmation = diseaseAffirmationTerms.some((term) =>
-    candidateNorm.includes(term),
-  );
-  if (hasDiseaseAffirmation) {
-    score += 0.5;
-  }
+  score += ontologyAdjustment(candidate.id);
 
-  const penalized = penalizedQualifierTerms.some((term) =>
-    candidateNorm.includes(term),
-  );
-  if (penalized) {
-    score -= 2.8;
-  }
+  return score;
+}
 
-  return { score, penalized };
+export function scoreDiseaseCandidateMatch(query: string, candidate: DiseaseCandidate): number {
+  return scoreCandidate(extractDiseaseIntent(query), candidate);
 }
 
 type RankedCandidate = DiseaseCandidate & {
   score: number;
-  penalized: boolean;
 };
 
-function lexicalRankDiseaseCandidates(
+export function lexicalRankDiseaseCandidates(
   query: string,
   candidates: DiseaseCandidate[],
 ): RankedCandidate[] {
   const intent = extractDiseaseIntent(query);
   return candidates
     .map((candidate) => {
-      const scored = scoreCandidate(intent, candidate);
       return {
         ...candidate,
-        score: scored.score,
-        penalized: scored.penalized,
+        score: scoreCandidate(intent, candidate),
       };
     })
     .sort((a, b) => b.score - a.score);
@@ -193,7 +158,7 @@ export async function rankDiseaseCandidatesFast(
 
   const lexical = lexicalRankDiseaseCandidates(query, candidates);
   const capped = lexical.slice(0, Math.max(1, limit));
-  if (!openai || capped.length <= 2) {
+  if (!openai || capped.length <= 2 || isOpenAiRateLimited()) {
     return capped.map((item) => ({
       id: item.id,
       name: item.name,
@@ -235,7 +200,7 @@ export async function rankDiseaseCandidatesFast(
   try {
     const response = await Promise.race([
       openai.responses.create({
-        model: appConfig.openai.smallModel,
+        model: chooseDiseaseAutocompleteRankingModel(),
         input: [
           {
             role: "system",
@@ -256,7 +221,7 @@ export async function rankDiseaseCandidatesFast(
         },
       }),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("autocomplete timeout")), 800),
+        setTimeout(() => reject(new Error("autocomplete timeout")), 1_800),
       ),
     ]);
 
@@ -281,7 +246,8 @@ export async function rankDiseaseCandidatesFast(
         name: item.name,
         description: item.description,
       }));
-  } catch {
+  } catch (error) {
+    handleOpenAiRateLimit(error);
     return capped.map((item) => ({
       id: item.id,
       name: item.name,
@@ -293,16 +259,13 @@ export async function rankDiseaseCandidatesFast(
 function lexicalFallback(query: string, candidates: DiseaseCandidate[]): {
   selected: DiseaseCandidate;
   score: number;
-  penalized: boolean;
   rationale: string;
 } {
   const intent = extractDiseaseIntent(query);
   const scored = candidates.map((item) => {
-    const { score, penalized } = scoreCandidate(intent, item);
     return {
       item,
-      score,
-      penalized,
+      score: scoreCandidate(intent, item),
     };
   });
 
@@ -312,7 +275,6 @@ function lexicalFallback(query: string, candidates: DiseaseCandidate[]): {
     return {
       selected: candidates[0]!,
       score: 0,
-      penalized: false,
       rationale: "Selected first candidate by fallback.",
     };
   }
@@ -320,11 +282,15 @@ function lexicalFallback(query: string, candidates: DiseaseCandidate[]): {
   return {
     selected: best.item,
     score: best.score,
-    penalized: best.penalized,
-    rationale: best.penalized
-      ? "Selected via lexical fallback with qualifier penalty guardrails."
-      : "Selected via lexical disease-intent matching.",
+    rationale: "Selected via lexical disease-intent matching.",
   };
+}
+
+export function chooseBestDiseaseCandidateLexical(
+  query: string,
+  candidates: DiseaseCandidate[],
+): { selected: DiseaseCandidate; score: number; rationale: string } {
+  return lexicalFallback(query, candidates);
 }
 
 export async function chooseBestDiseaseCandidate(
@@ -336,7 +302,7 @@ export async function chooseBestDiseaseCandidate(
   }
 
   const fallback = lexicalFallback(query, candidates);
-  if (!openai || candidates.length === 1) {
+  if (!openai || candidates.length === 1 || isOpenAiRateLimited()) {
     return {
       selected: fallback.selected,
       rationale: fallback.rationale,
@@ -357,12 +323,16 @@ export async function chooseBestDiseaseCandidate(
     "You are a biomedical disease entity resolver.",
     "Select the single best matching disease candidate for the user query.",
     "Use semantic intent, synonyms, and translational context.",
+    "Ignore non-entity tokens and question scaffolding (e.g. what, is, best, target, for).",
+    "Only map the disease concept implied by the query.",
+    "If query uses abbreviations (e.g., COPD), map to canonical disease entities.",
     "Return only the schema fields.",
   ].join(" ");
 
   const userPrompt = JSON.stringify(
     {
       query,
+      normalizedDiseaseIntent: extractDiseaseIntent(query),
       candidates,
     },
     null,
@@ -370,27 +340,32 @@ export async function chooseBestDiseaseCandidate(
   );
 
   try {
-    const response = await openai.responses.create({
-      model: appConfig.openai.smallModel,
-      input: [
-        {
-          role: "system",
-          content: [{ type: "input_text", text: systemPrompt }],
+    const response = await Promise.race([
+      openai.responses.create({
+        model: appConfig.openai.smallModel,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: systemPrompt }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: userPrompt }],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "disease_candidate_selection",
+            schema,
+            strict: true,
+          },
         },
-        {
-          role: "user",
-          content: [{ type: "input_text", text: userPrompt }],
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "disease_candidate_selection",
-          schema,
-          strict: true,
-        },
-      },
-    });
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("disease selection timeout")), 3_200),
+      ),
+    ]);
 
     const parsed = JSON.parse(response.output_text) as {
       selectedId?: string;
@@ -401,15 +376,10 @@ export async function chooseBestDiseaseCandidate(
       candidates.find((item) => item.id === parsed.selectedId) ?? fallback.selected;
     const selectedScore = scoreCandidate(extractDiseaseIntent(query), selected);
 
-    // Guardrail: if semantic output is qualifier-like and heuristic has a stronger disease-intent match,
-    // prefer heuristic to avoid "biomarker measurement"-style picks.
-    if (
-      (selectedScore.penalized && !fallback.penalized) ||
-      fallback.score - selectedScore.score > 1.8
-    ) {
+    if (fallback.score - selectedScore > 1.8) {
       return {
         selected: fallback.selected,
-        rationale: `${fallback.rationale} Semantic resolver output was deprioritized by guardrails.`,
+        rationale: `${fallback.rationale} Semantic resolver output was deprioritized by lexical score guardrail.`,
       };
     }
 
@@ -420,10 +390,123 @@ export async function chooseBestDiseaseCandidate(
           ? parsed.rationale.trim()
           : "Selected via semantic resolver.",
     };
-  } catch {
+  } catch (error) {
+    handleOpenAiRateLimit(error);
     return {
       selected: fallback.selected,
       rationale: "Semantic resolver unavailable; used lexical disease-intent fallback.",
+    };
+  }
+}
+
+export async function expandDiseaseAliases(query: string): Promise<DiseaseAliasExpansion> {
+  const intent = extractDiseaseIntent(query).trim();
+  if (!intent) {
+    return {
+      isDisease: false,
+      aliases: [],
+      rationale: "No disease-like phrase extracted from query.",
+    };
+  }
+
+  if (!openai || isOpenAiRateLimited()) {
+    return {
+      isDisease: true,
+      aliases: [intent],
+      rationale: "Alias expansion fallback: OpenAI unavailable.",
+    };
+  }
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      isDisease: { type: "boolean" },
+      aliases: {
+        type: "array",
+        items: { type: "string" },
+      },
+      rationale: { type: "string" },
+    },
+    required: ["isDisease", "aliases", "rationale"],
+  } as const;
+
+  try {
+    const response = await Promise.race([
+      openai.responses.create({
+        model: appConfig.openai.smallModel,
+        reasoning: { effort: "minimal" },
+        input: [
+          {
+            role: "system",
+            content: [
+              {
+                type: "input_text",
+                text: [
+                  "Identify whether the query contains a disease concept.",
+                  "If yes, return canonical disease aliases suitable for ontology resolver search.",
+                  "If no disease concept is present, set isDisease=false and aliases=[].",
+                  "Do not invent unrelated diseases.",
+                ].join(" "),
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: JSON.stringify(
+                  {
+                    query,
+                    extractedDiseaseIntent: intent,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "disease_alias_expansion",
+            schema,
+            strict: true,
+          },
+        },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("alias expansion timeout")), 3_000),
+      ),
+    ]);
+
+    const parsed = JSON.parse(response.output_text) as {
+      isDisease?: boolean;
+      aliases?: string[];
+      rationale?: string;
+    };
+
+    const aliases = [...new Set([intent, ...(parsed.aliases ?? [])])]
+      .map((value) => normalizeText(value))
+      .filter((value) => value.length >= 2)
+      .slice(0, 6);
+
+    return {
+      isDisease: Boolean(parsed.isDisease),
+      aliases,
+      rationale:
+        typeof parsed.rationale === "string" && parsed.rationale.trim().length > 0
+          ? parsed.rationale.trim()
+          : "Alias expansion complete.",
+    };
+  } catch (error) {
+    handleOpenAiRateLimit(error);
+    return {
+      isDisease: true,
+      aliases: [intent],
+      rationale: "Alias expansion unavailable; used extracted disease intent.",
     };
   }
 }

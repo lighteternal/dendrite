@@ -45,6 +45,7 @@ REACTOME_MCP_URL=http://localhost:7020/mcp
 STRING_MCP_URL=http://localhost:7030/mcp
 CHEMBL_MCP_URL=http://localhost:7040/mcp
 BIOMCP_URL=http://localhost:8000/mcp
+PUBMED_MCP_URL=http://localhost:8000/mcp
 
 PHASE_TIMEOUT_MS=12000
 STRING_CONFIDENCE_DEFAULT=0.7
@@ -67,6 +68,7 @@ STREAM_MAX_LITERATURE_TARGETS=5
 - `npm run build:web` - production build.
 - `npm run services:up` - start MCP services via Docker.
 - `npm run services:down` - stop MCP services.
+- `npm run test:ui-regression` - run Chromium live UX regression across challenge queries.
 - `./scripts/check-services.sh` - health checks on local ports.
 
 ## Brief-First API Surface
@@ -83,6 +85,8 @@ Disease-only entity resolver used by landing and brief workspace:
 
 Decision-brief streaming endpoint consumed by `/brief`:
 
+- `query_plan` - typed anchor/entity/constraint plan built from resolver-native candidates
+- `entity_candidates` - raw candidate anchors and unresolved mentions
 - `resolver_candidates` - disease candidates surfaced before run starts
 - `resolver_selected` - selected disease entity + rationale
 - `status` - step status, counts, source health, completion
@@ -132,6 +136,10 @@ SSE events:
 
 - `status` - workflow bootstrapping state.
 - `journey` - live agent journey entries (tool start/result, source, entities).
+- `subagent_start` - explicit specialist subagent starts.
+- `subagent_result` - structured handoff payload from specialist subagents.
+- `followup_question_spawned` - targeted multihop follow-up generated during run.
+- `branch_update` - branch state update (active/candidate/discarded).
 - `final` - consolidated readout (answer, biomedical case, focus thread, caveats, next actions).
 - `done` - elapsed time.
 
@@ -139,6 +147,24 @@ Implementation uses LangGraph/LangChain agent middleware with DeepAgents-style s
 
 - `pathway_mapper` (mechanism mapping)
 - `translational_scout` (compound/tractability scouting)
+- Optional PubMed MCP enrichment (`PUBMED_MCP_URL`) for explicit literature branching in live journey updates.
+
+## Agentic Architecture
+
+Current architecture is orchestrator-first with typed handoffs:
+
+1. Query planner resolves mixed entity anchors and constraints using resolver-native candidates (no hardcoded biomedical dictionaries).
+2. Orchestrator delegates parallel specialist retrieval (`pathway_mapper`, `translational_scout`) plus deterministic fallbacks.
+3. Tool outputs can spawn follow-up tasks; branch state is streamed as active/candidate/discarded.
+4. Intermediate results are emitted as both:
+   - textual journey/handoff events
+   - live graph deltas and path updates in the mechanism canvas.
+
+Reference docs used for architecture decisions:
+
+- DeepAgents: https://docs.deepagents.dev/
+- LangGraph multi-agent: https://langchain-ai.github.io/langgraph/concepts/multi_agent/
+- Anthropic agent engineering patterns: https://www.anthropic.com/engineering/building-effective-agents
 
 ## Decision and Scoring
 

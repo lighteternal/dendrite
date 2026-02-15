@@ -29,6 +29,10 @@ export const appConfig = {
     string: process.env.STRING_MCP_URL ?? "http://localhost:7030/mcp",
     chembl: process.env.CHEMBL_MCP_URL ?? "http://localhost:7040/mcp",
     biomcp: process.env.BIOMCP_URL ?? "http://localhost:8000/mcp",
+    pubmed:
+      process.env.PUBMED_MCP_URL ??
+      process.env.BIOMCP_URL ??
+      "http://localhost:7050/mcp",
   },
   stream: {
     phaseTimeoutMs: parseNumber(process.env.PHASE_TIMEOUT_MS, 12_000),
@@ -54,7 +58,8 @@ export const appConfig = {
   },
   openai: {
     model: process.env.OPENAI_MODEL ?? "gpt-5.2",
-    smallModel: process.env.OPENAI_SMALL_MODEL ?? "gpt-5-nano",
+    smallModel: process.env.OPENAI_SMALL_MODEL ?? "gpt-5-mini",
+    nanoModel: process.env.OPENAI_NANO_MODEL ?? "gpt-5-nano",
     hypothesisTimeoutMs: parseNumber(process.env.OPENAI_HYPOTHESIS_TIMEOUT_MS, 10_000),
   },
 };

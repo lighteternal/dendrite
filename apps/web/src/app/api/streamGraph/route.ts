@@ -19,12 +19,19 @@ import {
   getDiseaseTargetsSummary,
   getKnownDrugsForTarget,
   searchDiseases,
+  searchTargets,
 } from "@/server/mcp/opentargets";
 import { findPathwaysByGene } from "@/server/mcp/reactome";
 import { getInteractionNetwork } from "@/server/mcp/stringdb";
 import { rankTargets, rankTargetsFallback } from "@/server/openai/ranking";
 import { appConfig, assertRuntimeConfig } from "@/server/config";
 import { encodeSseEvent, randomInt } from "@/server/pipeline/sse";
+import {
+  endRequestLog,
+  errorRequestLog,
+  startRequestLog,
+  stepRequestLog,
+} from "@/server/telemetry";
 
 export const runtime = "nodejs";
 
@@ -101,12 +108,27 @@ export async function GET(request: NextRequest) {
   const diseaseQuery = searchParams.get("diseaseQuery")?.trim();
   const diseaseIdHint = searchParams.get("diseaseId")?.trim();
   const maxTargets = Number(searchParams.get("maxTargets") ?? 20);
+  const seedTargets = (searchParams.get("seedTargets") ?? "")
+    .split(",")
+    .map((token) => token.trim().toUpperCase())
+    .filter((token) => token.length >= 2)
+    .slice(0, 20);
   const includePathways = searchParams.get("pathways") !== "0";
   const includeDrugs = searchParams.get("drugs") !== "0";
   const includeInteractions = searchParams.get("interactions") !== "0";
   const includeLiterature = searchParams.get("literature") !== "0";
+  const log = startRequestLog("/api/streamGraph", {
+    diseaseQuery: diseaseQuery?.slice(0, 120),
+    maxTargets,
+    includePathways,
+    includeDrugs,
+    includeInteractions,
+    includeLiterature,
+    seedTargets: seedTargets.length,
+  });
 
   if (!diseaseQuery) {
+    endRequestLog(log, { rejected: true, reason: "missing_disease_query" });
     return new Response("Missing diseaseQuery", { status: 400 });
   }
 
@@ -119,6 +141,7 @@ export async function GET(request: NextRequest) {
     string: "green",
     chembl: "green",
     biomcp: "green",
+    pubmed: "green",
     openai: "green",
   };
 
@@ -313,10 +336,54 @@ export async function GET(request: NextRequest) {
 
         try {
           emitStatus("P1", "Fetching target evidence from OpenTargets", 18);
-          const targets = await withTimeout(
-            getDiseaseTargetsSummary(diseaseId, Math.min(40, Math.max(5, maxTargets))),
-            phaseTimeoutMs,
-          );
+          let targets: Awaited<ReturnType<typeof getDiseaseTargetsSummary>> = [];
+          try {
+            targets = await withTimeout(
+              getDiseaseTargetsSummary(diseaseId, Math.min(40, Math.max(5, maxTargets))),
+              phaseTimeoutMs,
+            );
+          } catch {
+            sourceHealth.opentargets = "yellow";
+          }
+
+          if (targets.length === 0 && seedTargets.length > 0) {
+            emitStatus(
+              "P1",
+              "No disease-target rows returned; switching to query-seeded targets",
+              22,
+              {
+                seedTargets: seedTargets.length,
+              },
+              true,
+            );
+
+            const seededTargetRows = await Promise.all(
+              seedTargets.slice(0, maxTargets).map(async (symbol) => {
+                const resolved = await withTimeout(
+                  searchTargets(symbol, 4),
+                  Math.min(phaseTimeoutMs, 3_500),
+                ).catch(() => []);
+                const best =
+                  resolved.find((item) => item.name.toUpperCase() === symbol) ?? resolved[0];
+                if (!best) {
+                  return {
+                    targetId: `QUERY_TARGET_${symbol}`,
+                    targetSymbol: symbol,
+                    targetName: symbol,
+                    associationScore: 0.38,
+                  };
+                }
+
+                return {
+                  targetId: best.id,
+                  targetSymbol: symbol,
+                  targetName: best.name,
+                  associationScore: 0.52,
+                };
+              }),
+            );
+            targets = seededTargetRows;
+          }
 
           const diseaseNodeId = makeNodeId("disease", diseaseId);
           for (const batch of chunkArray(targets.slice(0, maxTargets), 5)) {
@@ -370,6 +437,16 @@ export async function GET(request: NextRequest) {
             });
             await sleep(randomInt(appConfig.stream.batchMinDelayMs, appConfig.stream.batchMaxDelayMs));
           }
+
+          if (targetCount === 0) {
+            emitStatus(
+              "P1",
+              "No target evidence rows were available from disease or query-seeded retrieval",
+              30,
+              { targets: 0, seedTargets: seedTargets.length },
+              true,
+            );
+          }
         } catch (error) {
           sourceHealth.opentargets = "yellow";
           emit({
@@ -404,14 +481,24 @@ export async function GET(request: NextRequest) {
 
             const seededTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, maxTargets));
             let degradedTargets = 0;
+            let budgetTruncated = false;
+            const p2Deadline = Date.now() + Math.max(18_000, Math.floor(phaseTimeoutMs * 2));
 
             for (const batch of chunkArray(seededTargets, 4)) {
+              if (Date.now() > p2Deadline) {
+                budgetTruncated = true;
+                degradedTargets += batch.length;
+                break;
+              }
               const resolved = await Promise.allSettled(
                 batch.map(async (targetNodeId) => {
                   const symbol = targetSymbolByNodeId.get(targetNodeId);
                   if (!symbol) return { targetNodeId, pathways: [] as Awaited<ReturnType<typeof findPathwaysByGene>> };
 
-                  const pathways = await withTimeout(findPathwaysByGene(symbol), phaseTimeoutMs);
+                  const pathways = await withTimeout(
+                    findPathwaysByGene(symbol),
+                    Math.min(phaseTimeoutMs, 4_500),
+                  );
                   return {
                     targetNodeId,
                     pathways: pathways.slice(0, 8),
@@ -482,7 +569,9 @@ export async function GET(request: NextRequest) {
                 event: "error",
                 data: {
                   phase: "P2",
-                  message: `Reactome pathway expansion partial: ${degradedTargets} target-level fetches degraded`,
+                  message: budgetTruncated
+                    ? `Reactome pathway expansion partial: phase budget reached; ${degradedTargets} target-level fetches truncated/degraded`
+                    : `Reactome pathway expansion partial: ${degradedTargets} target-level fetches degraded`,
                   recoverable: true,
                 },
               });
@@ -527,8 +616,15 @@ export async function GET(request: NextRequest) {
 
             const seedTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, 10));
             let degradedTargets = 0;
+            let budgetTruncated = false;
+            const p3Deadline = Date.now() + Math.max(20_000, Math.floor(phaseTimeoutMs * 2));
 
             for (const batch of chunkArray(seedTargets, 2)) {
+              if (Date.now() > p3Deadline) {
+                budgetTruncated = true;
+                degradedTargets += batch.length;
+                break;
+              }
               const settledBatch = await Promise.allSettled(
                 batch.map(async (targetNodeId) => {
                 const targetPrimaryId = nodeMap.get(targetNodeId)?.primaryId;
@@ -538,8 +634,14 @@ export async function GET(request: NextRequest) {
                 }
 
                 const [knownDrugs, activityDrugs] = await Promise.allSettled([
-                  withTimeout(getKnownDrugsForTarget(targetPrimaryId, 8), phaseTimeoutMs),
-                  withTimeout(getTargetActivityDrugs(targetSymbol, 8), phaseTimeoutMs),
+                  withTimeout(
+                    getKnownDrugsForTarget(targetPrimaryId, 8),
+                    Math.min(phaseTimeoutMs, 4_500),
+                  ),
+                  withTimeout(
+                    getTargetActivityDrugs(targetSymbol, 8),
+                    Math.min(phaseTimeoutMs, 4_500),
+                  ),
                 ]);
 
                 const nodes: GraphNode[] = [];
@@ -647,7 +749,9 @@ export async function GET(request: NextRequest) {
                 event: "error",
                 data: {
                   phase: "P3",
-                  message: `Drug enrichment partial: ${degradedTargets} target-level fetches degraded`,
+                  message: budgetTruncated
+                    ? `Drug enrichment partial: phase budget reached; ${degradedTargets} target-level fetches truncated/degraded`
+                    : `Drug enrichment partial: ${degradedTargets} target-level fetches degraded`,
                   recoverable: true,
                 },
               });
@@ -702,7 +806,7 @@ export async function GET(request: NextRequest) {
                   appConfig.string.confidenceDefault,
                   appConfig.string.maxNeighborsPerSeed,
                 ),
-                phaseTimeoutMs,
+                Math.min(phaseTimeoutMs, 5_000),
               );
 
               const nodes: GraphNode[] = [];
@@ -1033,6 +1137,15 @@ export async function GET(request: NextRequest) {
             },
           },
         });
+        stepRequestLog(log, "stream_graph.done", {
+          totalNodes: nodeMap.size,
+          totalEdges: edgeMap.size,
+          targets: targetCount,
+          pathways: pathwayCount,
+          drugs: drugCount,
+          interactions: interactionCount,
+        });
+        endRequestLog(log, { completed: true });
 
         closeStream();
       };
@@ -1046,6 +1159,8 @@ export async function GET(request: NextRequest) {
             recoverable: false,
           },
         });
+        errorRequestLog(log, "stream_graph.fatal", error);
+        endRequestLog(log, { completed: false });
         closeStream();
       });
     },

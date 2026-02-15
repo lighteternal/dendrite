@@ -8,6 +8,10 @@ import {
 } from "@/lib/contracts";
 import { clamp } from "@/lib/graph";
 import { appConfig } from "@/server/config";
+import {
+  chooseMechanismThreadModel,
+  chooseRankingModel,
+} from "@/server/openai/model-router";
 
 type RankingInputRow = {
   id: string;
@@ -50,57 +54,74 @@ async function callStructuredJson<T>(options: {
   schema: Record<string, unknown>;
   systemPrompt: string;
   userPrompt: string;
+  model?: string;
   reasoningEffort?: "medium" | "high";
+  maxOutputTokens?: number;
+  timeoutMs?: number;
 }): Promise<T> {
   if (!openai) {
     throw new Error("OPENAI_API_KEY is not configured");
   }
 
+  const timeoutMs = Math.max(500, options.timeoutMs ?? 6000);
+  const withTimeout = <R>(promise: Promise<R>) =>
+    Promise.race([
+      promise,
+      new Promise<R>((_, reject) =>
+        setTimeout(() => reject(new Error(`openai timeout after ${timeoutMs}ms`)), timeoutMs),
+      ),
+    ]);
+
   try {
-    const response = await openai.responses.create({
-      model: appConfig.openai.model,
-      reasoning: options.reasoningEffort
-        ? {
-            effort: options.reasoningEffort,
-          }
-        : undefined,
-      input: [
-        {
-          role: "system",
-          content: [{ type: "input_text", text: options.systemPrompt }],
+    const response = await withTimeout(
+      openai.responses.create({
+        model: options.model ?? appConfig.openai.model,
+        max_output_tokens: options.maxOutputTokens,
+        reasoning: options.reasoningEffort
+          ? {
+              effort: options.reasoningEffort,
+            }
+          : undefined,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: options.systemPrompt }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: options.userPrompt }],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: options.schemaName,
+            schema: options.schema,
+            strict: true,
+          },
         },
-        {
-          role: "user",
-          content: [{ type: "input_text", text: options.userPrompt }],
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: options.schemaName,
-          schema: options.schema,
-          strict: true,
-        },
-      },
-    });
+      }),
+    );
 
     return JSON.parse(response.output_text) as T;
   } catch {
-    const response = await openai.chat.completions.create({
-      model: appConfig.openai.model,
-      messages: [
-        { role: "system", content: options.systemPrompt },
-        { role: "user", content: options.userPrompt },
-      ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: options.schemaName,
-          strict: true,
-          schema: options.schema,
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: options.model ?? appConfig.openai.model,
+        messages: [
+          { role: "system", content: options.systemPrompt },
+          { role: "user", content: options.userPrompt },
+        ],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: options.schemaName,
+            strict: true,
+            schema: options.schema,
+          },
         },
-      },
-    });
+      }),
+    );
 
     const content = response.choices[0]?.message?.content;
     if (!content) {
@@ -171,6 +192,7 @@ export function rankTargetsFallback(rows: RankingInputRow[]): RankingResponse {
 export async function rankTargets(rows: RankingInputRow[]): Promise<RankingResponse> {
   const fallback = rankTargetsFallback(rows);
   if (!openai) return fallback;
+  const rankingModel = chooseRankingModel(rows.length);
 
   const schema = {
     type: "object",
@@ -256,6 +278,9 @@ export async function rankTargets(rows: RankingInputRow[]): Promise<RankingRespo
       schema,
       systemPrompt,
       userPrompt,
+      model: rankingModel,
+      maxOutputTokens: 1_600,
+      timeoutMs: 5500,
     });
 
     return rankingResponseSchema.parse(json);
@@ -299,6 +324,10 @@ export async function generateMechanismThread(
   input: HypothesisInput,
 ): Promise<HypothesisResponse> {
   const fallback = mechanismThreadFallback(input);
+  const mechanismModel = chooseMechanismThreadModel({
+    scoredTargetsCount: input.scoredTargets.length,
+    outputCount: input.outputCount,
+  });
 
   if (!openai) return fallback;
 
@@ -375,7 +404,9 @@ export async function generateMechanismThread(
       schema,
       systemPrompt,
       userPrompt,
+      model: mechanismModel,
       reasoningEffort: "medium",
+      maxOutputTokens: 1_200,
     });
 
     const parsed = hypothesisResponseSchema.parse(json);

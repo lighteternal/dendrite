@@ -1,20 +1,49 @@
 import { createAgent, tool } from "langchain";
 import { ChatOpenAI } from "@langchain/openai";
-import { createPatchToolCallsMiddleware, createSubAgentMiddleware, type SubAgent } from "deepagents";
 import { z } from "zod";
+import type { GraphEdge, GraphNode } from "@/lib/contracts";
+import { makeEdgeId, makeNodeId } from "@/lib/graph";
+import {
+  planQuery,
+  type QueryPlanAnchor,
+  type QueryPlanFollowup,
+  type ResolvedQueryPlan,
+} from "@/server/agent/query-plan";
 import { getLiteratureAndTrials } from "@/server/mcp/biomcp";
 import { getTargetActivityDrugs } from "@/server/mcp/chembl";
+import {
+  getPubmedArticles,
+  searchPubmedByQuery,
+  type PubmedArticle,
+} from "@/server/mcp/pubmed";
 import {
   getDiseaseTargetsSummary,
   getKnownDrugsForTarget,
   searchDiseases,
+  searchDrugs,
+  searchTargets,
 } from "@/server/mcp/opentargets";
 import { findPathwaysByGene } from "@/server/mcp/reactome";
 import { getInteractionNetwork } from "@/server/mcp/stringdb";
 import { appConfig } from "@/server/config";
+import {
+  handleOpenAiRateLimit,
+  isOpenAiRateLimited,
+} from "@/server/openai/rate-limit";
+import { chooseDiscovererModel } from "@/server/openai/model-router";
 
 export type DiscoverEntity = {
-  type: "disease" | "target" | "pathway" | "drug" | "interaction";
+  type:
+    | "disease"
+    | "target"
+    | "pathway"
+    | "drug"
+    | "interaction"
+    | "phenotype"
+    | "anatomy"
+    | "effect"
+    | "molecule"
+    | "protein";
   label: string;
   primaryId?: string;
 };
@@ -22,11 +51,32 @@ export type DiscoverEntity = {
 export type DiscoverJourneyEntry = {
   id: string;
   ts: string;
-  kind: "phase" | "tool_start" | "tool_result" | "insight" | "warning";
+  kind:
+    | "phase"
+    | "tool_start"
+    | "tool_result"
+    | "insight"
+    | "warning"
+    | "handoff"
+    | "followup"
+    | "branch";
   title: string;
   detail: string;
-  source: "agent" | "opentargets" | "reactome" | "chembl" | "string" | "biomcp";
+  source:
+    | "agent"
+    | "planner"
+    | "opentargets"
+    | "reactome"
+    | "chembl"
+    | "string"
+    | "biomcp"
+    | "pubmed";
+  pathState?: "active" | "candidate" | "discarded";
   entities: DiscoverEntity[];
+  graphPatch?: {
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+  };
 };
 
 export type DiscovererFinal = {
@@ -76,57 +126,136 @@ type DrugInfo = {
   source: "opentargets" | "chembl";
 };
 
-type LitTrialInfo = {
-  articles: number;
-  trials: number;
+type DiscoveryNode = {
+  key: string;
+  entity: DiscoverEntity;
+};
+
+type DiscoveryEdge = {
+  id: string;
+  sourceKey: string;
+  targetKey: string;
+  relation:
+    | "query_anchor"
+    | "disease_target"
+    | "target_pathway"
+    | "target_drug"
+    | "target_target"
+    | "pathway_target"
+    | "pubmed_support";
+  source:
+    | "planner"
+    | "agent"
+    | "opentargets"
+    | "reactome"
+    | "chembl"
+    | "string"
+    | "biomcp"
+    | "pubmed";
+  score: number;
+  note?: string;
+};
+
+type BridgePath = {
+  nodeKeys: string[];
+  edgeIds: string[];
 };
 
 type DiscoveryState = {
-  disease: DiseaseInfo | null;
-  targets: TargetInfo[];
+  queryPlan: ResolvedQueryPlan | null;
+  diseaseById: Map<string, DiseaseInfo>;
+  targetById: Map<string, TargetInfo>;
+  pathwayById: Map<string, PathwayInfo>;
+  drugById: Map<string, DrugInfo>;
   pathwaysByTarget: Map<string, PathwayInfo[]>;
   drugsByTarget: Map<string, DrugInfo[]>;
-  litTrialByTarget: Map<string, LitTrialInfo>;
-  interactionNodes: string[];
+  interactionSymbols: Set<string>;
+  nodes: Map<string, DiscoveryNode>;
+  edges: Map<string, DiscoveryEdge>;
+  pubmedSubqueriesUsed: number;
+  pubmedSubqueryHits: Array<{ query: string; articles: PubmedArticle[] }>;
+  bioMcpCounts: { articles: number; trials: number };
+};
+
+type CoordinatorTask = {
+  subagent: "pathway_mapper" | "translational_scout" | "bridge_hunter" | "literature_scout";
+  objective: string;
+  seedEntities: string[];
+};
+
+type SubagentReport = {
+  summary: string;
+  findings: string[];
+  followups: string[];
+  pathState: "active" | "candidate" | "discarded";
 };
 
 const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
+const AGENT_TIMEOUT_MS = 50_000;
+const TOOL_TIMEOUT_MS = 12_000;
+const MAX_PUBMED_SUBQUERIES = 5;
 
-const agentResponseSchema = z.object({
+const coordinatorPlanSchema = z.object({
+  strategy: z.string(),
+  pubmedSubqueries: z.array(z.string()).max(MAX_PUBMED_SUBQUERIES),
+  tasks: z
+    .array(
+      z.object({
+        subagent: z.enum([
+          "pathway_mapper",
+          "translational_scout",
+          "bridge_hunter",
+          "literature_scout",
+        ]),
+        objective: z.string(),
+        seedEntities: z.array(z.string()).max(8),
+      }),
+    )
+    .max(6),
+});
+
+const subagentReportSchema = z.object({
+  summary: z.string(),
+  findings: z.array(z.string()).max(8),
+  followups: z.array(z.string()).max(4),
+  pathState: z.enum(["active", "candidate", "discarded"]),
+});
+
+function toGraphNodeType(entityType: DiscoverEntity["type"]): GraphNode["type"] {
+  if (entityType === "disease") return "disease";
+  if (entityType === "target" || entityType === "protein") return "target";
+  if (entityType === "pathway") return "pathway";
+  if (entityType === "drug") return "drug";
+  return "interaction";
+}
+
+function toGraphPrimaryId(entity: DiscoverEntity): string {
+  const id = clean(entity.primaryId ?? entity.label);
+  if (!id) return "unknown";
+  return id.replace(/\s+/g, "_");
+}
+
+function toGraphNodeId(entity: DiscoverEntity): string {
+  return makeNodeId(toGraphNodeType(entity.type), toGraphPrimaryId(entity));
+}
+
+function toGraphEdgeType(
+  relation: DiscoveryEdge["relation"],
+): { type: GraphEdge["type"]; reverse?: boolean } {
+  if (relation === "disease_target") return { type: "disease_target" };
+  if (relation === "target_pathway") return { type: "target_pathway" };
+  if (relation === "target_drug") return { type: "target_drug" };
+  if (relation === "target_target") return { type: "target_target" };
+  if (relation === "pathway_target") return { type: "target_pathway", reverse: true };
+  if (relation === "pubmed_support") return { type: "target_target" };
+  return { type: "disease_disease" };
+}
+
+const synthesisSchema = z.object({
   directAnswer: z.string(),
-  mechanismSummary: z.array(z.string()),
-  caveats: z.array(z.string()),
-  nextActions: z.array(z.string()),
-});
-
-const resolveDiseaseSchema = z.object({
-  query: z.string(),
-});
-
-const topTargetsSchema = z.object({
-  diseaseId: z.string(),
-  limit: z.number().int().min(3).max(20),
-});
-
-const pathwaysSchema = z.object({
-  symbolsCsv: z.string(),
-  perTarget: z.number().int().min(1).max(10),
-});
-
-const drugsSchema = z.object({
-  symbolsCsv: z.string(),
-  perTarget: z.number().int().min(1).max(10),
-});
-
-const interactionsSchema = z.object({
-  symbolsCsv: z.string(),
-  confidence: z.number().min(0.1).max(1),
-  maxNeighbors: z.number().int().min(5).max(80),
-});
-
-const literatureSchema = z.object({
-  symbolsCsv: z.string(),
-  perTarget: z.number().int().min(1).max(6),
+  keyFindings: z.array(z.string()).max(8),
+  caveats: z.array(z.string()).max(8),
+  nextActions: z.array(z.string()).max(6),
 });
 
 function clamp(value: number, min: number, max: number): number {
@@ -134,20 +263,24 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function clean(value: string): string {
-  return value.trim().replace(/\s+/g, " ");
+  return value.replace(/\s+/g, " ").trim();
 }
 
-function inferBiomedicalCase(diseaseName: string | undefined): {
-  title: string;
-  whyAgentic: string;
-} {
-  return {
-    title: diseaseName
-      ? `${diseaseName}: translational mechanism triage`
-      : "Translational mechanism triage",
-    whyAgentic:
-      "This workflow benefits from parallel evidence retrieval across targets, pathways, compounds, interactions, and literature context before selecting one validation thread.",
-  };
+function compact(value: string, max = 180): string {
+  const normalized = clean(value);
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, max - 1)}…`;
+}
+
+function toNarrativeDetail(
+  kind: DiscoverJourneyEntry["kind"],
+  detail: string,
+): string {
+  const normalized = clean(detail);
+  if (!normalized) return detail;
+  if (kind === "warning") return `Gap: ${normalized}`;
+  if (kind === "followup") return `Next step: ${normalized}`;
+  return normalized;
 }
 
 function parseSymbolsCsv(csv: string): string[] {
@@ -157,19 +290,29 @@ function parseSymbolsCsv(csv: string): string[] {
     .filter(Boolean);
 }
 
+function uniqueSymbols(symbols: string[]): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const symbol of symbols) {
+    const normalized = clean(symbol);
+    if (!normalized) continue;
+    const key = normalized.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    ordered.push(normalized);
+  }
+  return ordered;
+}
+
 function toAssistantText(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    return "";
-  }
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
   return content
     .map((part) => {
       if (typeof part === "string") return part;
       if (part && typeof part === "object" && "text" in part) {
-        const maybe = (part as { text?: unknown }).text;
-        return typeof maybe === "string" ? maybe : "";
+        const maybeText = (part as { text?: unknown }).text;
+        return typeof maybeText === "string" ? maybeText : "";
       }
       return "";
     })
@@ -177,54 +320,520 @@ function toAssistantText(content: unknown): string {
     .trim();
 }
 
-function toThread(state: DiscoveryState) {
-  const topTarget = state.targets[0];
-  const pathways = topTarget ? (state.pathwaysByTarget.get(topTarget.symbol) ?? []) : [];
-  const drugs = topTarget ? (state.drugsByTarget.get(topTarget.symbol) ?? []) : [];
-  const topPathwayRaw = pathways[0]?.name;
-  const topPathway = Array.isArray(topPathwayRaw)
-    ? topPathwayRaw.map((item) => String(item)).join(", ")
-    : typeof topPathwayRaw === "string"
-      ? topPathwayRaw
-      : "not provided";
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs);
+    promise
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
 
+function classifyDiscovererError(error: unknown): string {
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+
+  if (message.includes("429") || message.includes("rate limit") || message.includes("quota")) {
+    return "OpenAI rate-limited";
+  }
+  if (message.includes("timeout")) {
+    return "LLM timeout";
+  }
+  if (message.includes("401") || message.includes("invalid api key")) {
+    return "OpenAI authentication error";
+  }
+  return "LLM unavailable";
+}
+
+function inferBiomedicalCase(query: string): {
+  title: string;
+  whyAgentic: string;
+} {
   return {
-    target: topTarget?.symbol ?? "not provided",
-    pathway: topPathway,
-    drug: drugs[0]?.name ?? "not provided",
+    title: `${compact(query, 86)}: multihop mechanistic discovery`,
+    whyAgentic:
+      "Coordinator-guided subagents retrieve evidence across OpenTargets, Reactome, STRING, ChEMBL, BioMCP, and PubMed, then test bridge hypotheses with query-specific follow-ups.",
   };
 }
 
-function buildFallbackSummary(state: DiscoveryState): DiscovererFinal {
-  const thread = toThread(state);
-  const disease = state.disease?.name ?? "selected disease";
-  const biomedicalCase = inferBiomedicalCase(state.disease?.name);
+function entityKey(entity: DiscoverEntity): string {
+  const id = clean(entity.primaryId ?? entity.label).toUpperCase();
+  return `${entity.type}:${id}`;
+}
 
-  const caveats: string[] = [];
-  if (thread.target === "not provided") caveats.push("Target evidence not available.");
-  if (thread.pathway === "not provided") caveats.push("Pathway mapping not available.");
-  if (thread.drug === "not provided") caveats.push("Drugability mapping not available.");
-  if (state.interactionNodes.length === 0) caveats.push("Interaction neighborhood not available.");
+function nodeEntityFromAnchor(anchor: QueryPlanAnchor): DiscoverEntity {
+  return {
+    type: anchor.entityType,
+    label: anchor.name,
+    primaryId: anchor.id,
+  };
+}
+
+function upsertNode(state: DiscoveryState, entity: DiscoverEntity): string {
+  const normalized: DiscoverEntity = {
+    ...entity,
+    label: clean(entity.label),
+    primaryId: entity.primaryId ? clean(entity.primaryId) : undefined,
+  };
+  const key = entityKey(normalized);
+  const existing = state.nodes.get(key);
+  if (existing) {
+    state.nodes.set(key, {
+      key,
+      entity: {
+        ...existing.entity,
+        ...normalized,
+      },
+    });
+    return key;
+  }
+  state.nodes.set(key, {
+    key,
+    entity: normalized,
+  });
+  return key;
+}
+
+function edgeId(sourceKey: string, targetKey: string, relation: DiscoveryEdge["relation"]): string {
+  return `${relation}:${sourceKey}->${targetKey}`;
+}
+
+function upsertEdge(
+  state: DiscoveryState,
+  input: Omit<DiscoveryEdge, "id" | "score"> & { score?: number },
+): string {
+  const id = edgeId(input.sourceKey, input.targetKey, input.relation);
+  const current = state.edges.get(id);
+  const next: DiscoveryEdge = {
+    id,
+    score: input.score ?? 0.5,
+    ...input,
+  };
+  if (!current) {
+    state.edges.set(id, next);
+    return id;
+  }
+  state.edges.set(id, {
+    ...current,
+    ...next,
+    score: Math.max(current.score, next.score),
+    note: next.note || current.note,
+  });
+  return id;
+}
+
+function buildGraphPatch(state: DiscoveryState): {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+} {
+  const nodeMap = new Map<string, GraphNode>();
+  for (const node of state.nodes.values()) {
+    const graphType = toGraphNodeType(node.entity.type);
+    const primaryId = toGraphPrimaryId(node.entity);
+    const graphId = makeNodeId(graphType, primaryId);
+    const baseScore =
+      graphType === "target"
+        ? (() => {
+            const known = [...state.targetById.values()].find(
+              (item) =>
+                item.id.toUpperCase() === primaryId.toUpperCase() ||
+                item.symbol.toUpperCase() === node.entity.label.toUpperCase(),
+            );
+            return known?.score ?? 0.36;
+          })()
+        : graphType === "disease"
+          ? 0.84
+          : graphType === "pathway"
+            ? 0.52
+            : graphType === "drug"
+              ? 0.46
+              : 0.3;
+    nodeMap.set(graphId, {
+      id: graphId,
+      type: graphType,
+      primaryId,
+      label: compact(node.entity.label, 64),
+      score: clamp(baseScore, 0.06, 1),
+      size: graphType === "disease" ? 62 : graphType === "target" ? 36 : 24,
+      meta: {
+        displayName: node.entity.label,
+        source: "agent_discovery",
+        virtual: false,
+      },
+    });
+  }
+
+  const edgeMap = new Map<string, GraphEdge>();
+  for (const edge of state.edges.values()) {
+    const leftEntity = state.nodes.get(edge.sourceKey)?.entity;
+    const rightEntity = state.nodes.get(edge.targetKey)?.entity;
+    if (!leftEntity || !rightEntity) continue;
+
+    const mapping = toGraphEdgeType(edge.relation);
+    const sourceEntity = mapping.reverse ? rightEntity : leftEntity;
+    const targetEntity = mapping.reverse ? leftEntity : rightEntity;
+    const sourceId = toGraphNodeId(sourceEntity);
+    const targetId = toGraphNodeId(targetEntity);
+    const id = makeEdgeId(sourceId, targetId, mapping.type);
+    const status =
+      edge.relation === "query_anchor"
+        ? "candidate"
+        : edge.score >= 0.6
+          ? "connected"
+          : "candidate";
+    edgeMap.set(id, {
+      id,
+      source: sourceId,
+      target: targetId,
+      type: mapping.type,
+      weight: clamp(edge.score, 0.05, 1),
+      meta: {
+        source:
+          edge.relation === "query_anchor" ? "query_anchor" : edge.source,
+        status,
+        note: edge.note,
+        bridgeType: edge.relation === "query_anchor" ? "query_anchor" : edge.relation,
+        agentic: true,
+      },
+    });
+  }
 
   return {
-    answer: `For ${disease}, the current best-supported exploratory thread is ${thread.pathway} -> ${thread.target} -> ${thread.drug}.`,
-    biomedicalCase,
+    nodes: [...nodeMap.values()],
+    edges: [...edgeMap.values()],
+  };
+}
+
+function resolveDiseaseCandidatesFromPlan(
+  queryPlan: ResolvedQueryPlan | null,
+  fallbackQuery: string,
+): string[] {
+  const fromPlan = (queryPlan?.anchors ?? [])
+    .filter((anchor) => anchor.entityType === "disease")
+    .map((anchor) => anchor.name);
+  if (fromPlan.length > 0) return uniqueSymbols(fromPlan).slice(0, 4);
+  return [fallbackQuery];
+}
+
+function summarizeThread(state: DiscoveryState): {
+  target: string;
+  pathway: string;
+  drug: string;
+} {
+  const topTarget = [...state.targetById.values()].sort((a, b) => b.score - a.score)[0];
+  if (!topTarget) {
+    return { target: "not provided", pathway: "not provided", drug: "not provided" };
+  }
+  const topPathway = (state.pathwaysByTarget.get(topTarget.symbol) ?? [])[0];
+  const topDrug = (state.drugsByTarget.get(topTarget.symbol) ?? [])[0];
+  return {
+    target: topTarget.symbol,
+    pathway: topPathway?.name ?? "not provided",
+    drug: topDrug?.name ?? "not provided",
+  };
+}
+
+function buildAdjacency(state: DiscoveryState): Map<string, Array<{ to: string; edgeId: string }>> {
+  const adjacency = new Map<string, Array<{ to: string; edgeId: string }>>();
+  for (const edge of state.edges.values()) {
+    if (edge.relation === "query_anchor") {
+      // Query anchor links keep the run interpretable but should not be treated
+      // as mechanistic bridge evidence.
+      continue;
+    }
+    const left = adjacency.get(edge.sourceKey) ?? [];
+    left.push({ to: edge.targetKey, edgeId: edge.id });
+    adjacency.set(edge.sourceKey, left);
+
+    const right = adjacency.get(edge.targetKey) ?? [];
+    right.push({ to: edge.sourceKey, edgeId: edge.id });
+    adjacency.set(edge.targetKey, right);
+  }
+  return adjacency;
+}
+
+function findShortestPath(state: DiscoveryState, start: string, goal: string): BridgePath | null {
+  if (start === goal) {
+    return { nodeKeys: [start], edgeIds: [] };
+  }
+  const adjacency = buildAdjacency(state);
+  const queue: string[] = [start];
+  const visited = new Set<string>([start]);
+  const parent = new Map<string, { node: string; edgeId: string }>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) break;
+    const neighbors = adjacency.get(current) ?? [];
+    for (const neighbor of neighbors) {
+      if (visited.has(neighbor.to)) continue;
+      visited.add(neighbor.to);
+      parent.set(neighbor.to, { node: current, edgeId: neighbor.edgeId });
+      if (neighbor.to === goal) {
+        const nodeKeys: string[] = [goal];
+        const edgeIds: string[] = [];
+        let cursor = goal;
+        while (cursor !== start) {
+          const step = parent.get(cursor);
+          if (!step) break;
+          edgeIds.push(step.edgeId);
+          nodeKeys.push(step.node);
+          cursor = step.node;
+        }
+        return {
+          nodeKeys: nodeKeys.reverse(),
+          edgeIds: edgeIds.reverse(),
+        };
+      }
+      queue.push(neighbor.to);
+    }
+  }
+
+  return null;
+}
+
+function chooseBridgePath(state: DiscoveryState): {
+  connectedPath: BridgePath | null;
+  unresolvedPairs: string[];
+  anchorLabels: string[];
+} {
+  const anchors = (state.queryPlan?.anchors ?? []).slice(0, 4);
+  const anchorNodeKeys = anchors
+    .map((anchor) => entityKey(nodeEntityFromAnchor(anchor)))
+    .filter((key) => state.nodes.has(key));
+  const anchorLabels = anchors.map((anchor) => anchor.name);
+
+  if (anchorNodeKeys.length < 2) {
+    return {
+      connectedPath: null,
+      unresolvedPairs: [],
+      anchorLabels,
+    };
+  }
+
+  const sequentialNodeTrail: string[] = [];
+  const sequentialEdgeTrail: string[] = [];
+  const unresolvedSequentialPairs: string[] = [];
+  for (let idx = 0; idx < anchorNodeKeys.length - 1; idx += 1) {
+    const left = anchorNodeKeys[idx]!;
+    const right = anchorNodeKeys[idx + 1]!;
+    const path = findShortestPath(state, left, right);
+    const leftLabel = state.nodes.get(left)?.entity.label ?? left;
+    const rightLabel = state.nodes.get(right)?.entity.label ?? right;
+    if (!path) {
+      unresolvedSequentialPairs.push(`${leftLabel} -> ${rightLabel}`);
+      continue;
+    }
+    if (sequentialNodeTrail.length === 0) {
+      sequentialNodeTrail.push(...path.nodeKeys);
+    } else {
+      const last = sequentialNodeTrail[sequentialNodeTrail.length - 1];
+      if (last === path.nodeKeys[0]) {
+        sequentialNodeTrail.push(...path.nodeKeys.slice(1));
+      } else {
+        sequentialNodeTrail.push(...path.nodeKeys);
+      }
+    }
+    sequentialEdgeTrail.push(...path.edgeIds);
+  }
+
+  if (unresolvedSequentialPairs.length === 0 && sequentialNodeTrail.length >= 2) {
+    return {
+      connectedPath: {
+        nodeKeys: [...new Set(sequentialNodeTrail)],
+        edgeIds: [...new Set(sequentialEdgeTrail)],
+      },
+      unresolvedPairs: [],
+      anchorLabels,
+    };
+  }
+
+  let best: BridgePath | null = null;
+  const unresolvedPairs: string[] = [];
+
+  for (let i = 0; i < anchorNodeKeys.length; i += 1) {
+    for (let j = i + 1; j < anchorNodeKeys.length; j += 1) {
+      const left = anchorNodeKeys[i]!;
+      const right = anchorNodeKeys[j]!;
+      const path = findShortestPath(state, left, right);
+      const leftLabel = state.nodes.get(left)?.entity.label ?? left;
+      const rightLabel = state.nodes.get(right)?.entity.label ?? right;
+      if (!path) {
+        unresolvedPairs.push(`${leftLabel} -> ${rightLabel}`);
+        continue;
+      }
+      if (!best || path.edgeIds.length < best.edgeIds.length) {
+        best = path;
+      }
+    }
+  }
+
+  return {
+    connectedPath: best,
+    unresolvedPairs: [...new Set([...unresolvedPairs, ...unresolvedSequentialPairs])],
+    anchorLabels,
+  };
+}
+
+function bridgePathToSummary(state: DiscoveryState, path: BridgePath | null): string {
+  if (!path || path.nodeKeys.length === 0) return "not provided";
+  return path.nodeKeys
+    .map((key) => state.nodes.get(key)?.entity.label ?? key)
+    .join(" -> ");
+}
+
+function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererFinal {
+  const thread = summarizeThread(state);
+  const bridge = chooseBridgePath(state);
+  const bridgeSummary = bridgePathToSummary(state, bridge.connectedPath);
+  const pubmedCount = state.pubmedSubqueryHits.reduce((acc, row) => acc + row.articles.length, 0);
+
+  const answer = bridge.connectedPath
+    ? `Provisional synthesis for "${query}": evidence currently supports the multihop chain ${bridgeSummary}.`
+    : `Provisional synthesis for "${query}": no complete multihop bridge is closed yet; the strongest partial thread is ${thread.pathway} -> ${thread.target} -> ${thread.drug}.`;
+
+  const caveats: string[] = [];
+  if (!bridge.connectedPath) {
+    caveats.push("No explicit connected path across all anchors in this run.");
+  }
+  if (thread.target === "not provided") caveats.push("Target evidence not provided.");
+  if (thread.pathway === "not provided") caveats.push("Pathway evidence not provided.");
+  if (thread.drug === "not provided") caveats.push("Drug evidence not provided.");
+  if (pubmedCount === 0) caveats.push("PubMed subqueries returned no articles.");
+
+  return {
+    answer,
+    biomedicalCase: inferBiomedicalCase(query),
     focusThread: thread,
     keyFindings: [
-      `Mapped ${state.targets.length} high-evidence targets.`,
-      `Mapped ${
-        [...state.pathwaysByTarget.values()].reduce((acc, arr) => acc + arr.length, 0)
-      } target-pathway links.`,
-      `Mapped ${[...state.drugsByTarget.values()].reduce((acc, arr) => acc + arr.length, 0)} target-drug links.`,
-      `Captured ${state.interactionNodes.length} interaction neighbors.`,
+      `Nodes discovered: ${state.nodes.size}`,
+      `Edges discovered: ${state.edges.size}`,
+      `PubMed subqueries executed: ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}`,
+      `BioMCP snippets: ${state.bioMcpCounts.articles} articles / ${state.bioMcpCounts.trials} trials`,
     ],
-    caveats: caveats.length > 0 ? caveats : ["No major missing inputs flagged."],
+    caveats: caveats.length > 0 ? caveats : ["No major gaps were flagged."],
     nextActions: [
-      "Use Predominant-connection lens = Pathway-mechanism.",
-      "Raise network density until pathway branching is visible.",
-      "Run Hypothesis Mode on the selected pathway and compare top-3 targets.",
+      "Run follow-up assay design on the strongest connected target-pathway segment.",
+      "Expand interaction neighborhood around the bridge target set.",
+      "Increase PubMed depth on unresolved anchor pairs with narrower subqueries.",
     ],
   };
+}
+
+type FreeformSynthesisInput = {
+  query: string;
+  bridge: {
+    connected: boolean;
+    summary: string;
+    unresolvedPairs: string[];
+  };
+  thread: {
+    pathway: string;
+    target: string;
+    drug: string;
+  };
+  state: DiscoveryState;
+  citationPreview: string[];
+  subagentSummaries: string[];
+};
+
+async function synthesizeFreeformNarrative(
+  model: ChatOpenAI,
+  payload: FreeformSynthesisInput,
+): Promise<string | null> {
+  const response = await withTimeout(
+    model.invoke([
+      {
+        role: "system",
+        content: [
+          "You are a biomedical scientist writing the final run answer.",
+          "Write a concise free-form scientific summary tailored to the exact query.",
+          "Never use generic templates or boilerplate prefixes.",
+          "If bridge is incomplete, explain what was tested and where the gap remains.",
+          "When evidence is available, mention the main intermediate hops explicitly.",
+          "If citation markers are provided, cite only using [1], [2], etc.",
+          "Return plain text only.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: JSON.stringify(
+          {
+            query: payload.query,
+            bridge: payload.bridge,
+            focusThread: payload.thread,
+            evidenceStats: {
+              nodes: payload.state.nodes.size,
+              edges: payload.state.edges.size,
+              targets: payload.state.targetById.size,
+              pathways: payload.state.pathwayById.size,
+              drugs: payload.state.drugById.size,
+              pubmedQueriesUsed: payload.state.pubmedSubqueriesUsed,
+              pubmedArticles: payload.state.pubmedSubqueryHits.reduce(
+                (acc, row) => acc + row.articles.length,
+                0,
+              ),
+              biomcpArticles: payload.state.bioMcpCounts.articles,
+              biomcpTrials: payload.state.bioMcpCounts.trials,
+            },
+            subagentSummaries: payload.subagentSummaries.slice(0, 8),
+            citationPreview: payload.citationPreview,
+          },
+          null,
+          2,
+        ),
+      },
+    ]),
+    AGENT_TIMEOUT_MS,
+    "freeform synthesis",
+  );
+  const text = clean(toAssistantText(response.content));
+  return text.length > 0 ? text : null;
+}
+
+function routeFollowupToSubagent(
+  followup: string,
+): CoordinatorTask["subagent"] {
+  const text = followup.toLowerCase();
+  if (/pubmed|paper|literature|trial|bibliography/.test(text)) return "literature_scout";
+  if (/connect|bridge|between|overlap|relationship|common|shared/.test(text)) return "bridge_hunter";
+  if (/drug|compound|tractability|moa|mechanism/.test(text)) return "translational_scout";
+  return "pathway_mapper";
+}
+
+async function resolveDisease(
+  state: DiscoveryState,
+  mention: string,
+  preferredDiseaseId?: string,
+): Promise<DiseaseInfo> {
+  const query = clean(mention);
+  const matches = await withTimeout(searchDiseases(query, 12).catch(() => []), TOOL_TIMEOUT_MS, "resolve disease");
+  const diseaseHits = matches.filter((row) => diseaseEntityPattern.test(row.id));
+  const selected =
+    diseaseHits.find((row) => row.id === preferredDiseaseId) ??
+    diseaseHits.find((row) => row.name.toLowerCase() === query.toLowerCase()) ??
+    diseaseHits[0] ??
+    matches[0];
+
+  const disease: DiseaseInfo = {
+    id: selected?.id ?? `QUERY_${query.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`,
+    name: selected?.name ?? query,
+    description: selected?.description,
+  };
+
+  state.diseaseById.set(disease.id, disease);
+  upsertNode(state, {
+    type: "disease",
+    label: disease.name,
+    primaryId: disease.id,
+  });
+  return disease;
 }
 
 export async function runDeepDiscoverer({
@@ -233,13 +842,21 @@ export async function runDeepDiscoverer({
   question,
   emitJourney,
 }: RunParams): Promise<DiscovererFinal> {
+  const normalizedQuestion = clean(question || diseaseQuery);
   const state: DiscoveryState = {
-    disease: null,
-    targets: [],
-    pathwaysByTarget: new Map<string, PathwayInfo[]>(),
-    drugsByTarget: new Map<string, DrugInfo[]>(),
-    litTrialByTarget: new Map<string, LitTrialInfo>(),
-    interactionNodes: [],
+    queryPlan: null,
+    diseaseById: new Map(),
+    targetById: new Map(),
+    pathwayById: new Map(),
+    drugById: new Map(),
+    pathwaysByTarget: new Map(),
+    drugsByTarget: new Map(),
+    interactionSymbols: new Set(),
+    nodes: new Map(),
+    edges: new Map(),
+    pubmedSubqueriesUsed: 0,
+    pubmedSubqueryHits: [],
+    bioMcpCounts: { articles: 0, trials: 0 },
   };
 
   let entryCounter = 0;
@@ -249,6 +866,8 @@ export async function runDeepDiscoverer({
     detail: string,
     source: DiscoverJourneyEntry["source"],
     entities: DiscoverEntity[] = [],
+    pathState?: DiscoverJourneyEntry["pathState"],
+    includeGraphPatch = kind === "tool_result" || kind === "followup" || kind === "branch" || kind === "insight",
   ) => {
     entryCounter += 1;
     emitJourney({
@@ -256,233 +875,429 @@ export async function runDeepDiscoverer({
       ts: new Date().toISOString(),
       kind,
       title,
-      detail,
+      detail: toNarrativeDetail(kind, detail),
       source,
+      pathState,
       entities,
+      graphPatch: includeGraphPatch ? buildGraphPatch(state) : undefined,
     });
   };
 
-  const resolveDisease = async (queryRaw: string) => {
-    const query = clean(queryRaw) || diseaseQuery;
-    const matches = await searchDiseases(query, 10);
-    const diseaseMatches = matches.filter((item) => diseaseEntityPattern.test(item.id));
-    const pool = diseaseMatches.length > 0 ? diseaseMatches : matches;
-    const selected =
-      pool.find((item) => item.id === diseaseIdHint) ??
-      pool.find((item) => item.name.toLowerCase() === query.toLowerCase()) ??
-      pool[0];
-
-    const resolved: DiseaseInfo = {
-      id: selected?.id ?? `QUERY_${query.replace(/\s+/g, "_")}`,
-      name: selected?.name ?? query,
-      description: selected?.description,
-    };
-
-    state.disease = resolved;
-    return resolved;
+  const upsertTargetNode = (target: TargetInfo) => {
+    state.targetById.set(target.id, target);
+    const key = upsertNode(state, {
+      type: "target",
+      label: target.symbol,
+      primaryId: target.id,
+    });
+    return key;
   };
 
-  const resolveDiseaseTool = tool(
-    async ({ query }) => {
-      push("tool_start", "Resolve disease", `Resolving disease entity for "${query}".`, "opentargets");
-      const resolved = await resolveDisease(query);
+  const upsertPathwayNode = (pathway: PathwayInfo) => {
+    state.pathwayById.set(pathway.id, pathway);
+    const key = upsertNode(state, {
+      type: "pathway",
+      label: pathway.name,
+      primaryId: pathway.id,
+    });
+    return key;
+  };
+
+  const upsertDrugNode = (drug: DrugInfo) => {
+    state.drugById.set(drug.id, drug);
+    const key = upsertNode(state, {
+      type: "drug",
+      label: drug.name,
+      primaryId: drug.id,
+    });
+    return key;
+  };
+
+  const linkDiseaseTarget = (disease: DiseaseInfo, target: TargetInfo, score: number) => {
+    const diseaseKey = upsertNode(state, {
+      type: "disease",
+      label: disease.name,
+      primaryId: disease.id,
+    });
+    const targetKey = upsertTargetNode(target);
+    upsertEdge(state, {
+      sourceKey: diseaseKey,
+      targetKey,
+      relation: "disease_target",
+      source: "opentargets",
+      score,
+      note: `${disease.name} -> ${target.symbol}`,
+    });
+  };
+
+  const linkTargetPathway = (targetSymbol: string, pathway: PathwayInfo) => {
+    const target = [...state.targetById.values()].find(
+      (row) => row.symbol.toUpperCase() === targetSymbol.toUpperCase(),
+    );
+    if (!target) return;
+    const targetKey = upsertTargetNode(target);
+    const pathwayKey = upsertPathwayNode(pathway);
+    upsertEdge(state, {
+      sourceKey: targetKey,
+      targetKey: pathwayKey,
+      relation: "target_pathway",
+      source: "reactome",
+      score: 0.52,
+      note: `${target.symbol} -> ${pathway.name}`,
+    });
+  };
+
+  const linkTargetDrug = (targetSymbol: string, drug: DrugInfo) => {
+    const target = [...state.targetById.values()].find(
+      (row) => row.symbol.toUpperCase() === targetSymbol.toUpperCase(),
+    );
+    if (!target) return;
+    const targetKey = upsertTargetNode(target);
+    const drugKey = upsertDrugNode(drug);
+    upsertEdge(state, {
+      sourceKey: targetKey,
+      targetKey: drugKey,
+      relation: "target_drug",
+      source: drug.source,
+      score: drug.source === "chembl" ? 0.58 : 0.5,
+      note: `${target.symbol} -> ${drug.name}`,
+    });
+  };
+
+  const linkTargetInteraction = (leftSymbol: string, rightSymbol: string, score: number) => {
+    const left = [...state.targetById.values()].find(
+      (row) => row.symbol.toUpperCase() === leftSymbol.toUpperCase(),
+    );
+    const right = [...state.targetById.values()].find(
+      (row) => row.symbol.toUpperCase() === rightSymbol.toUpperCase(),
+    );
+    if (!left || !right) return;
+    const leftKey = upsertTargetNode(left);
+    const rightKey = upsertTargetNode(right);
+    upsertEdge(state, {
+      sourceKey: leftKey,
+      targetKey: rightKey,
+      relation: "target_target",
+      source: "string",
+      score: clamp(score || 0.4, 0.2, 1),
+      note: `${left.symbol} -> ${right.symbol}`,
+    });
+  };
+
+  const resolveAnchorNodes = () => {
+    const anchors = state.queryPlan?.anchors ?? [];
+    const entities = anchors.slice(0, 8).map(nodeEntityFromAnchor);
+    for (const entity of entities) {
+      upsertNode(state, entity);
+    }
+
+    for (let index = 0; index < entities.length - 1; index += 1) {
+      const left = entities[index]!;
+      const right = entities[index + 1]!;
+      const leftKey = upsertNode(state, left);
+      const rightKey = upsertNode(state, right);
+      upsertEdge(state, {
+        sourceKey: leftKey,
+        targetKey: rightKey,
+        relation: "query_anchor",
+        source: "planner",
+        score: 0.3,
+        note: `${left.label} -> ${right.label} query anchor` ,
+      });
+    }
+
+    if (entities.length > 0) {
+      push(
+        "handoff",
+        "Planner handoff",
+        `${entities.length} anchors selected: ${entities.map((entity) => entity.label).join(", ")}`,
+        "planner",
+        entities,
+        "active",
+      );
+    }
+  };
+
+  const resolveEntityCandidatesTool = tool(
+    async ({ mention, expectedType }) => {
+      const query = clean(mention);
+      const expected = expectedType.toLowerCase();
+      push(
+        "tool_start",
+        "Resolve entity",
+        `Resolving ${expected} candidates for \"${query}\".`,
+        "opentargets",
+        [],
+        "active",
+      );
+
+      const candidates: Array<{ id: string; name: string; type: string; source: string }> = [];
+      if (expected === "disease" || expected === "unknown") {
+        const diseases = await searchDiseases(query, 8).catch(() => []);
+        for (const disease of diseases) {
+          if (!diseaseEntityPattern.test(disease.id)) continue;
+          candidates.push({ id: disease.id, name: disease.name, type: "disease", source: "opentargets" });
+        }
+      }
+
+      if (expected === "target" || expected === "unknown" || expected === "protein") {
+        const targets = await searchTargets(query, 8).catch(() => []);
+        for (const target of targets) {
+          candidates.push({ id: target.id, name: target.name, type: "target", source: "opentargets" });
+        }
+      }
+
+      if (expected === "drug" || expected === "unknown" || expected === "intervention") {
+        const [drugs, chemblDrugs] = await Promise.all([
+          searchDrugs(query, 6).catch(() => []),
+          getTargetActivityDrugs(query, 4).catch(() => []),
+        ]);
+        for (const drug of drugs) {
+          candidates.push({ id: drug.id, name: drug.name, type: "drug", source: "opentargets" });
+        }
+        for (const drug of chemblDrugs) {
+          candidates.push({ id: drug.moleculeId, name: drug.name, type: "drug", source: "chembl" });
+        }
+      }
+
+      const deduped = new Map<string, { id: string; name: string; type: string; source: string }>();
+      for (const candidate of candidates) {
+        const key = `${candidate.type}:${candidate.id}`;
+        if (!deduped.has(key)) deduped.set(key, candidate);
+      }
+      const out = [...deduped.values()].slice(0, 10);
+
+      for (const candidate of out) {
+        upsertNode(state, {
+          type: candidate.type as DiscoverEntity["type"],
+          label: candidate.name,
+          primaryId: candidate.id,
+        });
+      }
+
       push(
         "tool_result",
-        "Disease resolved",
-        `${resolved.name} (${resolved.id})`,
+        "Entity candidates resolved",
+        `${out.length} candidates found for \"${query}\".`,
         "opentargets",
-        [{ type: "disease", label: resolved.name, primaryId: resolved.id }],
+        out.slice(0, 6).map((candidate) => ({
+          type: candidate.type as DiscoverEntity["type"],
+          label: candidate.name,
+          primaryId: candidate.id,
+        })),
+        out.length > 0 ? "active" : "candidate",
       );
-      return JSON.stringify(resolved);
+
+      return JSON.stringify({ mention: query, candidates: out });
     },
     {
-      name: "resolve_disease",
+      name: "resolve_entity_candidates",
       description:
-        "Resolve a disease query into a disease ontology entity (EFO/MONDO/ORPHANET/DOID/HP).",
-      schema: resolveDiseaseSchema,
+        "Resolve disease/target/drug candidates for a free-text mention using MCP resolvers. Use this before retrieval when anchors are ambiguous.",
+      schema: z.object({
+        mention: z.string(),
+        expectedType: z.enum(["disease", "target", "drug", "intervention", "protein", "unknown"]),
+      }),
     },
   );
 
-  const topTargetsTool = tool(
-    async ({ diseaseId, limit }) => {
-      const activeDisease =
-        state.disease ?? (await resolveDisease(diseaseId || diseaseQuery));
-      const resolvedDiseaseId = clean(diseaseId) || activeDisease.id;
-      const size = clamp(limit, 3, 20);
+  const fetchDiseaseTargetsTool = tool(
+    async ({ diseaseIdOrName, limit }) => {
+      const query = clean(diseaseIdOrName);
+      const capped = clamp(limit, 3, 20);
       push(
         "tool_start",
         "Fetch top targets",
-        `Fetching ${size} disease-associated targets for ${activeDisease.name}.`,
+        `Fetching ${capped} disease-associated targets for ${query}.`,
         "opentargets",
-        [{ type: "disease", label: activeDisease.name, primaryId: resolvedDiseaseId }],
+        [{ type: "disease", label: query }],
+        "active",
       );
 
-      const rows = await getDiseaseTargetsSummary(resolvedDiseaseId, size);
-      state.targets = rows.slice(0, size).map((row) => ({
+      let disease = state.diseaseById.get(query) ?? null;
+      if (!disease) {
+        if (diseaseEntityPattern.test(query)) {
+          const matches = await searchDiseases(query, 4).catch(() => []);
+          const exact = matches.find((row) => row.id === query);
+          disease = {
+            id: query,
+            name: exact?.name ?? query,
+            description: exact?.description,
+          };
+          state.diseaseById.set(disease.id, disease);
+        } else {
+          disease = await resolveDisease(state, query, diseaseIdHint);
+        }
+      }
+
+      const rows = await getDiseaseTargetsSummary(disease.id, capped).catch(() => []);
+      const targets = rows.slice(0, capped).map((row) => ({
         id: row.targetId,
         symbol: row.targetSymbol,
         name: row.targetName,
         score: row.associationScore,
       }));
 
-      const entities = state.targets.slice(0, 6).map((target) => ({
-        type: "target" as const,
-        label: target.symbol,
-        primaryId: target.id,
-      }));
+      for (const target of targets) {
+        linkDiseaseTarget(disease, target, target.score);
+      }
 
       push(
         "tool_result",
         "Targets mapped",
-        `${state.targets.length} targets loaded (top: ${state.targets
-          .slice(0, 3)
-          .map((target) => target.symbol)
-          .join(", ")}).`,
+        `${targets.length} targets linked for ${disease.name}.`,
         "opentargets",
-        entities,
+        targets.slice(0, 8).map((target) => ({
+          type: "target",
+          label: target.symbol,
+          primaryId: target.id,
+        })),
+        targets.length > 0 ? "active" : "candidate",
       );
 
       return JSON.stringify({
-        disease: activeDisease,
-        targets: state.targets,
+        disease,
+        targets,
       });
     },
     {
-      name: "get_top_targets",
+      name: "fetch_disease_targets",
       description:
-        "Fetch top disease-associated targets with Open Targets evidence scores for a disease ID.",
-      schema: topTargetsSchema,
+        "Fetch top OpenTargets disease-associated targets by disease ID or disease name. This is the main disease->target evidence retrieval tool.",
+      schema: z.object({
+        diseaseIdOrName: z.string(),
+        limit: z.number().int().min(3).max(20),
+      }),
     },
   );
 
-  const pathwaysTool = tool(
-    async ({ symbolsCsv, perTarget }) => {
-      const symbols =
-        parseSymbolsCsv(symbolsCsv).length > 0
-          ? parseSymbolsCsv(symbolsCsv)
-          : state.targets.slice(0, 6).map((target) => target.symbol);
+  const fetchPathwaysTool = tool(
+    async ({ targetSymbolsCsv, perTarget }) => {
+      const symbols = uniqueSymbols(parseSymbolsCsv(targetSymbolsCsv));
+      const cappedPerTarget = clamp(perTarget, 1, 8);
+      const effectiveSymbols =
+        symbols.length > 0 ? symbols : uniqueSymbols([...state.targetById.values()].map((row) => row.symbol)).slice(0, 8);
 
-      const cappedPerTarget = clamp(perTarget, 1, 10);
       push(
         "tool_start",
         "Map pathways",
-        `Fetching Reactome pathways for ${symbols.length} targets.`,
+        `Fetching Reactome pathways for ${effectiveSymbols.length} targets.`,
         "reactome",
-        symbols.slice(0, 5).map((symbol) => ({ type: "target", label: symbol })),
+        effectiveSymbols.slice(0, 8).map((symbol) => ({ type: "target", label: symbol })),
+        "active",
       );
 
-      const mapped = await Promise.all(
-        symbols.map(async (symbol) => ({
-          symbol,
-          pathways: (await findPathwaysByGene(symbol)).slice(0, cappedPerTarget),
-        })),
-      );
-
-      const uniquePathways = new Map<string, PathwayInfo>();
-      for (const item of mapped) {
-        const pathways = item.pathways.map((pathway) => ({
-          id: pathway.id,
-          name: Array.isArray(pathway.name)
-            ? pathway.name.map((entry) => String(entry)).join(", ")
-            : String(pathway.name),
+      let linkCount = 0;
+      for (const symbol of effectiveSymbols) {
+        const rows = await findPathwaysByGene(symbol).catch(() => []);
+        const pathways = rows.slice(0, cappedPerTarget).map((row) => ({
+          id: row.id,
+          name: Array.isArray(row.name)
+            ? row.name.map((item) => String(item)).join(", ")
+            : String(row.name),
         }));
-        state.pathwaysByTarget.set(item.symbol, pathways);
+        state.pathwaysByTarget.set(symbol, pathways);
         for (const pathway of pathways) {
-          uniquePathways.set(pathway.id, pathway);
+          linkTargetPathway(symbol, pathway);
+          linkCount += 1;
         }
       }
 
       push(
         "tool_result",
         "Pathways mapped",
-        `${uniquePathways.size} pathways linked across ${symbols.length} targets.`,
+        `${linkCount} pathway links mapped from ${effectiveSymbols.length} targets.`,
         "reactome",
-        [...uniquePathways.values()].slice(0, 6).map((pathway) => ({
+        [...state.pathwayById.values()].slice(0, 8).map((pathway) => ({
           type: "pathway",
           label: pathway.name,
           primaryId: pathway.id,
         })),
+        linkCount > 0 ? "active" : "candidate",
       );
 
       return JSON.stringify({
-        targets: symbols,
         pathwaysByTarget: Object.fromEntries(
           [...state.pathwaysByTarget.entries()].map(([symbol, pathways]) => [symbol, pathways]),
         ),
       });
     },
     {
-      name: "get_pathways_for_targets",
+      name: "fetch_target_pathways",
       description:
-        "Fetch Reactome pathways for target symbols and return pathway associations per target.",
-      schema: pathwaysSchema,
+        "Fetch Reactome pathways for target symbols. Use this to populate mechanistic hops between targets and pathway processes.",
+      schema: z.object({
+        targetSymbolsCsv: z.string(),
+        perTarget: z.number().int().min(1).max(8),
+      }),
     },
   );
 
-  const drugsTool = tool(
-    async ({ symbolsCsv, perTarget }) => {
-      const symbols =
-        parseSymbolsCsv(symbolsCsv).length > 0
-          ? parseSymbolsCsv(symbolsCsv)
-          : state.targets.slice(0, 6).map((target) => target.symbol);
-      const cappedPerTarget = clamp(perTarget, 1, 10);
+  const fetchDrugsTool = tool(
+    async ({ targetSymbolsCsv, perTarget }) => {
+      const symbols = uniqueSymbols(parseSymbolsCsv(targetSymbolsCsv));
+      const cappedPerTarget = clamp(perTarget, 1, 8);
+      const effectiveSymbols =
+        symbols.length > 0 ? symbols : uniqueSymbols([...state.targetById.values()].map((row) => row.symbol)).slice(0, 8);
 
       push(
         "tool_start",
         "Map drugability",
-        `Fetching OpenTargets + ChEMBL compounds for ${symbols.length} targets.`,
+        `Fetching compound evidence for ${effectiveSymbols.length} targets.`,
         "chembl",
-        symbols.slice(0, 5).map((symbol) => ({ type: "target", label: symbol })),
+        effectiveSymbols.slice(0, 8).map((symbol) => ({ type: "target", label: symbol })),
+        "active",
       );
 
-      await Promise.all(
-        symbols.map(async (symbol) => {
-          const target = state.targets.find((item) => item.symbol === symbol);
-          const [known, activity] = await Promise.allSettled([
-            target
-              ? getKnownDrugsForTarget(target.id, cappedPerTarget)
-              : Promise.resolve([]),
-            getTargetActivityDrugs(symbol, cappedPerTarget),
-          ]);
+      let linkCount = 0;
+      for (const symbol of effectiveSymbols) {
+        const target = [...state.targetById.values()].find(
+          (row) => row.symbol.toUpperCase() === symbol.toUpperCase(),
+        );
+        const [known, activity] = await Promise.allSettled([
+          target ? getKnownDrugsForTarget(target.id, cappedPerTarget) : Promise.resolve([]),
+          getTargetActivityDrugs(symbol, cappedPerTarget),
+        ]);
 
-          const options = new Map<string, DrugInfo>();
-          if (known.status === "fulfilled") {
-            for (const drug of known.value) {
-              options.set(drug.drugId, {
-                id: drug.drugId,
-                name: drug.name,
-                source: "opentargets",
-              });
-            }
+        const merged = new Map<string, DrugInfo>();
+        if (known.status === "fulfilled") {
+          for (const row of known.value) {
+            merged.set(row.drugId, {
+              id: row.drugId,
+              name: row.name,
+              source: "opentargets",
+            });
           }
-          if (activity.status === "fulfilled") {
-            for (const drug of activity.value) {
-              options.set(drug.moleculeId, {
-                id: drug.moleculeId,
-                name: drug.name,
-                source: "chembl",
-              });
-            }
+        }
+        if (activity.status === "fulfilled") {
+          for (const row of activity.value) {
+            merged.set(row.moleculeId, {
+              id: row.moleculeId,
+              name: row.name,
+              source: "chembl",
+            });
           }
-          state.drugsByTarget.set(symbol, [...options.values()].slice(0, cappedPerTarget));
-        }),
-      );
+        }
 
-      const unique = new Map<string, DrugInfo>();
-      for (const list of state.drugsByTarget.values()) {
-        for (const drug of list) unique.set(drug.id, drug);
+        const drugs = [...merged.values()].slice(0, cappedPerTarget);
+        state.drugsByTarget.set(symbol, drugs);
+        for (const drug of drugs) {
+          linkTargetDrug(symbol, drug);
+          linkCount += 1;
+        }
       }
 
       push(
         "tool_result",
-        "Drugability mapped",
-        `${unique.size} compounds linked across ${symbols.length} targets.`,
+        "Druggability mapped",
+        `${linkCount} target-drug links mapped.`,
         "chembl",
-        [...unique.values()].slice(0, 8).map((drug) => ({
+        [...state.drugById.values()].slice(0, 8).map((drug) => ({
           type: "drug",
           label: drug.name,
           primaryId: drug.id,
         })),
+        linkCount > 0 ? "active" : "candidate",
       );
 
       return JSON.stringify({
@@ -492,269 +1307,1052 @@ export async function runDeepDiscoverer({
       });
     },
     {
-      name: "get_drugs_for_targets",
+      name: "fetch_target_drugs",
       description:
-        "Fetch compounds associated with target symbols using OpenTargets known drugs and ChEMBL activities.",
-      schema: drugsSchema,
+        "Fetch compounds linked to targets using OpenTargets known drugs and ChEMBL activity evidence.",
+      schema: z.object({
+        targetSymbolsCsv: z.string(),
+        perTarget: z.number().int().min(1).max(8),
+      }),
     },
   );
 
-  const interactionsTool = tool(
-    async ({ symbolsCsv, confidence, maxNeighbors }) => {
-      const symbols =
-        parseSymbolsCsv(symbolsCsv).length > 0
-          ? parseSymbolsCsv(symbolsCsv)
-          : state.targets.slice(0, 8).map((target) => target.symbol);
+  const fetchInteractionsTool = tool(
+    async ({ targetSymbolsCsv, confidence, maxNeighbors }) => {
+      const symbols = uniqueSymbols(parseSymbolsCsv(targetSymbolsCsv));
+      const effectiveSymbols =
+        symbols.length > 0 ? symbols : uniqueSymbols([...state.targetById.values()].map((row) => row.symbol)).slice(0, 12);
       const conf = clamp(confidence, 0.1, 1);
-      const neighbors = clamp(maxNeighbors, 5, 80);
+      const maxN = clamp(maxNeighbors, 8, 80);
 
       push(
         "tool_start",
         "Map interaction neighborhood",
-        `Fetching STRING neighborhood (confidence ${conf.toFixed(2)}).`,
+        `Fetching STRING neighborhood for ${effectiveSymbols.length} targets (conf ${conf.toFixed(2)}).`,
         "string",
-        symbols.slice(0, 6).map((symbol) => ({ type: "target", label: symbol })),
+        effectiveSymbols.slice(0, 8).map((symbol) => ({ type: "target", label: symbol })),
+        "active",
       );
 
-      const interaction = await getInteractionNetwork(symbols, conf, neighbors);
-      state.interactionNodes = interaction.nodes.map((node) => node.symbol);
+      const network = await getInteractionNetwork(effectiveSymbols, conf, maxN).catch(() => ({
+        nodes: [],
+        edges: [],
+      }));
+
+      for (const node of network.nodes) {
+        const symbol = clean(node.symbol).toUpperCase();
+        if (!symbol) continue;
+        state.interactionSymbols.add(symbol);
+      }
+
+      for (const edge of network.edges) {
+        linkTargetInteraction(edge.sourceSymbol, edge.targetSymbol, edge.score);
+      }
 
       push(
         "tool_result",
         "Interaction network mapped",
-        `${interaction.nodes.length} nodes and ${interaction.edges.length} interaction edges.`,
+        `${network.nodes.length} interaction nodes and ${network.edges.length} edges mapped.`,
         "string",
-        interaction.nodes.slice(0, 8).map((node) => ({
+        network.nodes.slice(0, 8).map((node) => ({
           type: "interaction",
           label: node.symbol,
           primaryId: node.id,
         })),
+        network.edges.length > 0 ? "active" : "candidate",
       );
 
       return JSON.stringify({
-        interactionNodes: interaction.nodes,
-        interactionEdges: interaction.edges,
+        nodes: network.nodes,
+        edges: network.edges,
       });
     },
     {
-      name: "get_interaction_neighborhood",
+      name: "fetch_interaction_neighbors",
       description:
-        "Fetch STRING interaction neighborhood for target symbols with configurable confidence and neighborhood size.",
-      schema: interactionsSchema,
+        "Fetch STRING interaction neighborhood for seed targets. Use this to test bridge hops between anchors.",
+      schema: z.object({
+        targetSymbolsCsv: z.string(),
+        confidence: z.number().min(0.1).max(1),
+        maxNeighbors: z.number().int().min(8).max(80),
+      }),
     },
   );
 
-  const literatureTool = tool(
-    async ({ symbolsCsv, perTarget }) => {
-      const symbols =
-        parseSymbolsCsv(symbolsCsv).length > 0
-          ? parseSymbolsCsv(symbolsCsv)
-          : state.targets.slice(0, 4).map((target) => target.symbol);
-      const capped = clamp(perTarget, 1, 6);
-      const diseaseName = state.disease?.name ?? diseaseQuery;
+  const collectBioMcpTool = tool(
+    async ({ diseaseName, targetSymbol, interventionHint }) => {
+      const disease = clean(diseaseName);
+      const target = clean(targetSymbol);
+      const intervention = clean(interventionHint ?? "");
+      if (!disease || !target) {
+        return JSON.stringify({ articles: 0, trials: 0 });
+      }
 
       push(
         "tool_start",
         "Collect literature/trials",
-        `Fetching BioMCP snippets for ${symbols.length} targets.`,
+        `Collecting BioMCP snippets for ${disease} / ${target}.`,
         "biomcp",
-        symbols.slice(0, 4).map((symbol) => ({ type: "target", label: symbol })),
+        [
+          { type: "disease", label: disease },
+          { type: "target", label: target },
+        ],
+        "active",
       );
 
-      await Promise.all(
-        symbols.slice(0, capped).map(async (symbol) => {
-          const firstDrug = state.drugsByTarget.get(symbol)?.[0]?.name;
-          const enrichment = await getLiteratureAndTrials(diseaseName, symbol, firstDrug);
-          state.litTrialByTarget.set(symbol, {
-            articles: enrichment.articles.length,
-            trials: enrichment.trials.length,
-          });
-        }),
+      const data = await getLiteratureAndTrials(disease, target, intervention || undefined).catch(
+        () => ({ articles: [], trials: [] }),
       );
-
-      const articleTotal = [...state.litTrialByTarget.values()].reduce(
-        (acc, row) => acc + row.articles,
-        0,
-      );
-      const trialTotal = [...state.litTrialByTarget.values()].reduce(
-        (acc, row) => acc + row.trials,
-        0,
-      );
+      state.bioMcpCounts.articles += data.articles.length;
+      state.bioMcpCounts.trials += data.trials.length;
 
       push(
         "tool_result",
-        "Literature/trials collected",
-        `${articleTotal} article snippets and ${trialTotal} trial snippets captured.`,
+        "BioMCP evidence collected",
+        `${data.articles.length} article snippets and ${data.trials.length} trial snippets collected.`,
         "biomcp",
+        [],
+        data.articles.length + data.trials.length > 0 ? "active" : "candidate",
       );
 
       return JSON.stringify({
-        literatureByTarget: Object.fromEntries(state.litTrialByTarget.entries()),
+        articleCount: data.articles.length,
+        trialCount: data.trials.length,
       });
     },
     {
-      name: "get_literature_trials_for_targets",
+      name: "collect_biomcp_evidence",
       description:
-        "Fetch article and trial snippet counts for a short target list in the disease context.",
-      schema: literatureSchema,
+        "Collect BioMCP article/trial snippets for disease-target context and optional intervention.",
+      schema: z.object({
+        diseaseName: z.string(),
+        targetSymbol: z.string(),
+        interventionHint: z.string(),
+      }),
     },
   );
 
-  const tools = [
-    resolveDiseaseTool,
-    topTargetsTool,
-    pathwaysTool,
-    drugsTool,
-    interactionsTool,
-    literatureTool,
+  const collectPubmedPairTool = tool(
+    async ({ diseaseName, targetSymbol, limit }) => {
+      const disease = clean(diseaseName);
+      const target = clean(targetSymbol);
+      const capped = clamp(limit, 1, 6);
+      if (!disease || !target) {
+        return JSON.stringify({ articles: [] });
+      }
+
+      if (state.pubmedSubqueriesUsed >= MAX_PUBMED_SUBQUERIES) {
+        push(
+          "warning",
+          "PubMed budget exhausted",
+          `Skipping pair query for ${disease} / ${target} because budget is ${MAX_PUBMED_SUBQUERIES}.`,
+          "pubmed",
+          [
+            { type: "disease", label: disease },
+            { type: "target", label: target },
+          ],
+          "discarded",
+        );
+        return JSON.stringify({ articles: [], budgetExhausted: true });
+      }
+
+      state.pubmedSubqueriesUsed += 1;
+      push(
+        "tool_start",
+        "Collect PubMed evidence",
+        `Pair query ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}: ${target} AND ${disease}.`,
+        "pubmed",
+        [
+          { type: "disease", label: disease },
+          { type: "target", label: target },
+        ],
+        "active",
+      );
+
+      const articles = await getPubmedArticles(disease, target, capped).catch(() => []);
+      state.pubmedSubqueryHits.push({ query: `${target} AND ${disease}`, articles });
+
+      if (articles.length > 0) {
+        const targetNode = [...state.targetById.values()].find(
+          (row) => row.symbol.toUpperCase() === target.toUpperCase(),
+        );
+        if (targetNode) {
+          const targetKey = upsertTargetNode(targetNode);
+          const evidenceKey = upsertNode(state, {
+            type: "effect",
+            label: `PubMed: ${target} / ${disease}`,
+            primaryId: `PUBMED_${target}_${disease}`,
+          });
+          upsertEdge(state, {
+            sourceKey: targetKey,
+            targetKey: evidenceKey,
+            relation: "pubmed_support",
+            source: "pubmed",
+            score: 0.45,
+            note: `${articles.length} PubMed articles`,
+          });
+        }
+      }
+
+      push(
+        "tool_result",
+        "PubMed pair evidence",
+        `${articles.length} articles collected for ${target} / ${disease}.`,
+        "pubmed",
+        articles.slice(0, 3).map((article) => ({
+          type: "effect",
+          label: article.title,
+          primaryId: article.id,
+        })),
+        articles.length > 0 ? "active" : "candidate",
+      );
+
+      return JSON.stringify({
+        query: `${target} AND ${disease}`,
+        articleCount: articles.length,
+      });
+    },
+    {
+      name: "collect_pubmed_pair_evidence",
+      description:
+        "Collect PubMed evidence for disease-target pairs. This consumes from a strict max-5 PubMed query budget.",
+      schema: z.object({
+        diseaseName: z.string(),
+        targetSymbol: z.string(),
+        limit: z.number().int().min(1).max(6),
+      }),
+    },
+  );
+
+  const searchPubmedSubqueryTool = tool(
+    async ({ subquery, limit }) => {
+      const query = compact(subquery, 260);
+      const capped = clamp(limit, 1, 6);
+      if (!query) {
+        return JSON.stringify({ articles: [] });
+      }
+
+      if (state.pubmedSubqueriesUsed >= MAX_PUBMED_SUBQUERIES) {
+        push(
+          "warning",
+          "PubMed budget exhausted",
+          `Skipping subquery \"${query}\" because budget is ${MAX_PUBMED_SUBQUERIES}.`,
+          "pubmed",
+          [],
+          "discarded",
+        );
+        return JSON.stringify({ query, articleCount: 0, budgetExhausted: true });
+      }
+
+      state.pubmedSubqueriesUsed += 1;
+      push(
+        "tool_start",
+        "Run PubMed subquery",
+        `Subquery ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}: ${query}`,
+        "pubmed",
+        [],
+        "active",
+      );
+
+      const articles = await searchPubmedByQuery(query, capped).catch(() => []);
+      state.pubmedSubqueryHits.push({ query, articles });
+
+      push(
+        "tool_result",
+        "PubMed subquery complete",
+        `${articles.length} articles returned for subquery.`,
+        "pubmed",
+        articles.slice(0, 3).map((article) => ({
+          type: "effect",
+          label: article.title,
+          primaryId: article.id,
+        })),
+        articles.length > 0 ? "active" : "candidate",
+      );
+
+      return JSON.stringify({ query, articleCount: articles.length });
+    },
+    {
+      name: "search_pubmed_subquery",
+      description:
+        "Run one free-text PubMed subquery for bridge/mechanism evidence. Use sparingly; global budget is max 5 subqueries per run.",
+      schema: z.object({
+        subquery: z.string(),
+        limit: z.number().int().min(1).max(6),
+      }),
+    },
+  );
+
+  const recursiveExpandTool = tool(
+    async ({ seedSymbolsCsv, hops, perHop }) => {
+      const seeds = uniqueSymbols(parseSymbolsCsv(seedSymbolsCsv));
+      const hopCount = clamp(hops, 1, 3);
+      const perHopLimit = clamp(perHop, 2, 8);
+      let frontier = seeds.length > 0
+        ? seeds.slice(0, perHopLimit)
+        : uniqueSymbols([...state.targetById.values()].map((row) => row.symbol)).slice(0, perHopLimit);
+
+      let addedTotal = 0;
+      for (let hop = 1; hop <= hopCount; hop += 1) {
+        if (frontier.length === 0) break;
+        push(
+          "tool_start",
+          `Recursive multihop expansion (hop ${hop}/${hopCount})`,
+          `Expanding frontier: ${frontier.join(", ")}.`,
+          "agent",
+          frontier.map((symbol) => ({ type: "target", label: symbol })),
+          "candidate",
+        );
+
+        const network = await getInteractionNetwork(frontier, 0.72, clamp(perHopLimit * 6, 10, 60)).catch(
+          () => ({ nodes: [], edges: [] }),
+        );
+
+        const nextFrontier: string[] = [];
+        for (const edge of network.edges) {
+          linkTargetInteraction(edge.sourceSymbol, edge.targetSymbol, edge.score);
+        }
+
+        for (const node of network.nodes) {
+          const symbol = clean(node.symbol).toUpperCase();
+          if (!symbol) continue;
+          if (frontier.includes(symbol)) continue;
+          if (state.targetById.has(symbol)) continue;
+          nextFrontier.push(symbol);
+        }
+
+        const newlyResolved: TargetInfo[] = [];
+        for (const candidate of uniqueSymbols(nextFrontier).slice(0, perHopLimit)) {
+          const hits = await searchTargets(candidate, 3).catch(() => []);
+          const hit = hits[0];
+          const target: TargetInfo = {
+            id: hit?.id ?? `TARGET_${candidate}`,
+            symbol: hit?.name ?? candidate,
+            name: hit?.name ?? candidate,
+            score: hit ? 0.35 : 0.2,
+          };
+          if (!state.targetById.has(target.id)) {
+            state.targetById.set(target.id, target);
+            upsertTargetNode(target);
+            newlyResolved.push(target);
+          }
+        }
+
+        addedTotal += newlyResolved.length;
+        frontier = newlyResolved.map((row) => row.symbol).slice(0, perHopLimit);
+
+        push(
+          "tool_result",
+          `Recursive hop ${hop} result`,
+          `${newlyResolved.length} new targets added from frontier expansion.`,
+          "agent",
+          newlyResolved.slice(0, 6).map((target) => ({
+            type: "target",
+            label: target.symbol,
+            primaryId: target.id,
+          })),
+          newlyResolved.length > 0 ? "active" : "discarded",
+        );
+      }
+
+      return JSON.stringify({
+        addedTargets: addedTotal,
+      });
+    },
+    {
+      name: "recursive_expand_multihop",
+      description:
+        "Expand multihop target frontier using STRING neighbors and target resolver followups.",
+      schema: z.object({
+        seedSymbolsCsv: z.string(),
+        hops: z.number().int().min(1).max(3),
+        perHop: z.number().int().min(2).max(8),
+      }),
+    },
+  );
+
+  const toolset = [
+    resolveEntityCandidatesTool,
+    fetchDiseaseTargetsTool,
+    fetchPathwaysTool,
+    fetchDrugsTool,
+    fetchInteractionsTool,
+    collectBioMcpTool,
+    collectPubmedPairTool,
+    searchPubmedSubqueryTool,
+    recursiveExpandTool,
   ];
 
-  const model = new ChatOpenAI({
-    model: appConfig.openai.model,
-    temperature: 0,
-    apiKey: appConfig.openAiApiKey,
+  const modelDecision = chooseDiscovererModel({
+    diseaseQuery,
+    question: normalizedQuestion,
   });
 
-  const subagents: SubAgent[] = [
-    {
-      name: "pathway_mapper",
-      description:
-        "Maps disease -> target -> pathway -> interaction structure and identifies mechanistic bottlenecks.",
-      systemPrompt: [
-        "You are a pathway cartographer supporting a translational biologist.",
-        "Objective: find one biologically coherent disease -> target -> pathway -> interaction thread.",
-        "Tool plan: resolve_disease -> get_top_targets (8-12) -> get_pathways_for_targets -> get_interaction_neighborhood.",
-        "Prioritize pathway coherence and network plausibility over novelty for novelty's sake.",
-        "Report outputs with named entities and explicit unknowns.",
-        "Never invent pathway IDs, interaction evidence, or biological claims beyond returned tools.",
-      ].join(" "),
-      tools,
-      model,
-    },
-    {
-      name: "translational_scout",
-      description:
-        "Maps target -> compound -> evidence layers and proposes tractable intervention threads.",
-      systemPrompt: [
-        "You are a translational scout supporting target nomination decisions.",
-        "Objective: identify tractable compounds and translational caveats for top targets.",
-        "Tool plan: resolve_disease -> get_top_targets (8-12) -> get_drugs_for_targets -> get_literature_trials_for_targets.",
-        "Rank threads by tractability and evidence support, not by speculative novelty.",
-        "Call out missing evidence explicitly (not provided / unavailable).",
-        "Never invent compounds, trials, or efficacy claims.",
-      ].join(" "),
-      tools,
-      model,
-    },
-  ];
-
-  const agent = createAgent({
-    model,
-    tools,
-    middleware: [
-      createSubAgentMiddleware({
-        defaultModel: model,
-        defaultTools: tools,
-        subagents,
-      }),
-      createPatchToolCallsMiddleware(),
-    ],
-    responseFormat: agentResponseSchema,
-    systemPrompt: [
-      "You are TargetGraph Discoverer, a biomedical decision-support orchestrator.",
-      "Your audience is a translational biology program lead deciding the next experiment.",
-      "You MUST delegate in parallel using task tool to pathway_mapper and translational_scout.",
-      "After subagent outputs, synthesize one primary mechanism thread and 2-3 alternates.",
-      "Use only tool outputs; do not invent pathways, compounds, literature, or trial evidence.",
-      "No clinical recommendation language. No efficacy claims.",
-      "If evidence is missing, write 'not provided' and list concrete follow-up assays/data pulls.",
-      "Keep language concise and technical enough for a domain expert.",
-    ].join(" "),
+  const mainModel = new ChatOpenAI({
+    model: modelDecision.model,
+    apiKey: appConfig.openAiApiKey,
+  });
+  const subagentModel = new ChatOpenAI({
+    model: appConfig.openai.smallModel,
+    apiKey: appConfig.openAiApiKey,
   });
 
   push(
     "phase",
-    "Agentic workflow started",
-    "Launching parallel pathway mapping and translational scouting using DeepAgents task delegation.",
+    "Model routing",
+    `Using ${modelDecision.model} (${modelDecision.reason}).`,
     "agent",
+    [],
+    "active",
   );
+
+  push(
+    "phase",
+    "Query planner",
+    "Resolving typed anchors and constraints from resolver candidates.",
+    "planner",
+    [],
+    "active",
+  );
+
+  try {
+    state.queryPlan = await withTimeout(planQuery(normalizedQuestion), 18_000, "query plan");
+  } catch (error) {
+    push(
+      "warning",
+      "Query planner degraded",
+      `Planner failed, continuing with minimal anchors (${error instanceof Error ? error.message : "unknown"}).`,
+      "planner",
+      [],
+      "candidate",
+    );
+    state.queryPlan = {
+      query: normalizedQuestion,
+      intent: "multihop-discovery",
+      anchors: [],
+      constraints: [],
+      unresolvedMentions: [],
+      followups: [],
+      rationale: "planner unavailable",
+    };
+  }
+
+  resolveAnchorNodes();
+
+  const diseaseMentions = resolveDiseaseCandidatesFromPlan(state.queryPlan, diseaseQuery || normalizedQuestion);
+  for (const mention of diseaseMentions.slice(0, 3)) {
+    try {
+      const disease = await resolveDisease(state, mention, diseaseIdHint);
+      push(
+        "tool_result",
+        "Disease resolved",
+        `${disease.name} (${disease.id})`,
+        "opentargets",
+        [{ type: "disease", label: disease.name, primaryId: disease.id }],
+        "active",
+      );
+    } catch {
+      push(
+        "warning",
+        "Disease resolver degraded",
+        `Could not resolve disease mention: ${mention}`,
+        "opentargets",
+        [{ type: "disease", label: mention }],
+        "candidate",
+      );
+    }
+  }
+
+  const deterministicBackfill = async (reason: string) => {
+    push(
+      "insight",
+      "Deterministic recovery",
+      `Running deterministic retrieval (${reason}) to keep graph and narration live.`,
+      "agent",
+      [],
+      "candidate",
+    );
+
+    const disease = [...state.diseaseById.values()][0];
+    if (disease) {
+      const rows = await getDiseaseTargetsSummary(disease.id, 10).catch(() => []);
+      const targets = rows.slice(0, 10).map((row) => ({
+        id: row.targetId,
+        symbol: row.targetSymbol,
+        name: row.targetName,
+        score: row.associationScore,
+      }));
+      for (const target of targets) {
+        linkDiseaseTarget(disease, target, target.score);
+      }
+
+      const topSymbols = targets.slice(0, 4).map((target) => target.symbol);
+      for (const symbol of topSymbols) {
+        const pathways = await findPathwaysByGene(symbol).catch(() => []);
+        const compactPathways = pathways.slice(0, 2).map((row) => ({
+          id: row.id,
+          name: Array.isArray(row.name)
+            ? row.name.map((item) => String(item)).join(", ")
+            : String(row.name),
+        }));
+        state.pathwaysByTarget.set(symbol, compactPathways);
+        for (const pathway of compactPathways) {
+          linkTargetPathway(symbol, pathway);
+        }
+
+        const activity = await getTargetActivityDrugs(symbol, 2).catch(() => []);
+        const compounds = activity.slice(0, 2).map((row) => ({
+          id: row.moleculeId,
+          name: row.name,
+          source: "chembl" as const,
+        }));
+        state.drugsByTarget.set(symbol, compounds);
+        for (const drug of compounds) {
+          linkTargetDrug(symbol, drug);
+        }
+
+        if (state.pubmedSubqueriesUsed < MAX_PUBMED_SUBQUERIES) {
+          state.pubmedSubqueriesUsed += 1;
+          const articles = await getPubmedArticles(disease.name, symbol, 2).catch(() => []);
+          state.pubmedSubqueryHits.push({ query: `${symbol} AND ${disease.name}`, articles });
+        }
+      }
+    }
+  };
 
   if (!appConfig.openAiApiKey) {
     push(
       "warning",
       "OpenAI key missing",
-      "Using deterministic fallback summary without LLM synthesis.",
+      "Using deterministic retrieval only because OPENAI_API_KEY is not set.",
       "agent",
+      [],
+      "discarded",
     );
-
-    await resolveDisease(diseaseQuery);
-    const diseaseId = state.disease?.id ?? "";
-    if (diseaseId) {
-      state.targets = (await getDiseaseTargetsSummary(diseaseId, 8)).map((target) => ({
-        id: target.targetId,
-        symbol: target.targetSymbol,
-        name: target.targetName,
-        score: target.associationScore,
-      }));
-    }
-
-    return buildFallbackSummary(state);
+    await deterministicBackfill("openai-key-missing");
+    return buildFallbackSummary(state, normalizedQuestion);
   }
 
-  try {
-    const response = await agent.invoke({
-      messages: [
-        {
-          role: "user",
-          content: [
-            `Disease query: ${diseaseQuery}`,
-            `Preferred disease ID (if provided): ${diseaseIdHint ?? "not provided"}`,
-            `Question: ${question}`,
-            "",
-            "Deliver exactly:",
-            "1) Direct answer in 2-4 sentences naming one primary disease->target->pathway->drug thread.",
-            "2) 3 concise mechanism findings with named entities.",
-            "3) Caveats focused on data gaps and degraded sources.",
-            "4) Next actions as concrete experiments/validation tasks a biologist can run.",
-          ].join("\n"),
-        },
-      ],
-    });
+  if (isOpenAiRateLimited()) {
+    push(
+      "warning",
+      "OpenAI temporarily unavailable",
+      "Using deterministic retrieval while rate limits recover.",
+      "agent",
+      [],
+      "candidate",
+    );
+    await deterministicBackfill("openai-rate-limit");
+    return buildFallbackSummary(state, normalizedQuestion);
+  }
 
-    const structured = response.structuredResponse;
-    const thread = toThread(state);
-    const keyFindings = [
-      `Top target set size: ${state.targets.length}`,
-      `Pathway links: ${[...state.pathwaysByTarget.values()].reduce((acc, arr) => acc + arr.length, 0)}`,
-      `Drug links: ${[...state.drugsByTarget.values()].reduce((acc, arr) => acc + arr.length, 0)}`,
-      `Interaction neighbors: ${state.interactionNodes.length}`,
+  const coordinatorAgent = createAgent({
+    model: mainModel,
+    tools: [],
+    responseFormat: coordinatorPlanSchema,
+    systemPrompt: [
+      "You are a coordinator for a multihop biomedical discovery workflow.",
+      "Plan query-specific tasks, do not produce generic disease pipelines.",
+      "The system has specialized subagents: pathway_mapper, translational_scout, bridge_hunter, literature_scout.",
+      "Return max 6 tasks, each with subagent, objective, and seed entities.",
+      `Return max ${MAX_PUBMED_SUBQUERIES} PubMed subqueries tailored to this question.`,
+      "Subqueries should be specific and mechanism-oriented, not boilerplate.",
+      "If the query has multiple anchors, include at least one bridge_hunter task.",
+      "If the query is mechanism/explain style, include at least one translational_scout or pathway_mapper task.",
+    ].join(" "),
+  });
+
+  const subagentContext = {
+    query: normalizedQuestion,
+    queryPlan: state.queryPlan
+      ? {
+          intent: state.queryPlan.intent,
+          anchors: state.queryPlan.anchors.map((anchor) => ({
+            mention: anchor.mention,
+            entityType: anchor.entityType,
+            id: anchor.id,
+            name: anchor.name,
+            confidence: anchor.confidence,
+          })),
+          constraints: state.queryPlan.constraints,
+          followups: state.queryPlan.followups,
+        }
+      : null,
+  };
+
+  const subagentPromptCommon = [
+    "Use tools to gather real evidence. Do not invent data.",
+    "Prioritize anchor-specific subqueries and follow-up retrievals.",
+    "If evidence is weak, mark pathState as candidate or discarded with explicit gaps.",
+    "Return concise findings with named entities and mechanistic steps.",
+  ].join(" ");
+
+  const pathwayMapperAgent = createAgent({
+    model: subagentModel,
+    tools: toolset,
+    responseFormat: subagentReportSchema,
+    systemPrompt: [
+      "You are pathway_mapper.",
+      "Goal: map target/pathway/interactions that answer the exact query.",
+      "Prefer fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
+      "Use resolve_entity_candidates when anchors are ambiguous.",
+      subagentPromptCommon,
+    ].join(" "),
+  });
+
+  const translationalScoutAgent = createAgent({
+    model: subagentModel,
+    tools: toolset,
+    responseFormat: subagentReportSchema,
+    systemPrompt: [
+      "You are translational_scout.",
+      "Goal: map target->drug/moa evidence and identify tractable mechanistic threads.",
+      "Prefer fetch_target_drugs, fetch_target_pathways, collect_biomcp_evidence, collect_pubmed_pair_evidence, search_pubmed_subquery.",
+      "Use recursive_expand_multihop when direct links are weak.",
+      subagentPromptCommon,
+    ].join(" "),
+  });
+
+  const bridgeHunterAgent = createAgent({
+    model: subagentModel,
+    tools: toolset,
+    responseFormat: subagentReportSchema,
+    systemPrompt: [
+      "You are bridge_hunter.",
+      "Goal: connect multiple query anchors through explicit intermediate entities.",
+      "Never claim direct bridge unless intermediate nodes are mapped.",
+      "Prefer resolve_entity_candidates, fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
+      subagentPromptCommon,
+    ].join(" "),
+  });
+
+  const literatureScoutAgent = createAgent({
+    model: subagentModel,
+    tools: toolset,
+    responseFormat: subagentReportSchema,
+    systemPrompt: [
+      "You are literature_scout.",
+      "Goal: generate focused PubMed/BioMCP evidence for active mechanistic branches.",
+      "Use max-precision subqueries and tie each evidence pull to an active entity pair.",
+      "Prefer search_pubmed_subquery, collect_pubmed_pair_evidence, collect_biomcp_evidence.",
+      subagentPromptCommon,
+    ].join(" "),
+  });
+
+  const subagentMap: Record<CoordinatorTask["subagent"], ReturnType<typeof createAgent>> = {
+    pathway_mapper: pathwayMapperAgent,
+    translational_scout: translationalScoutAgent,
+    bridge_hunter: bridgeHunterAgent,
+    literature_scout: literatureScoutAgent,
+  };
+
+  const runSubagentTask = async (task: CoordinatorTask): Promise<SubagentReport> => {
+    push(
+      "handoff",
+      "Subagent handoff",
+      `${task.subagent}: ${task.objective}`,
+      "agent",
+      task.seedEntities.slice(0, 6).map((label) => ({ type: "effect", label })),
+      "active",
+    );
+
+    const subagent = subagentMap[task.subagent];
+    const response = await withTimeout(
+      subagent.invoke({
+        messages: [
+          {
+            role: "user",
+            content: [
+              `Query: ${normalizedQuestion}`,
+              `Task objective: ${task.objective}`,
+              `Seed entities: ${task.seedEntities.join(", ") || "none provided"}`,
+              `Structured query plan: ${JSON.stringify(subagentContext.queryPlan)}`,
+            ].join("\n"),
+          },
+        ],
+      }),
+      AGENT_TIMEOUT_MS,
+      `${task.subagent} invoke`,
+    );
+
+    const structured = response.structuredResponse as SubagentReport | undefined;
+    const report: SubagentReport = structured ?? {
+      summary:
+        toAssistantText(response.messages[response.messages.length - 1]?.content) ||
+        `${task.subagent} completed with unstructured response.`,
+      findings: [],
+      followups: [],
+      pathState: "candidate",
+    };
+
+    push(
+      "insight",
+      `${task.subagent} summary`,
+      compact(report.summary, 220),
+      "agent",
+      [],
+      report.pathState,
+    );
+
+    for (const finding of report.findings.slice(0, 4)) {
+      push("tool_result", "Subagent finding", compact(finding, 220), "agent", [], report.pathState);
+    }
+
+    for (const followup of report.followups.slice(0, 3)) {
+      push("followup", "Follow-up spawned", compact(followup, 200), "agent", [], "candidate");
+    }
+
+    return report;
+  };
+
+  const buildDefaultTasks = (): CoordinatorTask[] => {
+    const fallbackSeeds = (state.queryPlan?.anchors ?? []).map((anchor) => anchor.name).slice(0, 6);
+    const hasMultiAnchor = (state.queryPlan?.anchors ?? []).length >= 2;
+    const defaults: CoordinatorTask[] = [
+      {
+        subagent: "pathway_mapper",
+        objective: `Map dominant target/pathway branches for: ${normalizedQuestion}`,
+        seedEntities: fallbackSeeds,
+      },
+      {
+        subagent: "translational_scout",
+        objective: `Map target-drug/mechanism evidence for: ${normalizedQuestion}`,
+        seedEntities: fallbackSeeds,
+      },
+      {
+        subagent: hasMultiAnchor ? "bridge_hunter" : "literature_scout",
+        objective: hasMultiAnchor
+          ? `Test explicit bridge hypotheses between query anchors for: ${normalizedQuestion}`
+          : `Collect focused literature evidence for: ${normalizedQuestion}`,
+        seedEntities: fallbackSeeds,
+      },
     ];
+    return defaults;
+  };
+
+  let coordinatorTasks: CoordinatorTask[] = [];
+  let initialPubmedSubqueries: string[] = [];
+
+  push(
+    "phase",
+    "Coordinator planning",
+    "Building query-specific subagent task graph.",
+    "planner",
+    [],
+    "active",
+  );
+
+  try {
+    const plannerResponse = await withTimeout(
+      coordinatorAgent.invoke({
+        messages: [
+          {
+            role: "user",
+            content: JSON.stringify(
+              {
+                query: normalizedQuestion,
+                queryPlan: subagentContext.queryPlan,
+                diseaseHint: diseaseQuery,
+                maxPubmedSubqueries: MAX_PUBMED_SUBQUERIES,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      }),
+      AGENT_TIMEOUT_MS,
+      "coordinator planning",
+    );
+
+    const plan = plannerResponse.structuredResponse as
+      | {
+          strategy: string;
+          pubmedSubqueries: string[];
+          tasks: CoordinatorTask[];
+        }
+      | undefined;
+
+    if (plan) {
+      coordinatorTasks = (plan.tasks ?? []).slice(0, 6);
+      initialPubmedSubqueries = (plan.pubmedSubqueries ?? []).slice(0, MAX_PUBMED_SUBQUERIES);
+      push(
+        "handoff",
+        "Coordinator plan ready",
+        `${coordinatorTasks.length} tasks planned. Strategy: ${compact(plan.strategy, 140)}`,
+        "planner",
+        [],
+        "active",
+      );
+    }
+  } catch (error) {
+    handleOpenAiRateLimit(error);
+    push(
+      "warning",
+      "Coordinator planner degraded",
+      `Falling back to default task graph (${error instanceof Error ? error.message : "unknown"}).`,
+      "planner",
+      [],
+      "candidate",
+    );
+  }
+
+  if (coordinatorTasks.length === 0) {
+    coordinatorTasks = buildDefaultTasks();
+  }
+
+  if (initialPubmedSubqueries.length === 0) {
+    initialPubmedSubqueries = [
+      normalizedQuestion,
+      ...(state.queryPlan?.followups ?? []).map((row) => row.question),
+    ].slice(0, Math.min(2, MAX_PUBMED_SUBQUERIES));
+  }
+
+  for (const subquery of initialPubmedSubqueries.slice(0, MAX_PUBMED_SUBQUERIES)) {
+    await searchPubmedSubqueryTool.invoke({ subquery, limit: 4 }).catch(() => undefined);
+  }
+
+  const primaryTasks = coordinatorTasks.slice(0, 2);
+  const secondaryTasks = coordinatorTasks.slice(2);
+
+  const reports: SubagentReport[] = [];
+  const primarySettled = await Promise.allSettled(primaryTasks.map((task) => runSubagentTask(task)));
+  for (const row of primarySettled) {
+    if (row.status === "fulfilled") reports.push(row.value);
+  }
+
+  for (const task of secondaryTasks) {
+    try {
+      reports.push(await runSubagentTask(task));
+    } catch (error) {
+      push(
+        "warning",
+        "Subagent task degraded",
+        `${task.subagent} failed: ${error instanceof Error ? error.message : "unknown"}`,
+        "agent",
+        [],
+        "candidate",
+      );
+    }
+  }
+
+  const followupQueue = [
+    ...(state.queryPlan?.followups ?? []).map((row: QueryPlanFollowup) => row.question),
+    ...reports.flatMap((row) => row.followups),
+  ];
+  const dedupedFollowups = [...new Set(followupQueue.map((row) => clean(row)).filter(Boolean))].slice(0, 4);
+
+  for (const followup of dedupedFollowups) {
+    const routed = routeFollowupToSubagent(followup);
+    const task: CoordinatorTask = {
+      subagent: routed,
+      objective: followup,
+      seedEntities: (state.queryPlan?.anchors ?? []).map((anchor) => anchor.name).slice(0, 4),
+    };
+    try {
+      reports.push(await runSubagentTask(task));
+    } catch {
+      push(
+        "branch",
+        "Follow-up branch discarded",
+        `Unable to execute follow-up: ${compact(followup, 160)}`,
+        "agent",
+        [],
+        "discarded",
+      );
+    }
+  }
+
+  if (state.targetById.size === 0 || state.edges.size === 0) {
+    await deterministicBackfill("empty-agent-state");
+  }
+
+  const bridge = chooseBridgePath(state);
+  const bridgeSummary = bridgePathToSummary(state, bridge.connectedPath);
+  const thread = summarizeThread(state);
+
+  push(
+    "insight",
+    "Active path",
+    bridge.connectedPath
+      ? `Connected path: ${bridgeSummary}`
+      : `No complete bridge. Best available thread: ${thread.pathway} -> ${thread.target} -> ${thread.drug}`,
+    "agent",
+    bridge.connectedPath
+      ? bridge.connectedPath.nodeKeys
+          .map((key) => state.nodes.get(key)?.entity)
+          .filter((entity): entity is DiscoverEntity => Boolean(entity))
+      : ([
+          { type: "pathway", label: thread.pathway },
+          { type: "target", label: thread.target },
+          { type: "drug", label: thread.drug },
+        ] satisfies DiscoverEntity[]).filter((entity) => entity.label !== "not provided"),
+    bridge.connectedPath ? "active" : "candidate",
+  );
+
+  if (bridge.unresolvedPairs.length > 0) {
+    push(
+      "branch",
+      "Unresolved anchor pair",
+      bridge.unresolvedPairs.slice(0, 3).join(" | "),
+      "planner",
+      [],
+      "discarded",
+    );
+  }
+
+  const synthesisAgent = createAgent({
+    model: mainModel,
+    tools: [],
+    responseFormat: synthesisSchema,
+    systemPrompt: [
+      "You are a biomedical multihop synthesis agent.",
+      "Answer the exact user query using only provided evidence summary.",
+      "Never return generic disease-centric text if query asks cross-anchor relations.",
+      "If bridge is incomplete, state explicit gap and what intermediate nodes were tested.",
+      "Use concise scientific language and include mechanism thread with intermediate hops when available.",
+      "Do not fabricate literature or confidence.",
+    ].join(" "),
+  });
+
+  const citationPreview = state.pubmedSubqueryHits
+    .flatMap((row) => row.articles)
+    .slice(0, 6)
+    .map((article, index) => `[${index + 1}] ${article.title}`);
+
+  const synthesisInput: FreeformSynthesisInput = {
+    query: normalizedQuestion,
+    bridge: {
+      connected: Boolean(bridge.connectedPath),
+      summary: bridgeSummary,
+      unresolvedPairs: bridge.unresolvedPairs,
+    },
+    thread,
+    state,
+    citationPreview,
+    subagentSummaries: reports.slice(0, 8).map((row) => row.summary),
+  };
+
+  try {
+    const synthesisResponse = await withTimeout(
+      synthesisAgent.invoke({
+        messages: [
+          {
+            role: "user",
+            content: JSON.stringify(
+              {
+                query: normalizedQuestion,
+                queryPlan: {
+                  intent: state.queryPlan?.intent,
+                  anchors: state.queryPlan?.anchors.map((anchor) => ({
+                    mention: anchor.mention,
+                    entityType: anchor.entityType,
+                    id: anchor.id,
+                    name: anchor.name,
+                  })),
+                  constraints: state.queryPlan?.constraints,
+                },
+                bridge: {
+                  connected: synthesisInput.bridge.connected,
+                  summary: synthesisInput.bridge.summary,
+                  unresolvedPairs: synthesisInput.bridge.unresolvedPairs,
+                },
+                evidenceStats: {
+                  nodes: synthesisInput.state.nodes.size,
+                  edges: synthesisInput.state.edges.size,
+                  targets: synthesisInput.state.targetById.size,
+                  pathways: synthesisInput.state.pathwayById.size,
+                  drugs: synthesisInput.state.drugById.size,
+                  pubmedQueriesUsed: synthesisInput.state.pubmedSubqueriesUsed,
+                  pubmedArticles: synthesisInput.state.pubmedSubqueryHits.reduce(
+                    (acc, row) => acc + row.articles.length,
+                    0,
+                  ),
+                  biomcpArticles: synthesisInput.state.bioMcpCounts.articles,
+                  biomcpTrials: synthesisInput.state.bioMcpCounts.trials,
+                },
+                focusThread: synthesisInput.thread,
+                activePath: synthesisInput.bridge.summary,
+                citationPreview: synthesisInput.citationPreview,
+                subagentSummaries: synthesisInput.subagentSummaries,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      }),
+      AGENT_TIMEOUT_MS,
+      "final synthesis",
+    );
+
+    const structured = synthesisResponse.structuredResponse as
+      | {
+          directAnswer: string;
+          keyFindings: string[];
+          caveats: string[];
+          nextActions: string[];
+        }
+      | undefined;
+
+    const fallback = buildFallbackSummary(state, normalizedQuestion);
+    const structuredAnswer = clean(structured?.directAnswer ?? "");
+    const rescueAnswer = structuredAnswer
+      ? null
+      : await synthesizeFreeformNarrative(mainModel, synthesisInput).catch(() => null);
 
     return {
       answer:
-        structured && typeof structured.directAnswer === "string"
-          ? structured.directAnswer
-          : toAssistantText(response.messages[response.messages.length - 1]?.content) ||
-            buildFallbackSummary(state).answer,
-      biomedicalCase: inferBiomedicalCase(state.disease?.name),
-      focusThread: thread,
-      keyFindings,
+        structuredAnswer ||
+        rescueAnswer ||
+        toAssistantText(
+          synthesisResponse.messages[synthesisResponse.messages.length - 1]?.content,
+        ) ||
+        fallback.answer,
+      biomedicalCase: inferBiomedicalCase(normalizedQuestion),
+      focusThread: bridge.connectedPath
+        ? {
+            pathway: bridgeSummary,
+            target: thread.target,
+            drug: thread.drug,
+          }
+        : thread,
+      keyFindings:
+        structured?.keyFindings?.length
+          ? [...structured.keyFindings.slice(0, 6), ...fallback.keyFindings.slice(0, 2)]
+          : fallback.keyFindings,
       caveats:
-        structured && Array.isArray(structured.caveats) && structured.caveats.length > 0
+        structured?.caveats?.length
           ? structured.caveats
-          : buildFallbackSummary(state).caveats,
+          : fallback.caveats,
       nextActions:
-        structured && Array.isArray(structured.nextActions) && structured.nextActions.length > 0
+        structured?.nextActions?.length
           ? structured.nextActions
-          : buildFallbackSummary(state).nextActions,
+          : fallback.nextActions,
     };
-  } catch {
+  } catch (error) {
+    const reason = classifyDiscovererError(error);
+    if (reason === "OpenAI rate-limited") {
+      handleOpenAiRateLimit(error);
+    }
     push(
       "warning",
-      "Agent synthesis degraded",
-      "Falling back to deterministic summary from gathered MCP evidence.",
+      "Final synthesis degraded",
+      `Returning deterministic summary (${reason}).`,
       "agent",
+      [],
+      "candidate",
     );
-    return buildFallbackSummary(state);
+    if (reason !== "OpenAI rate-limited") {
+      const rescued = await synthesizeFreeformNarrative(mainModel, synthesisInput).catch(() => null);
+      if (rescued) {
+        const fallback = buildFallbackSummary(state, normalizedQuestion);
+        return {
+          ...fallback,
+          answer: rescued,
+        };
+      }
+    }
+    return buildFallbackSummary(state, normalizedQuestion);
   }
 }

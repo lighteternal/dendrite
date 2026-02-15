@@ -10,6 +10,7 @@ export const graphNodeTypes = [
 
 export const graphEdgeTypes = [
   "disease_target",
+  "disease_disease",
   "target_pathway",
   "target_drug",
   "target_target",
@@ -22,6 +23,7 @@ export const sourceNames = [
   "string",
   "chembl",
   "biomcp",
+  "pubmed",
   "openai",
 ] as const;
 

@@ -30,6 +30,11 @@ export type ResolvedConcept = {
   alternatives: CanonicalEntity[];
 };
 
+type ResolveConceptOptions = {
+  useLlm?: boolean;
+  maxConcepts?: number;
+};
+
 const openai = appConfig.openAiApiKey
   ? new OpenAI({ apiKey: appConfig.openAiApiKey })
   : null;
@@ -128,6 +133,21 @@ function interventionAnchorVariants(mention: string): string[] {
   }
 
   return [...variants].filter((value) => value.length >= 2).slice(0, 4);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
 }
 
 function scoreMatch(mention: string, candidateName: string, description?: string): number {
@@ -242,12 +262,34 @@ function heuristicConcepts(query: string): ConceptMention[] {
     }
   }
 
+  const actionMatches = text.matchAll(
+    /\b(?:help(?:s)?|improve(?:s)?|reduce(?:s)?|affect(?:s)?)\s+([a-zA-Z][a-zA-Z0-9\s'\-]{2,40})/g,
+  );
+  for (const hit of actionMatches) {
+    const raw = hit[1]?.trim();
+    if (!raw) continue;
+    const truncated = raw
+      .split(/\b(what|which|why|how|and|or|that)\b/i)[0]
+      ?.trim();
+    if (
+      truncated &&
+      truncated.length >= 3 &&
+      truncated.split(/\s+/).length <= 6 &&
+      !isQuestionLike(truncated)
+    ) {
+      concepts.push({
+        mention: truncated,
+        type: "disease",
+      });
+    }
+  }
+
   return dedupeMentions(concepts);
 }
 
-async function extractConceptMentions(query: string): Promise<ConceptMention[]> {
+async function extractConceptMentions(query: string, useLlm: boolean): Promise<ConceptMention[]> {
   const fallback = heuristicConcepts(query);
-  if (!openai) return fallback;
+  if (!useLlm || !openai) return fallback;
 
   const schema = {
     type: "object",
@@ -412,23 +454,28 @@ async function resolveInterventionMention(mention: string): Promise<CanonicalEnt
   return combined;
 }
 
-export async function resolveSemanticConcepts(query: string): Promise<ResolvedConcept[]> {
-  const cacheKey = normalizeGreek(query);
+export async function resolveSemanticConcepts(
+  query: string,
+  options: ResolveConceptOptions = {},
+): Promise<ResolvedConcept[]> {
+  const useLlm = options.useLlm ?? true;
+  const maxConcepts = Math.max(1, Math.min(4, options.maxConcepts ?? 4));
+  const cacheKey = `${normalizeGreek(query)}::${useLlm ? "llm" : "det"}::${maxConcepts}`;
   const cached = conceptCache.get(cacheKey);
   if (cached) return cached;
 
-  const mentions = await extractConceptMentions(query);
-  const concepts: ResolvedConcept[] = await Promise.all(
+  const mentions = (await extractConceptMentions(query, useLlm)).slice(0, maxConcepts);
+  const settled = await Promise.allSettled(
     mentions.map(async (mention) => {
       let alternatives: CanonicalEntity[] = [];
       if (mention.type === "disease") {
-        alternatives = await resolveDiseaseMention(mention.mention);
+        alternatives = await withTimeout(resolveDiseaseMention(mention.mention), 900);
       } else if (mention.type === "target") {
-        alternatives = await resolveTargetMention(mention.mention);
+        alternatives = await withTimeout(resolveTargetMention(mention.mention), 900);
       } else if (mention.type === "drug") {
-        alternatives = await resolveDrugMention(mention.mention);
+        alternatives = await withTimeout(resolveDrugMention(mention.mention), 900);
       } else if (mention.type === "intervention") {
-        alternatives = await resolveInterventionMention(mention.mention);
+        alternatives = await withTimeout(resolveInterventionMention(mention.mention), 900);
       }
 
       return {
@@ -436,9 +483,16 @@ export async function resolveSemanticConcepts(query: string): Promise<ResolvedCo
         type: mention.type,
         selected: alternatives[0] ?? null,
         alternatives,
-      };
+      } satisfies ResolvedConcept;
     }),
   );
+
+  const concepts: ResolvedConcept[] = [];
+  for (const result of settled) {
+    if (result.status === "fulfilled") {
+      concepts.push(result.value);
+    }
+  }
 
   const filtered = concepts
     .filter((concept) => {
@@ -483,7 +537,10 @@ export async function inferDiseaseFromQuery(query: string): Promise<{
   id: string;
   name: string;
 } | null> {
-  const concepts = await resolveSemanticConcepts(query);
+  const concepts = await resolveSemanticConcepts(query, {
+    useLlm: false,
+    maxConcepts: 2,
+  });
   for (const concept of concepts) {
     if (concept.selected?.entityType === "disease") {
       return {

@@ -87,7 +87,13 @@ function edgePriority(edge: GraphEdge, lens: ConnectionLens): number {
   switch (lens) {
     case "evidence": {
       const evidenceBoost =
-        edge.type === "disease_target" ? 1.2 : edge.type === "target_pathway" ? 1 : 0.8;
+        edge.type === "disease_target"
+          ? 1.2
+          : edge.type === "disease_disease"
+            ? 1
+            : edge.type === "target_pathway"
+              ? 1
+              : 0.8;
       return weight * 4.2 + evidenceBoost;
     }
     case "drugability": {
@@ -96,6 +102,8 @@ function edgePriority(edge: GraphEdge, lens: ConnectionLens): number {
           ? 3.4
           : edge.type === "disease_target"
             ? 1.8
+            : edge.type === "disease_disease"
+              ? 1.2
             : edge.type === "target_pathway"
               ? 1.2
               : 0.7;
@@ -107,6 +115,8 @@ function edgePriority(edge: GraphEdge, lens: ConnectionLens): number {
           ? 3
           : edge.type === "disease_target"
             ? 2.2
+            : edge.type === "disease_disease"
+              ? 1.8
             : edge.type === "target_target"
               ? 1.6
               : 1;
@@ -117,6 +127,8 @@ function edgePriority(edge: GraphEdge, lens: ConnectionLens): number {
       const typeBoost =
         edge.type === "disease_target"
           ? 2.3
+          : edge.type === "disease_disease"
+            ? 1.8
           : edge.type === "target_pathway"
             ? 2
             : edge.type === "target_drug"
@@ -232,6 +244,7 @@ export function GraphWorkbench({
 
     const grouped: Record<GraphEdge["type"], Array<{ edge: GraphEdge; score: number }>> = {
       disease_target: [],
+      disease_disease: [],
       target_pathway: [],
       target_drug: [],
       target_target: [],

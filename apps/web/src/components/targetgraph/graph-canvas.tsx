@@ -16,30 +16,37 @@ type Props = {
   edges: GraphEdge[];
   selectedNodeId: string | null;
   onSelectNode: (node: GraphNode | null) => void;
+  selectedEdgeId?: string | null;
+  onSelectEdge?: (edge: GraphEdge | null) => void;
   highlightedNodeIds?: Set<string>;
   highlightedEdgeIds?: Set<string>;
+  washedNodeIds?: Set<string>;
+  washedEdgeIds?: Set<string>;
   dimUnfocused?: boolean;
+  isRunning?: boolean;
   hiddenSummary?: {
     hiddenNodes: number;
     hiddenEdges: number;
     lens: string;
   };
+  layoutRootIds?: string[];
 };
 
 const nodeColors: Record<GraphNode["type"], string> = {
-  disease: "#ef5f66",
-  target: "#7f4dd5",
-  pathway: "#f0a23e",
-  drug: "#e87f22",
-  interaction: "#9f8bc9",
+  disease: "#e84d89",
+  target: "#4f46e5",
+  pathway: "#0d9488",
+  drug: "#8b5cf6",
+  interaction: "#7f8aa6",
 };
 
 const edgeColors: Record<GraphEdge["type"], string> = {
-  disease_target: "#9d8ca9",
-  target_pathway: "#f0a23e",
-  target_drug: "#e87f22",
-  target_target: "#7f4dd5",
-  pathway_drug: "#d06d1a",
+  disease_target: "#8e94c8",
+  disease_disease: "#6d46d6",
+  target_pathway: "#0f9f8c",
+  target_drug: "#8b5cf6",
+  target_target: "#465ac2",
+  pathway_drug: "#756de0",
 };
 
 const MIN_ZOOM = 0.34;
@@ -73,6 +80,16 @@ function informativeNodeLabel(node: GraphNode): string {
 
   if (node.type === "target") return targetSymbol ?? displayName ?? node.label;
   return displayName ?? node.label;
+}
+
+function extractMetaString(meta: GraphNode["meta"] | GraphEdge["meta"], key: string): string | null {
+  const value = meta[key];
+  if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  if (Array.isArray(value) && value.length > 0) {
+    const first = value[0];
+    if (typeof first === "string" && first.trim().length > 0) return first.trim();
+  }
+  return null;
 }
 
 function shortestPath(startId: string, endId: string, adjacency: Map<string, string[]>) {
@@ -129,25 +146,44 @@ function clampZoom(value: number): number {
   return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
 }
 
+function readNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 export function GraphCanvas({
   nodes,
   edges,
+  layoutRootIds = [],
   selectedNodeId,
   onSelectNode,
+  selectedEdgeId = null,
+  onSelectEdge,
   highlightedNodeIds,
   highlightedEdgeIds,
+  washedNodeIds,
+  washedEdgeIds,
   dimUnfocused = true,
+  isRunning = false,
   hiddenSummary,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [width, setWidth] = useState(1000);
   const [fullscreen, setFullscreen] = useState(false);
   const [cy, setCy] = useState<Core | null>(null);
+  const [dashOffset, setDashOffset] = useState(0);
   const [pathAnchorNodeId, setPathAnchorNodeId] = useState<string | null>(null);
   const [localFocusNodeIds, setLocalFocusNodeIds] = useState<Set<string>>(new Set());
   const [localFocusEdgeIds, setLocalFocusEdgeIds] = useState<Set<string>>(new Set());
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
 
   const nodeMap = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const edgeMap = useMemo(() => new Map(edges.map((edge) => [edge.id, edge])), [edges]);
   const validNodeIds = useMemo(() => new Set(nodes.map((node) => node.id)), [nodes]);
   const validEdges = useMemo(
     () =>
@@ -157,10 +193,13 @@ export function GraphCanvas({
     [edges, validNodeIds],
   );
   const degreeMap = useMemo(() => buildDegreeMap(validEdges), [validEdges]);
-  const diseaseRootId = useMemo(
-    () => nodes.find((node) => node.type === "disease")?.id ?? null,
-    [nodes],
-  );
+  const preferredRootIds = useMemo(() => {
+    const deduped = layoutRootIds.filter((id, index, all) => all.indexOf(id) === index);
+    const filtered = deduped.filter((id) => validNodeIds.has(id));
+    if (filtered.length > 0) return filtered.slice(0, 4);
+    const fallback = nodes.find((node) => node.type === "disease")?.id;
+    return fallback ? [fallback] : [];
+  }, [layoutRootIds, nodes, validNodeIds]);
   const layoutSignature = useMemo(() => {
     const nodeIds = nodes.map((node) => node.id).sort().join("|");
     const edgeIds = validEdges.map((edge) => edge.id).sort().join("|");
@@ -207,6 +246,15 @@ export function GraphCanvas({
   );
 
   const hasFocusedSubset = dimUnfocused && (activeNodeSet.size > 0 || activeEdgeSet.size > 0);
+  const focusPulse = useMemo(() => (Math.sin(dashOffset / 2.8) + 1) / 2, [dashOffset]);
+
+  useEffect(() => {
+    if (!isRunning) return;
+    const timer = window.setInterval(() => {
+      setDashOffset((prev) => ((prev - 1) % 80 + 80) % 80);
+    }, 120);
+    return () => window.clearInterval(timer);
+  }, [isRunning]);
 
   const autoLabelNodeIds = useMemo(() => {
     const rankBy = (type: GraphNode["type"], count: number, field: "score" | "degree") =>
@@ -235,6 +283,7 @@ export function GraphCanvas({
         node.type === "disease" ||
         selectedNodeId === node.id ||
         activeNodeSet.has(node.id) ||
+        (washedNodeIds?.has(node.id) ?? false) ||
         autoLabelNodeIds.has(node.id) ||
         (node.type !== "interaction" && nodes.length <= 16) ||
         (node.type === "target" && nodes.length <= 36) ||
@@ -244,7 +293,9 @@ export function GraphCanvas({
       const classes = [
         hasFocusedSubset && !activeNodeSet.has(node.id) ? "is-faded" : "",
         activeNodeSet.has(node.id) ? "is-focused" : "",
+        washedNodeIds?.has(node.id) && !activeNodeSet.has(node.id) ? "is-washed" : "",
         selectedNodeId === node.id ? "is-selected" : "",
+        node.meta.queryAnchor ? "is-query-anchor" : "",
         shouldShowLabel ? "" : "label-hidden",
       ]
         .filter(Boolean)
@@ -268,10 +319,14 @@ export function GraphCanvas({
     const edgeElements = validEdges.map((edge) => {
       const showEdgeLabel =
         activeEdgeSet.has(edge.id) ||
+        (edge.type === "disease_disease" && typeof edge.meta.status === "string") ||
+        typeof edge.meta.bridgeType === "string" ||
         (edge.type !== "target_target" && (edge.weight ?? 0) >= 0.92 && nodes.length <= 60);
       const classes = [
         hasFocusedSubset && !activeEdgeSet.has(edge.id) ? "is-faded" : "",
         activeEdgeSet.has(edge.id) ? "is-focused" : "",
+        selectedEdgeId === edge.id ? "is-selected" : "",
+        washedEdgeIds?.has(edge.id) && !activeEdgeSet.has(edge.id) ? "is-washed" : "",
         showEdgeLabel ? "label-visible" : "",
       ]
         .filter(Boolean)
@@ -283,16 +338,22 @@ export function GraphCanvas({
           source: edge.source,
           target: edge.target,
           type: edge.type,
+          bridgeStatus:
+            typeof edge.meta.status === "string" ? String(edge.meta.status) : "",
           label:
-            edge.type === "disease_target"
+            extractMetaString(edge.meta, "bridgeType") ??
+            extractMetaString(edge.meta, "status") ??
+            (edge.type === "disease_target"
               ? "association"
+              : edge.type === "disease_disease"
+                ? "cross-disease hypothesis"
               : edge.type === "target_pathway"
                 ? "pathway"
                 : edge.type === "target_drug"
                   ? "drug link"
                   : edge.type === "target_target"
                     ? "interaction"
-                    : "mechanism link",
+                    : "mechanism link"),
           weight: edge.weight ?? 0.4,
           color: edgeColors[edge.type],
         },
@@ -309,6 +370,9 @@ export function GraphCanvas({
     hasFocusedSubset,
     nodes,
     selectedNodeId,
+    selectedEdgeId,
+    washedEdgeIds,
+    washedNodeIds,
   ]);
 
   const stylesheet = useMemo(
@@ -320,7 +384,7 @@ export function GraphCanvas({
           width: "data(rawSize)",
           height: "data(rawSize)",
           "background-color": "data(color)",
-          color: "#2f2a70",
+          color: "#2f2c66",
           "font-size": 11,
           "font-family": "var(--font-body)",
           "text-wrap": "wrap",
@@ -331,7 +395,7 @@ export function GraphCanvas({
           "text-background-shape": "roundrectangle",
           "text-background-padding": "1.4px",
           "text-border-width": 1,
-          "text-border-color": "#ffd7b1",
+          "text-border-color": "#d1d5f3",
           "text-border-opacity": 0.85,
           "text-margin-y": 12,
           "text-valign": "bottom",
@@ -340,7 +404,10 @@ export function GraphCanvas({
           "overlay-opacity": 0,
           "shadow-blur": 10,
           "shadow-opacity": 0.18,
-          "shadow-color": "#d28a3a",
+          "shadow-color": "#6675b5",
+          "transition-property":
+            "background-color, border-color, border-width, opacity, shadow-opacity, shadow-color, text-opacity",
+          "transition-duration": "220ms",
         },
       },
       {
@@ -382,16 +449,45 @@ export function GraphCanvas({
         selector: "node.is-selected",
         style: {
           "border-width": 2.6,
-          "border-color": "#f0872d",
+          "border-color": "#7f5af0",
           "shadow-opacity": 0.34,
-          "shadow-color": "#f0872d",
+          "shadow-color": "#7f5af0",
+        },
+      },
+      {
+        selector: "node.is-focused",
+        style: {
+          "border-width": 2 + focusPulse * 1.6,
+          "border-color": "#4f46e5",
+          "shadow-opacity": 0.28 + focusPulse * 0.24,
+          "shadow-color": "#5a50eb",
+          "text-border-color": "#b7bdf3",
+        },
+      },
+      {
+        selector: "node.is-query-anchor",
+        style: {
+          "border-width": 2.2,
+          "border-color": "#7f5af0",
+          "text-border-color": "#c8bcff",
         },
       },
       {
         selector: "node.is-faded",
         style: {
-          opacity: 0.14,
-          "text-opacity": 0.08,
+          opacity: 0.34,
+          "text-opacity": 0.3,
+        },
+      },
+      {
+        selector: "node.is-washed",
+        style: {
+          "background-color": "#b7bfd4",
+          opacity: 0.8,
+          "text-opacity": 0.96,
+          "text-border-color": "#aebad1",
+          "text-background-color": "#e5ebf7",
+          color: "#3f4b69",
         },
       },
       {
@@ -407,6 +503,8 @@ export function GraphCanvas({
           "arrow-scale": 0.9,
           "curve-style": "bezier",
           opacity: 0.84,
+          "transition-property": "line-color, target-arrow-color, width, opacity, line-style",
+          "transition-duration": "220ms",
         },
       },
       {
@@ -419,9 +517,45 @@ export function GraphCanvas({
         },
       },
       {
+        selector: "edge[type = 'disease_disease']",
+        style: {
+          "target-arrow-shape": "none",
+          "curve-style": "bezier",
+          width: "mapData(weight, 0, 1, 1.4, 4.2)",
+        },
+      },
+      {
+        selector: "edge[bridgeStatus = 'candidate']",
+        style: {
+          "line-style": "dashed",
+          "line-dash-pattern": [5, 4],
+          "line-color": "#8f6ae8",
+          "target-arrow-color": "#8f6ae8",
+        },
+      },
+      {
+        selector: "edge[bridgeStatus = 'no_connection']",
+        style: {
+          "line-style": "dashed",
+          "line-dash-pattern": [4, 4],
+          opacity: 0.62,
+          "line-color": "#9f90cb",
+          "target-arrow-color": "#9f90cb",
+        },
+      },
+      {
+        selector: "edge[bridgeStatus = 'connected']",
+        style: {
+          "line-style": "solid",
+          opacity: 0.96,
+          "line-color": "#4f46e5",
+          "target-arrow-color": "#4f46e5",
+        },
+      },
+      {
         selector: "edge.is-faded",
         style: {
-          opacity: 0.12,
+          opacity: 0.24,
         },
       },
       {
@@ -429,31 +563,56 @@ export function GraphCanvas({
         style: {
           opacity: 0.96,
           width: "mapData(weight, 0, 1, 2, 4.6)",
+          "line-style": isRunning ? "dashed" : "solid",
+          "line-dash-pattern": isRunning ? [8, 4] : [1, 0],
+          "line-dash-offset": isRunning ? dashOffset : 0,
+          "line-color": "#4f46e5",
+          "target-arrow-color": "#4f46e5",
+        },
+      },
+      {
+        selector: "edge.is-selected",
+        style: {
+          "line-color": "#7f5af0",
+          "target-arrow-color": "#7f5af0",
+          width: "mapData(weight, 0, 1, 2.6, 5.2)",
+          opacity: 0.98,
+        },
+      },
+      {
+        selector: "edge.is-washed",
+        style: {
+          "line-color": "#97a1bb",
+          "target-arrow-color": "#97a1bb",
+          "line-style": "dashed",
+          "line-dash-pattern": [4, 6],
+          opacity: 0.82,
         },
       },
       {
         selector: "edge.label-visible",
         style: {
           label: "data(label)",
-          "font-size": 9,
-          color: "#8a4d1a",
-          "text-background-color": "#fff5e8",
+          "font-size": 10,
+          color: "#35417f",
+          "text-background-color": "#f3f2ff",
           "text-background-opacity": 0.92,
           "text-background-shape": "roundrectangle",
           "text-border-width": 0.8,
-          "text-border-color": "#f8c99b",
+          "text-border-color": "#d0d2f8",
           "text-border-opacity": 0.9,
           "text-rotation": "autorotate",
         },
       },
     ],
-    [],
+    [dashOffset, focusPulse, isRunning],
   );
 
   useEffect(() => {
     if (!cy) return;
 
-    const useBreadth = nodes.length <= 28;
+    const hasMultiRoots = preferredRootIds.length > 1;
+    const useBreadth = nodes.length <= 32 || (hasMultiRoots && nodes.length <= 88);
 
     const layout = cy.layout(
       useBreadth
@@ -464,8 +623,9 @@ export function GraphCanvas({
             animationDuration: 320,
             fit: true,
             padding: 28,
-            spacingFactor: 1.02,
-            roots: diseaseRootId ? [diseaseRootId] : undefined,
+            spacingFactor: hasMultiRoots ? 1.18 : 1.06,
+            roots: preferredRootIds.length > 0 ? preferredRootIds : undefined,
+            avoidOverlap: true,
           }
         : {
             name: "cose",
@@ -521,7 +681,7 @@ export function GraphCanvas({
     layout.run();
     cy.minZoom(MIN_ZOOM);
     cy.maxZoom(MAX_ZOOM);
-  }, [cy, diseaseRootId, layoutSignature, nodes.length]);
+  }, [cy, layoutSignature, nodes.length, preferredRootIds]);
 
   useEffect(() => {
     if (!cy) return;
@@ -531,7 +691,10 @@ export function GraphCanvas({
       setPathAnchorNodeId(null);
       setLocalFocusNodeIds(new Set());
       setLocalFocusEdgeIds(new Set());
+      setHoveredNodeId(null);
+      setHoveredEdgeId(null);
       onSelectNode(null);
+      onSelectEdge?.(null);
     };
 
     const onTapNode = (event: {
@@ -573,7 +736,10 @@ export function GraphCanvas({
       setPathAnchorNodeId(null);
       setLocalFocusNodeIds(new Set());
       setLocalFocusEdgeIds(new Set());
+      setHoveredNodeId(nodeId);
+      setHoveredEdgeId(null);
       onSelectNode(nodeMap.get(nodeId) ?? null);
+      onSelectEdge?.(null);
     };
 
     const onRightTapNode = (event: { target: { id: () => string } }) => {
@@ -590,19 +756,62 @@ export function GraphCanvas({
 
       setLocalFocusNodeIds(neighborhood);
       setLocalFocusEdgeIds(focusEdges);
+      setHoveredNodeId(nodeId);
+      setHoveredEdgeId(null);
       onSelectNode(nodeMap.get(nodeId) ?? null);
+      onSelectEdge?.(null);
+    };
+
+    const onTapEdge = (event: { target: { id: () => string } }) => {
+      const edgeId = String(event.target.id());
+      const edge = edgeMap.get(edgeId) ?? null;
+      setHoveredNodeId(null);
+      setHoveredEdgeId(edgeId);
+      onSelectEdge?.(edge);
+      if (edge) {
+        setLocalFocusNodeIds(new Set([edge.source, edge.target]));
+        setLocalFocusEdgeIds(new Set([edge.id]));
+      }
+    };
+
+    const onMouseOverNode = (event: { target: { id: () => string } }) => {
+      setHoveredEdgeId(null);
+      setHoveredNodeId(String(event.target.id()));
+    };
+
+    const onMouseOutNode = () => {
+      setHoveredNodeId(null);
+    };
+
+    const onMouseOverEdge = (event: { target: { id: () => string } }) => {
+      setHoveredNodeId(null);
+      setHoveredEdgeId(String(event.target.id()));
+    };
+
+    const onMouseOutEdge = () => {
+      setHoveredEdgeId(null);
     };
 
     cy.on("tap", onTapBackground);
     cy.on("tap", "node", onTapNode);
+    cy.on("tap", "edge", onTapEdge);
     cy.on("cxttap", "node", onRightTapNode);
+    cy.on("mouseover", "node", onMouseOverNode);
+    cy.on("mouseout", "node", onMouseOutNode);
+    cy.on("mouseover", "edge", onMouseOverEdge);
+    cy.on("mouseout", "edge", onMouseOutEdge);
 
     return () => {
       cy.off("tap", onTapBackground);
       cy.off("tap", "node", onTapNode);
+      cy.off("tap", "edge", onTapEdge);
       cy.off("cxttap", "node", onRightTapNode);
+      cy.off("mouseover", "node", onMouseOverNode);
+      cy.off("mouseout", "node", onMouseOutNode);
+      cy.off("mouseover", "edge", onMouseOverEdge);
+      cy.off("mouseout", "edge", onMouseOutEdge);
     };
-  }, [adjacency, cy, nodeMap, onSelectNode, pathAnchorNodeId, validEdges]);
+  }, [adjacency, cy, edgeMap, nodeMap, onSelectEdge, onSelectNode, pathAnchorNodeId, validEdges]);
 
   const nodeCounts = useMemo(
     () =>
@@ -616,17 +825,125 @@ export function GraphCanvas({
     [nodes],
   );
 
+  const hoveredNode = useMemo(
+    () => (hoveredNodeId ? nodeMap.get(hoveredNodeId) ?? null : null),
+    [hoveredNodeId, nodeMap],
+  );
+  const hoveredEdge = useMemo(
+    () => (hoveredEdgeId ? edgeMap.get(hoveredEdgeId) ?? null : null),
+    [edgeMap, hoveredEdgeId],
+  );
+  const hoveredNodeDegree = useMemo(() => {
+    if (!hoveredNode) return 0;
+    return degreeMap.get(hoveredNode.id) ?? 0;
+  }, [degreeMap, hoveredNode]);
+  const hoveredNodeFacts = useMemo(() => {
+    if (!hoveredNode) {
+      return {
+        lines: [] as string[],
+        note: "No additional annotation available.",
+      };
+    }
+
+    const incident = validEdges.filter(
+      (edge) => edge.source === hoveredNode.id || edge.target === hoveredNode.id,
+    );
+    const diseaseTargetCount = incident.filter((edge) => edge.type === "disease_target").length;
+    const pathwayCount = incident.filter((edge) => edge.type === "target_pathway").length;
+    const drugCount = incident.filter((edge) => edge.type === "target_drug").length;
+    const interactionCount = incident.filter((edge) => edge.type === "target_target").length;
+    const bridgeConnected = incident.filter(
+      (edge) =>
+        edge.type === "disease_disease" &&
+        String(edge.meta.status ?? "").toLowerCase() === "connected",
+    ).length;
+    const bridgeGaps = incident.filter(
+      (edge) =>
+        edge.type === "disease_disease" &&
+        String(edge.meta.status ?? "").toLowerCase() === "no_connection",
+    ).length;
+
+    const lines: string[] = [];
+    if (hoveredNode.type === "disease") {
+      lines.push(`targets linked: ${diseaseTargetCount}`);
+      if (bridgeConnected > 0 || bridgeGaps > 0) {
+        lines.push(`anchor bridges: ${bridgeConnected} connected, ${bridgeGaps} gaps`);
+      }
+      const role = extractMetaString(hoveredNode.meta, "role");
+      if (role) {
+        lines.push(`anchor role: ${role.replace(/_/g, " ")}`);
+      }
+    }
+    if (hoveredNode.type === "target") {
+      lines.push(`pathways: ${pathwayCount}, drugs: ${drugCount}, interactions: ${interactionCount}`);
+      const otEvidence = readNumber(hoveredNode.meta.openTargetsEvidence ?? hoveredNode.score);
+      if (otEvidence !== null) {
+        lines.push(`OpenTargets evidence: ${otEvidence.toFixed(2)}`);
+      }
+      const articleCount = readNumber(hoveredNode.meta.articleCount);
+      const trialCount = readNumber(hoveredNode.meta.trialCount);
+      if (articleCount !== null || trialCount !== null) {
+        lines.push(`literature snippets: ${articleCount ?? 0} articles, ${trialCount ?? 0} trials`);
+      }
+    }
+    if (hoveredNode.type === "pathway") {
+      lines.push(`connected targets: ${incident.filter((edge) => edge.type === "target_pathway").length}`);
+    }
+    if (hoveredNode.type === "drug") {
+      lines.push(`connected targets: ${incident.filter((edge) => edge.type === "target_drug").length}`);
+    }
+
+    const note =
+      extractMetaString(hoveredNode.meta, "note") ??
+      extractMetaString(hoveredNode.meta, "description") ??
+      "No additional annotation available.";
+    return { lines, note };
+  }, [hoveredNode, validEdges]);
+  const hoveredEdgeSourceLabel = hoveredEdge ? nodeMap.get(hoveredEdge.source)?.label ?? hoveredEdge.source : null;
+  const hoveredEdgeTargetLabel = hoveredEdge ? nodeMap.get(hoveredEdge.target)?.label ?? hoveredEdge.target : null;
+  const hoveredEdgeFacts = useMemo(() => {
+    if (!hoveredEdge) return [] as string[];
+    const facts: string[] = [];
+    const sharedTargets = hoveredEdge.meta.sharedTargets;
+    if (Array.isArray(sharedTargets) && sharedTargets.length > 0) {
+      const symbols = sharedTargets
+        .map((item) => String(item).trim())
+        .filter((item) => item.length > 0)
+        .slice(0, 4);
+      if (symbols.length > 0) {
+        facts.push(`shared intermediates: ${symbols.join(", ")}`);
+      }
+    }
+    const sourceTag = extractMetaString(hoveredEdge.meta, "source");
+    if (sourceTag) {
+      facts.push(`source: ${sourceTag}`);
+    }
+    const bridgeType = extractMetaString(hoveredEdge.meta, "bridgeType");
+    if (bridgeType) {
+      facts.push(`bridge type: ${bridgeType}`);
+    }
+    const bridgeVia = extractMetaString(hoveredEdge.meta, "bridgeVia");
+    if (bridgeVia) {
+      facts.push(`via: ${bridgeVia}`);
+    }
+    const status = extractMetaString(hoveredEdge.meta, "status");
+    if (status) {
+      facts.push(`status: ${status}`);
+    }
+    return facts;
+  }, [hoveredEdge]);
+
   const canvasHeight = fullscreen
     ? Math.max(420, Math.floor((typeof window !== "undefined" ? window.innerHeight : 900) - 48))
-    : Math.max(460, Math.floor(width * 0.56));
+    : Math.max(360, Math.floor(width * 0.44));
 
   return (
     <div
       ref={containerRef}
       className={
         fullscreen
-          ? "fixed inset-0 z-40 rounded-none border-0 bg-[#f2f2ff] p-3"
-          : "relative min-h-[460px] overflow-hidden rounded-xl border border-[#f2dac4] bg-[linear-gradient(180deg,#fffdf8_0%,#fff5ec_100%)] shadow-[0_26px_72px_rgba(170,107,42,0.18)]"
+          ? "fixed inset-0 z-40 rounded-none border-0 bg-[#efeeff] p-3"
+          : "relative min-h-[360px] overflow-hidden rounded-xl border border-[#cdd2f7] bg-[radial-gradient(circle_at_18%_18%,#ffffff_0%,#f3f1ff_42%,#eceaff_100%)] shadow-[0_22px_64px_rgba(79,70,229,0.16)]"
       }
     >
       <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
@@ -643,7 +960,7 @@ export function GraphCanvas({
             cy.center();
           }}
           title="Fit graph"
-          className="border-[#f1d8c2] bg-white text-[#8b4f1a] hover:bg-[#fff2e5]"
+          className="border-[#d5dbf4] bg-white text-[#4649a2] hover:bg-[#f1f2ff]"
         >
           <LocateFixed className="h-4 w-4" />
         </Button>
@@ -663,7 +980,7 @@ export function GraphCanvas({
             a.download = "targetgraph-network.png";
             a.click();
           }}
-          className="border-[#f1d8c2] bg-white text-[#8b4f1a] hover:bg-[#fff2e5]"
+          className="border-[#d5dbf4] bg-white text-[#4649a2] hover:bg-[#f1f2ff]"
         >
           <Camera className="h-4 w-4" />
         </Button>
@@ -672,14 +989,14 @@ export function GraphCanvas({
           size="icon"
           variant="secondary"
           onClick={() => setFullscreen((prev) => !prev)}
-          className="border-[#f1d8c2] bg-white text-[#8b4f1a] hover:bg-[#fff2e5]"
+          className="border-[#d5dbf4] bg-white text-[#4649a2] hover:bg-[#f1f2ff]"
         >
           {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
         </Button>
       </div>
 
-      <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-xl border border-[#f1d8c2] bg-white/92 px-3 py-2 text-[11px] text-[#885527] backdrop-blur">
-        <div className="mb-1 font-semibold text-[#6e3f17]">Live Graph</div>
+      <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-xl border border-[#d5dbf4] bg-white/94 px-3 py-2 text-[11px] text-[#4f5f8e] backdrop-blur">
+        <div className="mb-1 font-semibold text-[#454ca2]">Live Graph</div>
         <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
           <span>Disease: {nodeCounts.disease ?? 0}</span>
           <span>Targets: {nodeCounts.target ?? 0}</span>
@@ -689,11 +1006,93 @@ export function GraphCanvas({
           <span>Edges: {validEdges.length}</span>
         </div>
         {hiddenSummary && hiddenSummary.hiddenEdges > 0 ? (
-          <div className="mt-1 rounded-md border border-[#f3d1ab] bg-[#fff7ec] px-2 py-1 text-[10px] text-[#8f5b2d]">
+          <div className="mt-1 rounded-md border border-[#d5dbf4] bg-[#f2f4ff] px-2 py-1 text-[10px] text-[#4f5f8e]">
             +{hiddenSummary.hiddenEdges} more edges hidden ({hiddenSummary.lens} lens)
           </div>
         ) : null}
+        {isRunning ? (
+          <div className="mt-1 flex items-center gap-1.5 text-[10px] font-medium text-[#454ca2]">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#5146d9] animate-pulse" />
+            Live stream active
+          </div>
+        ) : null}
+        <div className="mt-1.5 flex items-center gap-2 text-[9px] text-[#59629a]">
+          <span className="inline-flex items-center gap-1">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#4f46e5]" />
+            active path
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#bbc1d4]" />
+            washed branch
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#8f6ae8]" />
+            bridge edge
+          </span>
+        </div>
+        <div className="mt-1 text-[9px] text-[#616aa3]">
+          Animated dashed blue edges = currently explored branch.
+        </div>
       </div>
+
+      {hoveredNode ? (
+        <div className="pointer-events-none absolute right-3 top-14 z-20 max-w-[360px] rounded-xl border border-[#d5dbf4] bg-white/95 p-2.5 text-[11px] text-[#3f4a77] shadow-[0_18px_40px_rgba(57,64,130,0.2)] backdrop-blur">
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-semibold text-[#434aa1]">{informativeNodeLabel(hoveredNode)}</div>
+            <span className="rounded-full border border-[#d4d9f3] bg-[#f2f4ff] px-1.5 py-0.5 text-[10px] text-[#5a628f]">
+              {hoveredNode.type}
+            </span>
+          </div>
+          <div className="mt-1 text-[#5a638f]">{hoveredNodeFacts.note}</div>
+          {hoveredNodeFacts.lines.length > 0 ? (
+            <div className="mt-1 space-y-0.5 text-[10px] text-[#5f6ba1]">
+              {hoveredNodeFacts.lines.map((line) => (
+                <div key={line}>{line}</div>
+              ))}
+            </div>
+          ) : null}
+          <div className="mt-1 text-[10px] text-[#6670a1]">
+            neighborhood degree: {hoveredNodeDegree}
+          </div>
+          <div className="mt-1 text-[10px] text-[#6670a1]">
+            id: {hoveredNode.primaryId}
+            {extractMetaString(hoveredNode.meta, "source")
+              ? ` • source: ${extractMetaString(hoveredNode.meta, "source")}`
+              : ""}
+          </div>
+        </div>
+      ) : null}
+
+      {hoveredEdge ? (
+        <div className="pointer-events-none absolute right-3 top-14 z-20 max-w-[360px] rounded-xl border border-[#d5dbf4] bg-white/95 p-2.5 text-[11px] text-[#3f4a77] shadow-[0_18px_40px_rgba(57,64,130,0.2)] backdrop-blur">
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-semibold text-[#434aa1]">
+              {hoveredEdgeSourceLabel} → {hoveredEdgeTargetLabel}
+            </div>
+            <span className="rounded-full border border-[#d4d9f3] bg-[#f2f4ff] px-1.5 py-0.5 text-[10px] text-[#5a628f]">
+              {hoveredEdge.type}
+            </span>
+          </div>
+          <div className="mt-1 text-[#5a638f]">
+            {extractMetaString(hoveredEdge.meta, "note") ??
+              extractMetaString(hoveredEdge.meta, "source") ??
+              "Mechanistic edge candidate."}
+          </div>
+          {hoveredEdgeFacts.length > 0 ? (
+            <div className="mt-1 space-y-0.5 text-[10px] text-[#5f6ba1]">
+              {hoveredEdgeFacts.map((line) => (
+                <div key={line}>{line}</div>
+              ))}
+            </div>
+          ) : null}
+          <div className="mt-1 text-[10px] text-[#6670a1]">
+            weight: {(hoveredEdge.weight ?? 0).toFixed(3)}
+            {extractMetaString(hoveredEdge.meta, "status")
+              ? ` • status: ${extractMetaString(hoveredEdge.meta, "status")}`
+              : ""}
+          </div>
+        </div>
+      ) : null}
 
       <CytoscapeComponent
         elements={elements}
@@ -711,14 +1110,14 @@ export function GraphCanvas({
 
       {nodes.length === 0 ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-          <div className="rounded-full border border-[#f1d8c2] bg-white px-4 py-2 text-xs font-medium text-[#8b4f1a]">
+          <div className="rounded-full border border-[#d5dbf4] bg-white px-4 py-2 text-xs font-medium text-[#454ca2]">
             Building core network...
           </div>
         </div>
       ) : null}
 
-      <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-[#f1d8c2] bg-white/92 px-2.5 py-1.5 text-[10px] text-[#94633a]">
-        Right-click: neighborhood focus • Shift-click two nodes: shortest path
+      <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-[#d5dbf4] bg-white/94 px-2.5 py-1.5 text-[10px] text-[#4f5f8e]">
+        Hover: node/edge evidence • Right-click: neighborhood focus • Shift-click two nodes: shortest path
       </div>
     </div>
   );

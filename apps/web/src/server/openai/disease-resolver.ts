@@ -1,7 +1,7 @@
-import OpenAI from "openai";
 import { appConfig } from "@/server/config";
 import { handleOpenAiRateLimit, isOpenAiRateLimited } from "@/server/openai/rate-limit";
 import { chooseDiseaseAutocompleteRankingModel } from "@/server/openai/model-router";
+import { createTrackedOpenAIClient } from "@/server/openai/client";
 
 export type DiseaseCandidate = {
   id: string;
@@ -15,9 +15,9 @@ export type DiseaseAliasExpansion = {
   rationale: string;
 };
 
-const openai = appConfig.openAiApiKey
-  ? new OpenAI({ apiKey: appConfig.openAiApiKey })
-  : null;
+function getOpenAiClient() {
+  return createTrackedOpenAIClient();
+}
 
 function normalizeText(value: string): string {
   return value
@@ -154,6 +154,7 @@ export async function rankDiseaseCandidatesFast(
   candidates: DiseaseCandidate[],
   limit = 8,
 ): Promise<DiseaseCandidate[]> {
+  const openai = getOpenAiClient();
   if (candidates.length === 0) return [];
 
   const lexical = lexicalRankDiseaseCandidates(query, candidates);
@@ -297,6 +298,7 @@ export async function chooseBestDiseaseCandidate(
   query: string,
   candidates: DiseaseCandidate[],
 ): Promise<{ selected: DiseaseCandidate; rationale: string }> {
+  const openai = getOpenAiClient();
   if (candidates.length === 0) {
     throw new Error("No disease candidates available");
   }
@@ -400,6 +402,7 @@ export async function chooseBestDiseaseCandidate(
 }
 
 export async function expandDiseaseAliases(query: string): Promise<DiseaseAliasExpansion> {
+  const openai = getOpenAiClient();
   const intent = extractDiseaseIntent(query).trim();
   if (!intent) {
     return {

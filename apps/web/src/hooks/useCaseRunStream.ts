@@ -93,6 +93,17 @@ export type FinalBriefSection = {
     source: string;
     url?: string;
   }>;
+  evidenceSummary?: {
+    targetsWithEvidence: number;
+    articleSnippets: number;
+    trialSnippets: number;
+    citationCount: number;
+    citationBreakdown: {
+      article: number;
+      trial: number;
+      metric: number;
+    };
+  };
   caveats: string[];
   nextActions: string[];
   queryAlignment?: {
@@ -113,6 +124,128 @@ export type StatusUpdate = {
   partial?: boolean;
   counts?: Record<string, number>;
   sourceHealth?: Record<string, "green" | "yellow" | "red">;
+};
+
+export type JourneyEntity = {
+  type:
+    | "disease"
+    | "target"
+    | "pathway"
+    | "drug"
+    | "interaction"
+    | "phenotype"
+    | "anatomy"
+    | "effect"
+    | "molecule"
+    | "protein";
+  label: string;
+  primaryId?: string;
+};
+
+export type JourneyEntry = {
+  id: string;
+  ts: string;
+  kind:
+    | "phase"
+    | "tool_start"
+    | "tool_result"
+    | "insight"
+    | "warning"
+    | "handoff"
+    | "followup"
+    | "branch";
+  title: string;
+  detail: string;
+  source:
+    | "agent"
+    | "planner"
+    | "opentargets"
+    | "reactome"
+    | "chembl"
+    | "string"
+    | "biomcp"
+    | "pubmed";
+  pathState?: "active" | "candidate" | "discarded";
+  entities: JourneyEntity[];
+  graphPatch?: {
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+  };
+};
+
+export type AgentFinalAnswer = {
+  answer: string;
+  biomedicalCase: {
+    title: string;
+    whyAgentic: string;
+  };
+  focusThread: {
+    pathway: string;
+    target: string;
+    drug: string;
+  };
+  keyFindings: string[];
+  caveats: string[];
+  nextActions: string[];
+};
+
+export type CitationBundle = {
+  sections: Array<{ section: string; citationIndices: number[] }>;
+  citations: Array<{
+    index: number;
+    kind: "article" | "trial" | "metric";
+    label: string;
+    source: string;
+    url?: string;
+  }>;
+};
+
+export type LlmCostRollup = {
+  key: string;
+  calls: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  uncachedInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  estimatedCostUsd: number | null;
+  cacheHitRate: number;
+};
+
+export type LlmCostSummary = {
+  runId: string;
+  query?: string;
+  startedAt: string;
+  updatedAt: string;
+  totalCalls: number;
+  totals: {
+    inputTokens: number;
+    cachedInputTokens: number;
+    uncachedInputTokens: number;
+    outputTokens: number;
+    reasoningTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number | null;
+    cacheHitRate: number;
+  };
+  byModel: LlmCostRollup[];
+  byOperation: LlmCostRollup[];
+  bySource: LlmCostRollup[];
+  topCalls: Array<{
+    id: string;
+    at: string;
+    model: string;
+    source: string;
+    operation: string;
+    inputTokens: number;
+    cachedInputTokens: number;
+    uncachedInputTokens: number;
+    outputTokens: number;
+    reasoningTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number | null;
+  }>;
 };
 
 type StartOptions = {
@@ -144,6 +277,7 @@ export function useCaseRunStream() {
   const intentionalCloseRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const journeyIdCountRef = useRef<Map<string, number>>(new Map());
   const pendingStartRef = useRef(false);
   const isRunningRef = useRef(false);
   const [runSessionId] = useState(() => {
@@ -164,6 +298,15 @@ export function useCaseRunStream() {
   const [edgeMap, setEdgeMap] = useState<Map<string, GraphEdge>>(new Map());
   const [recommendation, setRecommendation] = useState<RecommendationSection | null>(null);
   const [finalBrief, setFinalBrief] = useState<FinalBriefSection | null>(null);
+  const [journeyEntries, setJourneyEntries] = useState<JourneyEntry[]>([]);
+  const [journeyStatusMessage, setJourneyStatusMessage] = useState<string | null>(null);
+  const [journeyStartedAtMs, setJourneyStartedAtMs] = useState<number | null>(null);
+  const [journeyElapsedMs, setJourneyElapsedMs] = useState<number | null>(null);
+  const [journeyIsRunning, setJourneyIsRunning] = useState(false);
+  const [agentFinal, setAgentFinal] = useState<AgentFinalAnswer | null>(null);
+  const [agentAnswerText, setAgentAnswerText] = useState("");
+  const [citationBundle, setCitationBundle] = useState<CitationBundle | null>(null);
+  const [llmCost, setLlmCost] = useState<LlmCostSummary | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
 
   useEffect(() => {
@@ -182,7 +325,17 @@ export function useCaseRunStream() {
     setEdgeMap(new Map());
     setRecommendation(null);
     setFinalBrief(null);
+    setJourneyEntries([]);
+    setJourneyStatusMessage(null);
+    setJourneyStartedAtMs(null);
+    setJourneyElapsedMs(null);
+    setJourneyIsRunning(false);
+    setAgentFinal(null);
+    setAgentAnswerText("");
+    setCitationBundle(null);
+    setLlmCost(null);
     setErrors([]);
+    journeyIdCountRef.current = new Map();
   }, []);
 
   const postInterrupt = useCallback((sessionId: string) => {
@@ -210,6 +363,7 @@ export function useCaseRunStream() {
     pendingStartRef.current = false;
     isRunningRef.current = false;
     setIsRunning(false);
+    setJourneyIsRunning(false);
     if (notifyRemote && hadActiveRun && sessionId) {
       postInterrupt(sessionId);
     }
@@ -275,6 +429,8 @@ export function useCaseRunStream() {
           intentionalCloseRef.current = false;
           isRunningRef.current = true;
           setIsRunning(true);
+          setJourneyIsRunning(true);
+          setJourneyStartedAtMs(Date.now());
           activeRunIdRef.current = runId;
 
           const params = new URLSearchParams({
@@ -293,6 +449,140 @@ export function useCaseRunStream() {
           const source = new EventSource(`/api/runCaseStream?${params.toString()}`);
           sourceRef.current = source;
 
+          const mergeGraphPatch = (payload: { nodes?: GraphNode[]; edges?: GraphEdge[] }) => {
+            setNodeMap((prev) => {
+              const next = new Map(prev);
+              for (const node of payload.nodes ?? []) {
+                const existing = next.get(node.id);
+                next.set(
+                  node.id,
+                  existing
+                    ? {
+                        ...existing,
+                        ...node,
+                        meta: {
+                          ...existing.meta,
+                          ...node.meta,
+                        },
+                      }
+                    : node,
+                );
+              }
+              return next;
+            });
+
+            setEdgeMap((prev) => {
+              const next = new Map(prev);
+              for (const edge of payload.edges ?? []) {
+                const existing = next.get(edge.id);
+                next.set(
+                  edge.id,
+                  existing
+                    ? {
+                        ...existing,
+                        ...edge,
+                        meta: {
+                          ...existing.meta,
+                          ...edge.meta,
+                        },
+                      }
+                    : edge,
+                );
+              }
+              return next;
+            });
+          };
+
+          const appendJourneyEntry = (
+            payload: unknown,
+            fallbackKind: JourneyEntry["kind"] = "insight",
+          ) => {
+            if (!payload || typeof payload !== "object") return;
+            const row = payload as Record<string, unknown>;
+            const title =
+              typeof row.title === "string" && row.title.trim().length > 0
+                ? row.title
+                : "Agent update";
+            const detail =
+              typeof row.detail === "string" && row.detail.trim().length > 0
+                ? row.detail
+                : title;
+            const id =
+              typeof row.id === "string" && row.id.trim().length > 0
+                ? row.id
+                : `journey-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+            const duplicateCount = journeyIdCountRef.current.get(id) ?? 0;
+            journeyIdCountRef.current.set(id, duplicateCount + 1);
+            const uniqueId = duplicateCount === 0 ? id : `${id}:${duplicateCount + 1}`;
+            const ts =
+              typeof row.ts === "string" && row.ts.trim().length > 0
+                ? row.ts
+                : new Date().toISOString();
+            const kind =
+              typeof row.kind === "string" && row.kind.trim().length > 0
+                ? (row.kind as JourneyEntry["kind"])
+                : fallbackKind;
+            const sourceName =
+              typeof row.source === "string" && row.source.trim().length > 0
+                ? (row.source as JourneyEntry["source"])
+                : "agent";
+            const pathState =
+              typeof row.pathState === "string" && row.pathState.trim().length > 0
+                ? (row.pathState as JourneyEntry["pathState"])
+                : undefined;
+            const entities = Array.isArray(row.entities)
+              ? (row.entities as JourneyEntity[])
+              : [];
+            const graphPatch =
+              row.graphPatch && typeof row.graphPatch === "object"
+                ? (row.graphPatch as JourneyEntry["graphPatch"])
+                : undefined;
+            const entry: JourneyEntry = {
+              id: uniqueId,
+              ts,
+              kind,
+              title,
+              detail,
+              source: sourceName,
+              pathState,
+              entities,
+              graphPatch,
+            };
+            setJourneyEntries((prev) => [...prev, entry].slice(-300));
+            setJourneyStatusMessage(detail);
+            if (graphPatch) {
+              mergeGraphPatch({
+                nodes: graphPatch.nodes,
+                edges: graphPatch.edges,
+              });
+            }
+          };
+
+          source.addEventListener("run_started", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as {
+                runId?: string;
+                query?: string;
+                startedAt?: string;
+              };
+              setJourneyIsRunning(true);
+              if (payload.startedAt) {
+                const parsedStartedAtMs = Date.parse(payload.startedAt);
+                if (Number.isFinite(parsedStartedAtMs)) {
+                  setJourneyStartedAtMs(parsedStartedAtMs);
+                }
+              }
+              if (payload.runId) {
+                activeRunIdRef.current = payload.runId;
+              }
+              if (payload.query) {
+                setJourneyStatusMessage(`Running: ${payload.query}`);
+              }
+            } catch {
+              // ignore parse errors
+            }
+          });
+
           source.addEventListener("status", (event) => {
             try {
               const payload = JSON.parse((event as MessageEvent<string>).data) as StatusUpdate;
@@ -304,6 +594,10 @@ export function useCaseRunStream() {
                 }
                 return [...prev, payload];
               });
+              setJourneyStatusMessage(payload.message);
+              if (typeof payload.elapsedMs === "number") {
+                setJourneyElapsedMs(payload.elapsedMs);
+              }
             } catch {
               // ignore parse errors
             }
@@ -324,6 +618,23 @@ export function useCaseRunStream() {
             try {
               const payload = JSON.parse((event as MessageEvent<string>).data) as ResolverSelection;
               setResolverSelection(payload);
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("plan_ready", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as {
+                queryPlan?: QueryPlan;
+                resolver?: ResolverSelection;
+              };
+              if (payload.queryPlan) {
+                setQueryPlan(payload.queryPlan);
+              }
+              if (payload.resolver) {
+                setResolverSelection(payload.resolver);
+              }
             } catch {
               // ignore parse errors
             }
@@ -362,48 +673,19 @@ export function useCaseRunStream() {
                 nodes: GraphNode[];
                 edges: GraphEdge[];
               };
+              mergeGraphPatch(payload);
+            } catch {
+              // ignore parse errors
+            }
+          });
 
-              setNodeMap((prev) => {
-                const next = new Map(prev);
-                for (const node of payload.nodes ?? []) {
-                  const existing = next.get(node.id);
-                  next.set(
-                    node.id,
-                    existing
-                      ? {
-                          ...existing,
-                          ...node,
-                          meta: {
-                            ...existing.meta,
-                            ...node.meta,
-                          },
-                        }
-                      : node,
-                  );
-                }
-                return next;
-              });
-
-              setEdgeMap((prev) => {
-                const next = new Map(prev);
-                for (const edge of payload.edges ?? []) {
-                  const existing = next.get(edge.id);
-                  next.set(
-                    edge.id,
-                    existing
-                      ? {
-                          ...existing,
-                          ...edge,
-                          meta: {
-                            ...existing.meta,
-                            ...edge.meta,
-                          },
-                        }
-                      : edge,
-                  );
-                }
-                return next;
-              });
+          source.addEventListener("graph_delta", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as {
+                nodes: GraphNode[];
+                edges: GraphEdge[];
+              };
+              mergeGraphPatch(payload);
             } catch {
               // ignore parse errors
             }
@@ -428,6 +710,121 @@ export function useCaseRunStream() {
             }
           });
 
+          source.addEventListener("narration_delta", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as unknown;
+              appendJourneyEntry(payload, "insight");
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("branch_update", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as unknown;
+              appendJourneyEntry(payload, "branch");
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("tool_call", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as unknown;
+              appendJourneyEntry(payload, "tool_start");
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("tool_result", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as unknown;
+              appendJourneyEntry(payload, "tool_result");
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("answer_delta", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as {
+                text?: string;
+              };
+              if (typeof payload.text === "string") {
+                setAgentAnswerText(payload.text);
+              }
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("final_answer", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as AgentFinalAnswer;
+              setAgentFinal(payload);
+              if (typeof payload.answer === "string") {
+                setAgentAnswerText(payload.answer);
+              }
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("citation_bundle", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as CitationBundle;
+              setCitationBundle(payload);
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("run_completed", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as {
+                elapsedMs?: number;
+                finalAnswer?: AgentFinalAnswer | null;
+                llmCost?: LlmCostSummary | null;
+              };
+              if (typeof payload.elapsedMs === "number") {
+                setJourneyElapsedMs(payload.elapsedMs);
+              }
+              if (payload.finalAnswer) {
+                setAgentFinal(payload.finalAnswer);
+                if (typeof payload.finalAnswer.answer === "string") {
+                  setAgentAnswerText(payload.finalAnswer.answer);
+                }
+              }
+              if (payload.llmCost) {
+                setLlmCost(payload.llmCost);
+              }
+              setJourneyIsRunning(false);
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("llm_cost", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as LlmCostSummary;
+              setLlmCost(payload);
+            } catch {
+              // ignore parse errors
+            }
+          });
+
+          source.addEventListener("run_error", (event) => {
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as {
+                message?: string;
+              };
+              setErrors((prev) => [...prev, payload.message ?? "run error"]);
+            } catch {
+              setErrors((prev) => [...prev, "run error"]);
+            }
+          });
+
           source.addEventListener("error", (event) => {
             try {
               const payload = JSON.parse((event as MessageEvent<string>).data) as {
@@ -439,17 +836,35 @@ export function useCaseRunStream() {
             }
           });
 
-          source.addEventListener("done", () => {
+          source.addEventListener("done", (event) => {
+            let doneElapsedMs: number | undefined;
+            try {
+              const payload = JSON.parse((event as MessageEvent<string>).data) as {
+                elapsedMs?: number;
+                llmCost?: LlmCostSummary | null;
+              };
+              if (typeof payload.elapsedMs === "number") {
+                doneElapsedMs = payload.elapsedMs;
+                setJourneyElapsedMs(payload.elapsedMs);
+              }
+              if (payload.llmCost) {
+                setLlmCost(payload.llmCost);
+              }
+            } catch {
+              // ignore parse errors
+            }
             intentionalCloseRef.current = true;
             setStatus((prev) => ({
               phase: "P6",
               message: "Build complete",
               pct: 100,
-              elapsedMs: prev?.elapsedMs,
+              elapsedMs: doneElapsedMs ?? prev?.elapsedMs,
               partial: false,
               counts: prev?.counts,
               sourceHealth: prev?.sourceHealth,
             }));
+            setJourneyStatusMessage("Build complete");
+            setJourneyIsRunning(false);
             isRunningRef.current = false;
             setIsRunning(false);
             sourceRef.current = null;
@@ -467,6 +882,7 @@ export function useCaseRunStream() {
             }
             isRunningRef.current = false;
             setIsRunning(false);
+            setJourneyIsRunning(false);
             setErrors((prev) => [...prev, "stream interrupted"]);
             sourceRef.current = null;
             activeRunIdRef.current = null;
@@ -496,6 +912,15 @@ export function useCaseRunStream() {
       edges: [...edgeMap.values()],
       recommendation,
       finalBrief,
+      journeyEntries,
+      journeyStatusMessage,
+      journeyStartedAtMs,
+      journeyElapsedMs,
+      journeyIsRunning,
+      agentFinal,
+      agentAnswerText,
+      citationBundle,
+      llmCost,
       errors,
       start,
       stop,
@@ -507,6 +932,15 @@ export function useCaseRunStream() {
       edgeMap,
       errors,
       finalBrief,
+      journeyEntries,
+      journeyStatusMessage,
+      journeyStartedAtMs,
+      journeyElapsedMs,
+      journeyIsRunning,
+      agentFinal,
+      agentAnswerText,
+      citationBundle,
+      llmCost,
       interrupt,
       isRunning,
       nodeMap,

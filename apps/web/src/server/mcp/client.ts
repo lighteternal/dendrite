@@ -1,12 +1,34 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { appConfig } from "@/server/config";
+
+function isLoopbackEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint);
+    const host = url.hostname.toLowerCase();
+    return (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "0.0.0.0" ||
+      host === "::1"
+    );
+  } catch {
+    return false;
+  }
+}
 
 export class McpClient {
   private readonly endpoint: string;
+  private readonly transportDisabled: boolean;
 
   constructor(endpoint: string) {
     this.endpoint = endpoint;
+    const runningOnVercel = Boolean(process.env.VERCEL);
+    const loopbackEndpoint = isLoopbackEndpoint(endpoint);
+    this.transportDisabled =
+      appConfig.mcpTransportMode === "fallback_only" ||
+      (appConfig.mcpTransportMode === "auto" && runningOnVercel && loopbackEndpoint);
   }
 
   async callToolRaw(
@@ -14,6 +36,10 @@ export class McpClient {
     args: Record<string, unknown>,
     timeoutMs = 12_000,
   ): Promise<string> {
+    if (this.transportDisabled) {
+      throw new Error(`MCP transport disabled for endpoint: ${this.endpoint}`);
+    }
+
     const abortController = new AbortController();
     let timedOut = false;
     const timeout = setTimeout(() => {

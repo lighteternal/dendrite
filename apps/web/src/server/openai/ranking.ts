@@ -1,4 +1,3 @@
-import OpenAI from "openai";
 import {
   hypothesisResponseSchema,
   mechanismThreadSchema,
@@ -12,6 +11,7 @@ import {
   chooseMechanismThreadModel,
   chooseRankingModel,
 } from "@/server/openai/model-router";
+import { createTrackedOpenAIClient } from "@/server/openai/client";
 
 type RankingInputRow = {
   id: string;
@@ -45,9 +45,9 @@ type HypothesisInput = {
   }>;
 };
 
-const openai = appConfig.openAiApiKey
-  ? new OpenAI({ apiKey: appConfig.openAiApiKey })
-  : null;
+function getOpenAiClient() {
+  return createTrackedOpenAIClient();
+}
 
 async function callStructuredJson<T>(options: {
   schemaName: string;
@@ -59,6 +59,7 @@ async function callStructuredJson<T>(options: {
   maxOutputTokens?: number;
   timeoutMs?: number;
 }): Promise<T> {
+  const openai = getOpenAiClient();
   if (!openai) {
     throw new Error("OPENAI_API_KEY is not configured");
   }
@@ -112,6 +113,8 @@ async function callStructuredJson<T>(options: {
           { role: "system", content: options.systemPrompt },
           { role: "user", content: options.userPrompt },
         ],
+        max_completion_tokens: options.maxOutputTokens,
+        max_tokens: options.maxOutputTokens,
         response_format: {
           type: "json_schema",
           json_schema: {
@@ -191,6 +194,7 @@ export function rankTargetsFallback(rows: RankingInputRow[]): RankingResponse {
 
 export async function rankTargets(rows: RankingInputRow[]): Promise<RankingResponse> {
   const fallback = rankTargetsFallback(rows);
+  const openai = getOpenAiClient();
   if (!openai) return fallback;
   const rankingModel = chooseRankingModel(rows.length);
 
@@ -324,6 +328,7 @@ export async function generateMechanismThread(
   input: HypothesisInput,
 ): Promise<HypothesisResponse> {
   const fallback = mechanismThreadFallback(input);
+  const openai = getOpenAiClient();
   const mechanismModel = chooseMechanismThreadModel({
     scoredTargetsCount: input.scoredTargets.length,
     outputCount: input.outputCount,

@@ -1,4 +1,3 @@
-import OpenAI from "openai";
 import { createTTLCache } from "@/server/cache/lru";
 import { appConfig } from "@/server/config";
 import {
@@ -16,6 +15,7 @@ import {
   QueryPlanFollowup,
   ResolvedQueryPlan,
 } from "@/server/agent/query-plan";
+import { extractRelationMentionsFast } from "@/server/agent/relation-mention-extractor";
 import {
   searchDiseases,
   searchDrugs,
@@ -23,6 +23,7 @@ import {
   type TargetHit,
 } from "@/server/mcp/opentargets";
 import { searchDrugCandidates } from "@/server/mcp/chembl";
+import { createTrackedOpenAIClient } from "@/server/openai/client";
 
 type CandidateEntityType = "disease" | "target" | "drug";
 type MentionType =
@@ -73,9 +74,9 @@ export type QueryEntityBundle = {
 
 const diseaseIdPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
 const mentionBoundaryPattern = /[.,;:!?()[\]{}]/g;
-const openai = appConfig.openAiApiKey
-  ? new OpenAI({ apiKey: appConfig.openAiApiKey })
-  : null;
+function getOpenAiClient() {
+  return createTrackedOpenAIClient();
+}
 const bundleCache = createTTLCache<string, QueryEntityBundle>(
   Math.min(appConfig.cache.ttlMs, 2 * 60 * 1000),
   Math.min(appConfig.cache.maxEntries, 500),
@@ -155,19 +156,57 @@ function sanitizeMention(value: string): string {
     .trim();
 }
 
+function isLikelySymbolMention(mention: string): boolean {
+  const normalizedMention = mention.trim();
+  if (!normalizedMention || normalizedMention.includes(" ")) return false;
+  const compactMention = alnumCompact(normalizedMention);
+  if (!compactMention) return false;
+  if (compactMention.length > 12) return false;
+  return /[0-9]/.test(compactMention) || compactMention.length <= 6;
+}
+
+function isGenericMechanismMention(mention: string): boolean {
+  const normalizedMention = sanitizeMention(mention);
+  if (!normalizedMention) return false;
+  const tokens = normalizedMention.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 4) return false;
+  const hasDiseaseCue = /\b(?:disease|disorder|syndrome|cancer|carcinoma|tumou?r|diabetes|obesity|lupus|arthritis|sclerosis|colitis|asthma|fibrosis|infection|infarction)\b/i.test(
+    normalizedMention,
+  );
+  if (hasDiseaseCue) return false;
+  const hasSymbolLikeToken = tokens.some((token) => /^[a-z]{1,6}\d{1,3}[a-z]?$/i.test(token.replace(/-/g, "")));
+  if (hasSymbolLikeToken) return false;
+  const genericTokens = tokens.filter((token) =>
+    /^(?:inflammatory|immune|metabolic|cellular|molecular|inflammation|signaling|signal|pathway|pathways|mechanism|mechanistic|network|cascade|axis|events?)$/i.test(
+      token,
+    ),
+  ).length;
+  if (genericTokens === tokens.length) return true;
+  return (
+    genericTokens >= Math.max(1, tokens.length - 1) &&
+    /\b(?:signaling|signal|pathway|pathways|mechanism|mechanistic|network|cascade|axis|events?)\b/i.test(
+      normalizedMention,
+    )
+  );
+}
+
 function normalizeRelationMention(value: string): string {
   let mention = sanitizeMention(normalizeDisplay(value));
   if (!mention) return "";
+  mention = mention.replace(/^(?:through|via|by|using)\s+/i, "");
   mention = mention.replace(
-    /^(?:how|what|which|why)\s+(?:does|do|is|are|can|could|would|will|should)\s+/i,
+    /^(?:how|what|which|why)\s+(?:might|may|does|do|did|is|are|can|could|would|will|should)\s+/i,
     "",
   );
   mention = mention.replace(/^(?:how|what|which|why)\s+/i, "");
-  const prepositionTailMatch = mention.match(/\b(?:in|for|of|with)\s+(.+)$/i);
+  mention = mention.replace(/^(?:might|may|does|do|did|is|are|can|could|would|will|should)\s+/i, "");
+  mention = mention.replace(/^(?:the|a|an)\s+/i, "");
+  const prepositionTailMatch = mention.match(/\b(?:in|for|of|with|through|via|by|using)\s+(.+)$/i);
   if (prepositionTailMatch?.[1]) {
     const tail = sanitizeMention(prepositionTailMatch[1]);
     if (tail.length >= 3) mention = tail;
   }
+  if (isGenericMechanismMention(mention)) return "";
   return mention;
 }
 
@@ -176,12 +215,25 @@ function extractStructuredMentions(query: string): string[] {
   if (!cleaned) return [];
 
   const mentions = new Set<string>();
+  const normalizeMentionParts = (value: string): string[] => {
+    const raw = String(value ?? "").trim();
+    if (!raw) return [];
+    const parts = raw
+      .split(/\s*,\s*|\s+(?:and|&)\s+/i)
+      .map((item) => normalizeRelationMention(item))
+      .filter(Boolean);
+    if (parts.length > 1) return parts;
+    const single = normalizeRelationMention(raw);
+    return single ? [single] : [];
+  };
   const addMention = (value: string) => {
-    const mention = normalizeRelationMention(value);
-    if (!mention || mention.length < 2) return;
-    if (mention.length > 90) return;
-    if (mention.split(/\s+/).filter(Boolean).length > 6) return;
-    mentions.add(mention);
+    for (const mention of normalizeMentionParts(value)) {
+      if (!mention || mention.length < 2) continue;
+      if (mention.length > 90) continue;
+      if (mention.split(/\s+/).filter(Boolean).length > 6) continue;
+      if (isGenericMechanismMention(mention)) continue;
+      mentions.add(mention);
+    }
   };
 
   const betweenMatch = cleaned.match(
@@ -218,6 +270,18 @@ function extractStructuredMentions(query: string): string[] {
     addMention(versusMatch[1] ?? "");
     addMention(versusMatch[2] ?? "");
     addMention(versusMatch[3] ?? "");
+  }
+
+  const causalPatterns = [
+    /\b(.+?)\s+(?:lead|leads|leading|drives?|driven|contributes?|causes?|triggers?|promotes?|predisposes?)\s+(?:to\s+)?(.+?)(?:\s+(?:through|via|using|with|by)\s+(.+))?$/i,
+    /\b(.+?)\s+(?:results?\s+in|linked\s+to|associated\s+with|correlat(?:ed|es?|ion)\s+with)\s+(.+?)(?:\s+(?:through|via|using|with|by)\s+(.+))?$/i,
+  ] as const;
+  for (const pattern of causalPatterns) {
+    const match = cleaned.match(pattern);
+    if (!match) continue;
+    addMention(match[1] ?? "");
+    addMention(match[2] ?? "");
+    addMention(match[3] ?? "");
   }
 
   for (const match of cleaned.matchAll(/["'`](.{2,90}?)["'`]/g)) {
@@ -289,6 +353,7 @@ function filterResolvedUnresolvedMentions(
   return unresolvedMentions.filter((mention) => {
     const normalized = normalize(mention);
     if (!normalized) return false;
+    if (isGenericMechanismMention(mention)) return false;
     const tokens = normalized.split(/\s+/).filter(Boolean);
     const hasResolvedDiseaseAnchor = anchors.some((anchor) => anchor.entityType === "disease");
     if (
@@ -360,6 +425,34 @@ function mergeQueryPlans(
   };
 }
 
+function keepDiseaseAnchor(anchor: QueryPlanAnchor): boolean {
+  if (anchor.entityType !== "disease") return true;
+  const mention = sanitizeMention(anchor.mention);
+  if (!mention) return true;
+  const mentionSimilarity = similarity(mention, anchor.name);
+  const hasDirectDiseaseCue = /\b(?:disease|disorder|syndrome|cancer|carcinoma|tumou?r|diabetes|obesity|lupus|arthritis|sclerosis|colitis|asthma|fibrosis|infection)\b/i.test(
+    mention,
+  );
+  if (mentionSimilarity >= 0.45 || hasDirectDiseaseCue) return true;
+  const mechanisticPhrase = /\b(signaling|signal|pathway|pathways|mechanism|mechanistic|network|axis|cascade|events?)\b/i.test(
+    mention,
+  );
+  if (mechanisticPhrase) return false;
+  const tokenCount = mention.split(/\s+/).filter(Boolean).length;
+  if (tokenCount <= 2 && anchor.confidence < 0.72) return false;
+  return true;
+}
+
+function targetSymbolHintFromMention(mention: string): string | null {
+  const mechanismTrimmed = mention
+    .replace(/\b(signaling|signal|pathway|pathways|axis|cascade|network|events?)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const compactMention = alnumCompact(mechanismTrimmed || mention);
+  if (!/^[a-z]{2,6}\d{1,3}[a-z]?$/i.test(compactMention)) return null;
+  return compactMention.toUpperCase();
+}
+
 function mentionsFromQueryPlan(
   query: string,
   queryPlan: ResolvedQueryPlan | null,
@@ -387,12 +480,14 @@ function mentionsFromQueryPlan(
     mentionSet.add(mention);
   }
   for (const relationMention of extractStructuredMentions(query)) {
+    if (isGenericMechanismMention(relationMention)) continue;
     mentionSet.add(relationMention);
   }
   return [...mentionSet]
     .map((item) => item.trim())
     .filter((item) => item.length >= 3)
     .filter((item) => !/\b(connect|connection|relationship|compare|between)\b/i.test(item))
+    .filter((item) => !isGenericMechanismMention(item))
     .slice(0, 8);
 }
 
@@ -460,6 +555,7 @@ function extractMentions(query: string): string[] {
     .filter((value) => value.length >= 3)
     .filter((value) => !/^(?:what|which|how|why)\b/i.test(value))
     .filter((value) => !/\b(connect|connection|relationship|compare|between|versus|vs)\b/i.test(value))
+    .filter((value) => !isGenericMechanismMention(value))
     .sort((a, b) => scoreMention(b) - scoreMention(a))
     .slice(0, 10);
 }
@@ -504,6 +600,13 @@ async function searchMentionCandidates(mention: string): Promise<MentionCandidat
     if (splitPoint > 1) {
       mentionVariants.add(`${compactMention.slice(0, splitPoint)}-${compactMention.slice(splitPoint)}`);
     }
+  }
+  const mechanismTrimmed = normalizedMention
+    .replace(/\b(signaling|signal|pathway|pathways|axis|cascade|network|events?)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (mechanismTrimmed && mechanismTrimmed.length >= 2 && mechanismTrimmed !== normalizedMention) {
+    mentionVariants.add(mechanismTrimmed);
   }
 
   const variants = [...mentionVariants].slice(0, 4);
@@ -600,6 +703,8 @@ async function searchMentionCandidates(mention: string): Promise<MentionCandidat
   const mentionTokenCount = tokenize(normalizedMention).length;
   const lowerAlphaSingleToken =
     mentionTokenCount <= 1 && /^[a-z]{4,}$/.test(normalizedMention);
+  const genericMechanisticMention = isGenericMechanismMention(normalizedMention);
+  const symbolMention = isLikelySymbolMention(normalizedMention);
   const filtered = [...deduped.values()].filter((row) => {
     const cutoff =
       row.entityType === "disease"
@@ -607,14 +712,46 @@ async function searchMentionCandidates(mention: string): Promise<MentionCandidat
           ? lowerAlphaSingleToken
             ? 0.66
             : 0.5
-          : 0.34
+          : genericMechanisticMention
+            ? 0.7
+            : 0.34
         : mentionTokenCount <= 1
           ? 0.52
-          : 0.32;
+          : genericMechanisticMention
+            ? symbolMention
+              ? 0.46
+              : 0.72
+            : 0.4;
     return row.score >= cutoff;
   });
 
-  return filtered.sort((a, b) => b.score - a.score);
+  const mentionCompact = alnumCompact(mechanismTrimmed || normalizedMention).toLowerCase();
+  const hintTokens = new Set<string>();
+  if (/^[a-z]{2,6}\d{1,3}[a-z]?$/i.test(mentionCompact)) {
+    hintTokens.add(mentionCompact);
+    const splitIndex = mentionCompact.search(/[0-9]/);
+    if (splitIndex > 1) {
+      const prefix = mentionCompact.slice(0, splitIndex);
+      const suffix = mentionCompact.slice(splitIndex);
+      hintTokens.add(`${prefix}-${suffix}`);
+      hintTokens.add(`${prefix} ${suffix}`);
+      if (prefix === "il") {
+        hintTokens.add(`interleukin ${suffix}`);
+      }
+    }
+  }
+
+  const boosted = filtered.map((row) => {
+    if (row.entityType !== "target" || hintTokens.size === 0) return row;
+    const haystack = `${row.name} ${row.description ?? ""}`.toLowerCase();
+    const matchesHint = [...hintTokens].some((hint) => haystack.includes(hint));
+    return {
+      ...row,
+      score: row.score + (matchesHint ? 0.45 : -0.12),
+    };
+  });
+
+  return boosted.sort((a, b) => b.score - a.score);
 }
 
 function diseaseCandidatesFromRows(
@@ -842,6 +979,7 @@ function fallbackBundle(query: string, mentions: string[], rows: MentionCandidat
 }
 
 function shouldSkipSemanticResolution(query: string, rows: MentionCandidate[]): boolean {
+  const openai = getOpenAiClient();
   if (!openai || isOpenAiRateLimited()) return true;
   if (rows.length === 0) return true;
   const diseaseCandidates = diseaseCandidatesFromRows(query, rows);
@@ -881,6 +1019,7 @@ async function runModelResolution(
   mentions: string[],
   rows: MentionCandidate[],
 ): Promise<QueryEntityBundle> {
+  const openai = getOpenAiClient();
   if (shouldSkipSemanticResolution(query, rows)) {
     return fallbackBundle(query, mentions, rows);
   }
@@ -1085,10 +1224,24 @@ export async function resolveQueryEntitiesBundle(query: string): Promise<QueryEn
   if (cached) return cached;
 
   const semanticPlan = await withTimeout(planQuery(trimmed), 14_000).catch(() => null);
+  const llmRelationMentions = (await extractRelationMentionsFast(trimmed, {
+    maxMentions: 6,
+    timeoutMs: 1_800,
+  }).catch(() => []))
+    .map((item) => sanitizeMention(item))
+    .filter((item) => item.length >= 3)
+    .filter((item) => !isGenericMechanismMention(item));
   const mentions = (() => {
     const fromPlan = mentionsFromQueryPlan(trimmed, semanticPlan);
-    if (fromPlan.length > 0) return fromPlan;
-    return extractMentions(trimmed);
+    const lexical = fromPlan.length > 0 ? fromPlan : extractMentions(trimmed);
+    const merged = new Set<string>();
+    for (const mention of [...fromPlan, ...llmRelationMentions, ...lexical]) {
+      const normalizedMention = sanitizeMention(mention);
+      if (!normalizedMention) continue;
+      merged.add(normalizedMention);
+      if (merged.size >= 10) break;
+    }
+    return [...merged];
   })();
   const criticalSingleTokenMentions = mentions.filter(
     (mention) =>
@@ -1140,6 +1293,32 @@ export async function resolveQueryEntitiesBundle(query: string): Promise<QueryEn
     rationale: semanticPlan
       ? `${resolved.rationale} ${semanticPlan.rationale}`.trim()
       : resolved.rationale,
+  };
+  const canonicalAnchors = await Promise.all(
+    merged.queryPlan.anchors.map(async (anchor) => {
+      if (anchor.entityType !== "target") return anchor;
+      const symbolHint = targetSymbolHintFromMention(anchor.mention);
+      if (!symbolHint) return anchor;
+      if (alnumCompact(anchor.name).toUpperCase() === symbolHint) return anchor;
+      const hits = await withTimeout(searchTargets(symbolHint, 8), 5_000).catch(() => []);
+      const exact = hits.find((hit) => alnumCompact(hit.name).toUpperCase() === symbolHint);
+      if (!exact) return null;
+      return {
+        ...anchor,
+        id: exact.id,
+        name: exact.name,
+        description: exact.description,
+        confidence: Math.max(anchor.confidence, 0.92),
+      };
+    }),
+  );
+  merged.queryPlan = {
+    ...merged.queryPlan,
+    anchors: dedupeAnchorsSemantically(
+      canonicalAnchors
+        .filter((anchor): anchor is QueryPlanAnchor => Boolean(anchor))
+        .filter((anchor) => keepDiseaseAnchor(anchor)),
+    ),
   };
   if (
     merged.queryPlan.anchors.length > 0 ||

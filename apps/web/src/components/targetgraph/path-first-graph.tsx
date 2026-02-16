@@ -1,9 +1,15 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
 import { GraphCanvas } from "@/components/targetgraph/graph-canvas";
 import { analyzeBridgeOutcomes, type BridgeAnalysis } from "@/components/targetgraph/bridge-analysis";
+import {
+  EDGE_SOURCE_GROUP_META,
+  EDGE_SOURCE_GROUPS,
+  getEdgeSourceGroup,
+  type EdgeSourceGroup,
+} from "@/components/targetgraph/graph-source";
 import type { QueryPlan } from "@/hooks/useCaseRunStream";
 import { Badge } from "@/components/ui/badge";
 
@@ -30,6 +36,18 @@ type Props = {
   onBridgeAnalysisChange?: (analysis: BridgeAnalysis) => void;
 };
 
+type SourceCountMap = Record<EdgeSourceGroup, number>;
+
+function emptySourceCountMap(): SourceCountMap {
+  return EDGE_SOURCE_GROUPS.reduce(
+    (acc, group) => {
+      acc[group] = 0;
+      return acc;
+    },
+    {} as SourceCountMap,
+  );
+}
+
 export function PathFirstGraph({
   query,
   queryPlan = null,
@@ -47,6 +65,27 @@ export function PathFirstGraph({
   onBridgeAnalysisChange,
 }: Props) {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [sourceFilter, setSourceFilter] = useState<Record<EdgeSourceGroup, boolean>>(() =>
+    EDGE_SOURCE_GROUPS.reduce(
+      (acc, group) => {
+        acc[group] = true;
+        return acc;
+      },
+      {} as Record<EdgeSourceGroup, boolean>,
+    ),
+  );
+
+  const toggleSourceGroup = useCallback((group: EdgeSourceGroup) => {
+    setSourceFilter((current) => ({
+      ...current,
+      [group]: !current[group],
+    }));
+  }, []);
+
+  const allSourceGroupsEnabled = useMemo(
+    () => EDGE_SOURCE_GROUPS.every((group) => sourceFilter[group]),
+    [sourceFilter],
+  );
 
   const bridgeAnalysis = useMemo(
     () =>
@@ -87,6 +126,13 @@ export function PathFirstGraph({
 
     const nodeById = new Map(allNodes.map((node) => [node.id, node]));
     const edgeById = new Map(allEdges.map((edge) => [edge.id, edge]));
+    const edgeSourceById = new Map<string, EdgeSourceGroup>();
+    const totalEdgeCountsBySource = emptySourceCountMap();
+    for (const edge of allEdges) {
+      const sourceGroup = getEdgeSourceGroup(edge);
+      edgeSourceById.set(edge.id, sourceGroup);
+      totalEdgeCountsBySource[sourceGroup] += 1;
+    }
     const pathFocusNodeIds = new Set(pathUpdate?.nodeIds ?? []);
     const pathFocusEdgeIds = new Set(pathUpdate?.edgeIds ?? []);
     const hasPathUpdateEdges = (pathUpdate?.edgeIds?.length ?? 0) > 0;
@@ -207,6 +253,10 @@ export function PathFirstGraph({
       }
     }
 
+    const sourceFilterEnabled =
+      EDGE_SOURCE_GROUPS.some((group) => !sourceFilter[group]);
+    const isSourceEnabled = (edge: GraphEdge) => sourceFilter[getEdgeSourceGroup(edge)];
+
     const selectedEdgeIds = new Set<string>(focusEdgeIds);
     const addTopEdgesForTarget = (targetId: string, type: GraphEdge["type"], limit: number) => {
       const top = allEdges
@@ -215,6 +265,7 @@ export function PathFirstGraph({
             ? edge.type === type && (edge.source === targetId || edge.target === targetId)
             : edge.type === type && edge.source === targetId,
         )
+        .filter((edge) => !sourceFilterEnabled || isSourceEnabled(edge))
         .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))
         .slice(0, limit);
 
@@ -240,6 +291,7 @@ export function PathFirstGraph({
     }
 
     for (const edge of diseaseTargetEdges.slice(0, showInteractionContext ? 10 : 8)) {
+      if (sourceFilterEnabled && !isSourceEnabled(edge) && !focusEdgeIds.has(edge.id)) continue;
       if (primaryTargetIds.has(edge.target)) {
         selectedEdgeIds.add(edge.id);
         focusNodeIds.add(edge.source);
@@ -248,6 +300,7 @@ export function PathFirstGraph({
     }
 
     for (const edge of diseaseBridgeEdges) {
+      if (sourceFilterEnabled && !isSourceEnabled(edge) && !focusEdgeIds.has(edge.id)) continue;
       selectedEdgeIds.add(edge.id);
       focusNodeIds.add(edge.source);
       focusNodeIds.add(edge.target);
@@ -277,6 +330,7 @@ export function PathFirstGraph({
           focusNodeIds.has(edge.source) ||
           focusNodeIds.has(edge.target);
         if (!anchored) continue;
+        if (sourceFilterEnabled && !isSourceEnabled(edge) && !focusEdgeIds.has(edge.id)) continue;
         selectedEdgeIds.add(edge.id);
         focusNodeIds.add(edge.source);
         focusNodeIds.add(edge.target);
@@ -295,7 +349,7 @@ export function PathFirstGraph({
     };
 
     const maxEdges = showInteractionContext ? 180 : 140;
-    const visibleEdges = allEdges
+    const selectedEdges = allEdges
       .filter((edge) => selectedEdgeIds.has(edge.id))
       .sort((a, b) => {
         const p = priority(b) - priority(a);
@@ -304,12 +358,40 @@ export function PathFirstGraph({
       })
       .slice(0, maxEdges);
 
+    const visibleCountsBySource = emptySourceCountMap();
+    const visibleEdges = selectedEdges.filter((edge) => {
+      const sourceGroup = edgeSourceById.get(edge.id) ?? "other";
+      const keep = sourceFilter[sourceGroup] || focusEdgeIds.has(edge.id);
+      if (keep) {
+        visibleCountsBySource[sourceGroup] += 1;
+      }
+      return keep;
+    });
+
     for (const edge of visibleEdges) {
       focusNodeIds.add(edge.source);
       focusNodeIds.add(edge.target);
     }
 
-    const visibleNodeIds = new Set<string>(focusNodeIds);
+    const forcedNodeIds = new Set<string>();
+    if (diseaseNode) forcedNodeIds.add(diseaseNode.id);
+    for (const anchor of bridgeAnalysis.anchors) {
+      if (anchor.nodeId) forcedNodeIds.add(anchor.nodeId);
+      if (anchor.virtualNodeId) forcedNodeIds.add(anchor.virtualNodeId);
+    }
+    for (const nodeId of pathFocusNodeIds) {
+      forcedNodeIds.add(nodeId);
+    }
+    for (const nodeId of focusNodeIds) {
+      const node = nodeById.get(nodeId);
+      if (node?.type === "disease") forcedNodeIds.add(nodeId);
+    }
+
+    const visibleNodeIds = new Set<string>(forcedNodeIds);
+    for (const edge of visibleEdges) {
+      visibleNodeIds.add(edge.source);
+      visibleNodeIds.add(edge.target);
+    }
     const visibleNodes = allNodes.filter((node) => visibleNodeIds.has(node.id));
     const layoutRootIds = bridgeAnalysis.anchors
       .map((anchor) => anchor.nodeId ?? anchor.virtualNodeId)
@@ -328,12 +410,17 @@ export function PathFirstGraph({
       `Showing predominant ${showInteractionContext ? "mechanistic" : "translational"} connections across ${primaryTargetIds.size} lead targets`;
     const bridgeSuffix =
       bridgeStatuses.length > 0
-        ? ` Bridge status: ${bridgeStatuses.join(", ")}.`
+        ? ` Anchor connectivity: ${bridgeStatuses.join(", ")}.`
         : "";
+    const filteredOutEdges = Math.max(0, selectedEdges.length - visibleEdges.length);
     const summaryCore = hiddenEdges > 0
       ? `${summaryPrefix}. +${hiddenEdges} additional edges hidden for readability.${bridgeSuffix}`
       : `${summaryPrefix}${bridgeSuffix}`;
-    const summary = `${summaryCore} ${bridgeAnalysis.summary}`.trim();
+    const sourceFilterSuffix =
+      filteredOutEdges > 0
+        ? ` ${filteredOutEdges} edges muted by source filter.`
+        : "";
+    const summary = `${summaryCore}${sourceFilterSuffix} ${bridgeAnalysis.summary}`.trim();
     const anchorById = new Map(bridgeAnalysis.anchors.map((anchor) => [anchor.id, anchor]));
     const activeTrailEdgeIds =
       hasPathUpdateEdges && !pathUpdateUsesOnlyProxyEdges
@@ -369,6 +456,11 @@ export function PathFirstGraph({
       visibleEdges,
       hiddenEdges,
       hiddenNodes,
+      sourceCounts: {
+        total: totalEdgeCountsBySource,
+        visible: visibleCountsBySource,
+      },
+      sourceFilterMuted: filteredOutEdges,
       highlightedNodeIds: pathFocusNodeIds,
       highlightedEdgeIds: pathFocusEdgeIds,
       washedNodeIds,
@@ -391,6 +483,7 @@ export function PathFirstGraph({
     showDrugContext,
     showInteractionContext,
     showPathwayContext,
+    sourceFilter,
   ]);
 
   return (
@@ -416,15 +509,20 @@ export function PathFirstGraph({
             }
           >
             {computed.bridgeStatus === "connected"
-              ? "Bridge connected"
+              ? "Anchor path connected"
               : computed.bridgeStatus === "no_connection"
-                ? "Bridge gap"
-                : "Bridge pending"}{" "}
+                ? "Anchor gap"
+                : "Anchor pending"}{" "}
             {computed.bridgePairCount > 0 ? `(${computed.bridgePairCount})` : ""}
           </Badge>
+          {computed.sourceFilterMuted > 0 ? (
+            <Badge className="bg-[#eef4ff] text-[#425792]">
+              Source-muted edges {computed.sourceFilterMuted}
+            </Badge>
+          ) : null}
           {computed.washedEdgeIds.size > 0 ? (
             <Badge className="bg-[#f1f2fa] text-[#5d5f7b]">
-              Washed paths {computed.washedEdgeIds.size}
+              Explored trails {computed.washedEdgeIds.size}
             </Badge>
           ) : null}
         </div>
@@ -438,22 +536,87 @@ export function PathFirstGraph({
       {bridgeAnalysis.anchors.length > 0 ? (
         <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
           <span className="font-semibold text-[#3f4a8f]">Query anchors:</span>
-          {bridgeAnalysis.anchors.map((anchor) => (
-            <span
-              key={anchor.id}
-              className={`rounded-full border px-2 py-0.5 ${
-                anchor.nodeId
-                  ? "border-[#c8cff6] bg-[#eef1ff] text-[#3f4a8f]"
-                  : "border-[#d9d5eb] bg-[#f5f4fb] text-[#5d5b77]"
-              }`}
-            >
-              <span className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${anchor.nodeId ? "bg-[#4a46cc]" : "bg-[#8a8ea5]"}`} />
-              {anchor.label}
-              {!anchor.nodeId ? " (pending)" : ""}
-            </span>
-          ))}
+          {bridgeAnalysis.anchors.map((anchor) => {
+            const mention =
+              typeof anchor.mention === "string" ? anchor.mention.trim() : "";
+            const hasMentionMismatch =
+              mention.length > 0 &&
+              mention.toLowerCase() !== anchor.label.trim().toLowerCase();
+
+            return (
+              <span
+                key={anchor.id}
+                className={`rounded-full border px-2 py-0.5 ${
+                  anchor.nodeId
+                    ? "border-[#c8cff6] bg-[#eef1ff] text-[#3f4a8f]"
+                    : "border-[#d9d5eb] bg-[#f5f4fb] text-[#5d5b77]"
+                }`}
+              >
+                <span className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${anchor.nodeId ? "bg-[#4a46cc]" : "bg-[#8a8ea5]"}`} />
+                {anchor.label}
+                {!anchor.nodeId ? " (pending)" : ""}
+                {hasMentionMismatch ? (
+                  <span className="ml-1 text-[10px] text-[#5f6696]">
+                    ← query: {mention}
+                  </span>
+                ) : null}
+              </span>
+            );
+          })}
         </div>
       ) : null}
+
+      <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
+        <span className="font-semibold text-[#3f4a8f]">Evidence lanes:</span>
+        {EDGE_SOURCE_GROUPS.map((group) => {
+          const total = computed.sourceCounts.total[group] ?? 0;
+          if (total === 0) return null;
+          const visible = computed.sourceCounts.visible[group] ?? 0;
+          const enabled = sourceFilter[group];
+          const meta = EDGE_SOURCE_GROUP_META[group];
+          return (
+            <button
+              key={group}
+              type="button"
+              onClick={() => toggleSourceGroup(group)}
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 transition ${
+                enabled
+                  ? "border-[#c8cff6] bg-[#eef1ff] text-[#3f4a8f]"
+                  : "border-[#d8dded] bg-[#f6f7fb] text-[#7b83a4]"
+              }`}
+              title={`${meta.label} edges`}
+            >
+              <span
+                className="inline-block h-1.5 w-1.5 rounded-full"
+                style={{ backgroundColor: meta.color }}
+              />
+              {meta.label}
+              <span className="rounded-full border border-current/20 px-1 text-[10px]">
+                {visible}/{total}
+              </span>
+            </button>
+          );
+        })}
+        {!allSourceGroupsEnabled ? (
+          <button
+            type="button"
+            onClick={() => {
+              setSourceFilter(
+                EDGE_SOURCE_GROUPS.reduce(
+                  (acc, group) => {
+                    acc[group] = true;
+                    return acc;
+                  },
+                  {} as Record<EdgeSourceGroup, boolean>,
+                ),
+              );
+            }}
+            className="rounded-full border border-[#d7dcf5] bg-[#f5f6ff] px-2 py-0.5 text-[10px] font-medium text-[#4e59a0]"
+          >
+            Reset
+          </button>
+        ) : null}
+      </div>
 
       {computed.bridgePairSummaries.length > 0 ? (
         <div className="grid gap-1.5 rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
@@ -483,6 +646,11 @@ export function PathFirstGraph({
           Graph stream initialized. Waiting for target and pathway evidence batches.
         </div>
       ) : null}
+      {!isRunning && computed.visibleEdges.length === 0 && computed.sourceFilterMuted > 0 ? (
+        <div className="rounded-lg border border-[#d7dcf5] bg-[#f7f8ff] px-3 py-2 text-xs text-[#4b5686]">
+          No edges are visible with the active source filters. Re-enable one or more evidence lanes.
+        </div>
+      ) : null}
 
       <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[#4c5a89]">
         <span className="rounded-full border border-[#f4c8cc] bg-[#fff2f4] px-2 py-0.5">Disease</span>
@@ -490,9 +658,9 @@ export function PathFirstGraph({
         <span className="rounded-full border border-[#bde9de] bg-[#ebfaf7] px-2 py-0.5">Pathway</span>
         <span className="rounded-full border border-[#dcc9ff] bg-[#f5efff] px-2 py-0.5">Drug</span>
         <span className="rounded-full border border-[#d7dced] bg-[#f2f4f9] px-2 py-0.5">Interaction</span>
-        <span className="rounded-full border border-[#d4c8ff] bg-[#f3efff] px-2 py-0.5">Cross-anchor bridge</span>
+        <span className="rounded-full border border-[#d4c8ff] bg-[#f3efff] px-2 py-0.5">Cross-anchor link</span>
         <span className="rounded-full border border-[#d7dcf5] bg-white px-2 py-0.5">
-          Directed edges: disease -&gt; target -&gt; pathway/drug. Bridge edges indicate connect/no-connect results.
+          Directed edges: disease -&gt; target -&gt; pathway/drug. Cross-anchor edges indicate connected/unresolved anchor pairs.
         </span>
       </div>
 

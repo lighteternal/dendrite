@@ -1,10 +1,11 @@
-import OpenAI from "openai";
 import { createTTLCache } from "@/server/cache/lru";
 import { appConfig } from "@/server/config";
 import {
   handleOpenAiRateLimit,
   isOpenAiRateLimited,
 } from "@/server/openai/rate-limit";
+import { createTrackedOpenAIClient } from "@/server/openai/client";
+import { extractRelationMentionsFast } from "@/server/agent/relation-mention-extractor";
 import { getDrugTargetHints, searchDrugCandidates } from "@/server/mcp/chembl";
 import {
   searchDiseases,
@@ -77,9 +78,9 @@ type ExtractedMention = {
   type: MentionType;
 };
 
-const openai = appConfig.openAiApiKey
-  ? new OpenAI({ apiKey: appConfig.openAiApiKey })
-  : null;
+function getOpenAiClient() {
+  return createTrackedOpenAIClient();
+}
 
 const planCache = createTTLCache<string, ResolvedQueryPlan>(
   Math.min(appConfig.cache.ttlMs, 3 * 60 * 1000),
@@ -167,6 +168,31 @@ function isLikelySymbolMention(mention: string): boolean {
   if (!compactMention) return false;
   if (compactMention.length > 12) return false;
   return /[0-9]/.test(compactMention) || compactMention.length <= 6;
+}
+
+function isGenericMechanismMention(mention: string): boolean {
+  const normalizedMention = clean(normalize(mention));
+  if (!normalizedMention) return false;
+  const tokens = normalizedMention.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 4) return false;
+  const hasDiseaseCue = /\b(?:disease|disorder|syndrome|cancer|carcinoma|tumou?r|diabetes|obesity|lupus|arthritis|sclerosis|colitis|asthma|fibrosis|infection|infarction)\b/i.test(
+    normalizedMention,
+  );
+  if (hasDiseaseCue) return false;
+  const hasSymbolLikeToken = tokens.some((token) => /^[a-z]{1,6}\d{1,3}[a-z]?$/i.test(token.replace(/-/g, "")));
+  if (hasSymbolLikeToken) return false;
+  const genericTokens = tokens.filter((token) =>
+    /^(?:inflammatory|immune|metabolic|cellular|molecular|inflammation|signaling|signal|pathway|pathways|mechanism|mechanistic|network|cascade|axis|events?)$/i.test(
+      token,
+    ),
+  ).length;
+  if (genericTokens === tokens.length) return true;
+  return (
+    genericTokens >= Math.max(1, tokens.length - 1) &&
+    /\b(?:signaling|signal|pathway|pathways|mechanism|mechanistic|network|cascade|axis|events?)\b/i.test(
+      normalizedMention,
+    )
+  );
 }
 
 function entityPreferenceBoost(
@@ -314,6 +340,7 @@ function filterResolvedUnresolvedMentions(
   return unresolved.filter((mention) => {
     const normalized = normalize(mention);
     if (!normalized) return false;
+    if (isGenericMechanismMention(mention)) return false;
     const tokens = normalized.split(/\s+/).filter(Boolean);
     const hasResolvedDiseaseAnchor = anchors.some((anchor) => anchor.entityType === "disease");
     if (
@@ -376,16 +403,20 @@ function sanitizeFallbackMention(value: string): string {
 function normalizeRelationMention(value: string): string {
   let mention = sanitizeFallbackMention(value);
   if (!mention) return "";
+  mention = mention.replace(/^(?:through|via|by|using)\s+/i, "");
   mention = mention.replace(
-    /^(?:how|what|which|why)\s+(?:does|do|is|are|can|could|would|will|should)\s+/i,
+    /^(?:how|what|which|why)\s+(?:might|may|does|do|did|is|are|can|could|would|will|should)\s+/i,
     "",
   );
   mention = mention.replace(/^(?:how|what|which|why)\s+/i, "");
-  const prepositionTailMatch = mention.match(/\b(?:in|for|of|with)\s+(.+)$/i);
+  mention = mention.replace(/^(?:might|may|does|do|did|is|are|can|could|would|will|should)\s+/i, "");
+  mention = mention.replace(/^(?:the|a|an)\s+/i, "");
+  const prepositionTailMatch = mention.match(/\b(?:in|for|of|with|through|via|by|using)\s+(.+)$/i);
   if (prepositionTailMatch?.[1]) {
     const tail = sanitizeFallbackMention(prepositionTailMatch[1]);
     if (tail.length >= 3) mention = tail;
   }
+  if (isGenericMechanismMention(mention)) return "";
   return mention;
 }
 
@@ -394,12 +425,25 @@ function extractStructuredMentions(query: string): string[] {
   if (!cleaned) return [];
 
   const mentions = new Set<string>();
+  const normalizeMentionParts = (value: string): string[] => {
+    const raw = String(value ?? "").trim();
+    if (!raw) return [];
+    const parts = raw
+      .split(/\s*,\s*|\s+(?:and|&)\s+/i)
+      .map((item) => normalizeRelationMention(item))
+      .filter(Boolean);
+    if (parts.length > 1) return parts;
+    const single = normalizeRelationMention(raw);
+    return single ? [single] : [];
+  };
   const addMention = (value: string) => {
-    const mention = normalizeRelationMention(value);
-    if (!mention || mention.length < 2) return;
-    if (mention.length > 90) return;
-    if (mention.split(/\s+/).filter(Boolean).length > 6) return;
-    mentions.add(mention);
+    for (const mention of normalizeMentionParts(value)) {
+      if (!mention || mention.length < 2) continue;
+      if (mention.length > 90) continue;
+      if (mention.split(/\s+/).filter(Boolean).length > 6) continue;
+      if (isGenericMechanismMention(mention)) continue;
+      mentions.add(mention);
+    }
   };
 
   const betweenMatch = cleaned.match(
@@ -436,6 +480,18 @@ function extractStructuredMentions(query: string): string[] {
     addMention(versusMatch[1] ?? "");
     addMention(versusMatch[2] ?? "");
     addMention(versusMatch[3] ?? "");
+  }
+
+  const causalPatterns = [
+    /\b(.+?)\s+(?:lead|leads|leading|drives?|driven|contributes?|causes?|triggers?|promotes?|predisposes?)\s+(?:to\s+)?(.+?)(?:\s+(?:through|via|using|with|by)\s+(.+))?$/i,
+    /\b(.+?)\s+(?:results?\s+in|linked\s+to|associated\s+with|correlat(?:ed|es?|ion)\s+with)\s+(.+?)(?:\s+(?:through|via|using|with|by)\s+(.+))?$/i,
+  ] as const;
+  for (const pattern of causalPatterns) {
+    const match = cleaned.match(pattern);
+    if (!match) continue;
+    addMention(match[1] ?? "");
+    addMention(match[2] ?? "");
+    addMention(match[3] ?? "");
   }
 
   for (const match of cleaned.matchAll(/["'`](.{2,90}?)["'`]/g)) {
@@ -517,6 +573,7 @@ function splitFallbackMentions(query: string): Array<{ mention: string; type: Me
     .filter((mention) => /[a-z0-9]/i.test(mention))
     .filter((mention) => !/^(?:what|which|how|why)\b/i.test(mention))
     .filter((mention) => !/\b(connect|connection|relationship|compare|between)\b/i.test(mention))
+    .filter((mention) => !isGenericMechanismMention(mention))
     .sort((a, b) => mentionScore(b) - mentionScore(a))
     .map((mention) => ({
       mention,
@@ -550,6 +607,7 @@ function rescueFallbackMentions(query: string): Array<{ mention: string; type: M
     .filter((value) => value.length >= 3)
     .filter((value) => !/^(?:what|which|how|why)\b/i.test(value))
     .filter((value) => !/\b(connect|connection|relationship|compare|between|versus|vs)\b/i.test(value))
+    .filter((value) => !isGenericMechanismMention(value))
     .sort((a, b) => b.length - a.length)
     .slice(0, 8)
     .map((mention) => ({ mention, type: "unknown" as MentionType }));
@@ -561,9 +619,33 @@ async function extractMentions(query: string): Promise<{
   constraints: QueryPlanConstraint[];
   rationale: string;
 }> {
+  const openai = getOpenAiClient();
+  const lexicalFallbackMentions = splitFallbackMentions(query);
+  const llmRelationMentionsRaw = await extractRelationMentionsFast(query, {
+    maxMentions: 6,
+    timeoutMs: 1_600,
+  });
+  const llmRelationMentions: ExtractedMention[] = llmRelationMentionsRaw
+    .map((mention) => ({
+      mention: compact(clean(mention), 90),
+      type: "unknown" as MentionType,
+    }))
+    .filter((item) => item.mention.length >= 2)
+    .filter((item) => mentionHasSurfaceSupport(query, item.mention))
+    .filter((item) => !isGenericMechanismMention(item.mention));
+  const fallbackMentions = (() => {
+    const byKey = new Map<string, ExtractedMention>();
+    for (const item of [...llmRelationMentions, ...lexicalFallbackMentions]) {
+      const key = normalize(item.mention);
+      if (!key || byKey.has(key)) continue;
+      byKey.set(key, item);
+    }
+    return [...byKey.values()].slice(0, 12);
+  })();
+
   const fallback = {
     intent: "multihop-discovery",
-    mentions: splitFallbackMentions(query),
+    mentions: fallbackMentions,
     constraints: [],
     rationale: "Fallback extractor used due unavailable/timeout structured planner call.",
   };
@@ -670,12 +752,17 @@ async function extractMentions(query: string): Promise<{
       }))
       .filter((item) => item.mention.length >= 2)
       .filter((item) => mentionHasSurfaceSupport(query, item.mention));
-    const lexicalMentions = splitFallbackMentions(query);
+    const lexicalMentions = lexicalFallbackMentions;
     const mergedMentions = new Map<string, ExtractedMention>();
     if (modelMentions.length > 0) {
       for (const item of modelMentions) {
         const key = normalize(item.mention);
         if (!key) continue;
+        mergedMentions.set(key, item);
+      }
+      for (const item of llmRelationMentions) {
+        const key = normalize(item.mention);
+        if (!key || mergedMentions.has(key)) continue;
         mergedMentions.set(key, item);
       }
       for (const item of lexicalMentions) {
@@ -685,6 +772,11 @@ async function extractMentions(query: string): Promise<{
         mergedMentions.set(key, item);
       }
     } else {
+      for (const item of llmRelationMentions) {
+        const key = normalize(item.mention);
+        if (!key || mergedMentions.has(key)) continue;
+        mergedMentions.set(key, item);
+      }
       for (const item of lexicalMentions) {
         const key = normalize(item.mention);
         if (!key || mergedMentions.has(key)) continue;
@@ -730,6 +822,13 @@ function baseMentionVariants(mention: string): string[] {
   if (/^[a-z0-9-]{2,8}$/i.test(compactMention) && !cleanMention.includes(" ")) {
     variants.add(compactMention.toUpperCase());
   }
+  const mechanismTrimmed = cleanMention
+    .replace(/\b(signaling|signal|pathway|pathways|axis|cascade|network|events?)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (mechanismTrimmed && mechanismTrimmed.length >= 2 && mechanismTrimmed !== cleanMention) {
+    variants.add(mechanismTrimmed);
+  }
 
   return [...variants]
     .map((item) => clean(item))
@@ -737,10 +836,40 @@ function baseMentionVariants(mention: string): string[] {
     .slice(0, 4);
 }
 
+function targetSymbolHintBoost(mention: string, name: string, description?: string): number {
+  const compactMention = alnumCompact(mention);
+  if (!/^[a-z]{2,6}\d{1,3}[a-z]?$/i.test(compactMention)) return 0;
+  const hintTokens = new Set<string>([compactMention]);
+  const splitIndex = compactMention.search(/[0-9]/);
+  if (splitIndex > 1) {
+    const prefix = compactMention.slice(0, splitIndex);
+    const suffix = compactMention.slice(splitIndex);
+    hintTokens.add(`${prefix}-${suffix}`);
+    hintTokens.add(`${prefix} ${suffix}`);
+    if (prefix === "il") {
+      hintTokens.add(`interleukin ${suffix}`);
+    }
+  }
+  const haystack = `${name} ${description ?? ""}`.toLowerCase();
+  const matchesHint = [...hintTokens].some((hint) => haystack.includes(hint));
+  return matchesHint ? 0.45 : -0.12;
+}
+
+function symbolHintFromMention(mention: string): string | null {
+  const mechanismTrimmed = mention
+    .replace(/\b(signaling|signal|pathway|pathways|axis|cascade|network|events?)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const compactMention = alnumCompact(mechanismTrimmed || mention);
+  if (!/^[a-z]{2,6}\d{1,3}[a-z]?$/i.test(compactMention)) return null;
+  return compactMention.toUpperCase();
+}
+
 async function expandMentionSearchQueries(
   query: string,
   mentions: ExtractedMention[],
 ): Promise<Map<string, string[]>> {
+  const openai = getOpenAiClient();
   const result = new Map<string, string[]>();
   for (const mention of mentions) {
     result.set(mention.mention, baseMentionVariants(mention.mention));
@@ -906,7 +1035,9 @@ async function resolveMentionCandidates(
           "target",
           item.name,
           item.description,
-        ),
+        ) +
+        targetSymbolHintBoost(query, item.name, item.description) +
+        targetSymbolHintBoost(searchQuery, item.name, item.description),
       source: "opentargets" as const,
     }));
 
@@ -997,7 +1128,31 @@ async function resolveMentionCandidates(
     }
   }
 
-  return [...deduped.values()]
+  const mentionTokenCount = tokenize(query).length;
+  const lowerAlphaSingleToken = mentionTokenCount <= 1 && /^[a-z]{4,}$/i.test(query);
+  const genericMechanisticMention = isGenericMechanismMention(query);
+  const symbolMention = isLikelySymbolMention(query);
+  const filtered = [...deduped.values()].filter((row) => {
+    const cutoff =
+      row.entityType === "disease"
+        ? mentionTokenCount <= 1
+          ? lowerAlphaSingleToken
+            ? 0.66
+            : 0.5
+          : genericMechanisticMention
+            ? 0.7
+            : 0.34
+        : mentionTokenCount <= 1
+          ? 0.52
+          : genericMechanisticMention
+            ? symbolMention
+              ? 0.46
+              : 0.72
+            : 0.4;
+    return row.score >= cutoff;
+  });
+
+  return filtered
     .sort((a, b) => b.score - a.score)
     .slice(0, 8);
 }
@@ -1204,16 +1359,38 @@ export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
   const finalAnchors = dedupeAnchorsSemantically([...selectedAnchors.values()])
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, 16);
-  const followups = deriveFollowups(finalAnchors, extracted.constraints);
+  const canonicalTargetAnchors = await Promise.all(
+    finalAnchors.map(async (anchor) => {
+      if (anchor.entityType !== "target") return anchor;
+      const symbolHint = symbolHintFromMention(anchor.mention);
+      if (!symbolHint) return anchor;
+      if (alnumCompact(anchor.name).toUpperCase() === symbolHint) return anchor;
+      const hits = await withTimeout(searchTargets(symbolHint, 8), 5_000).catch(() => []);
+      const exact = hits.find((hit) => alnumCompact(hit.name).toUpperCase() === symbolHint);
+      if (!exact) return anchor;
+      return {
+        ...anchor,
+        id: exact.id,
+        name: exact.name,
+        description: exact.description,
+        confidence: Math.max(anchor.confidence, 0.92),
+        source: "opentargets" as const,
+      };
+    }),
+  );
+  const canonicalAnchors = dedupeAnchorsSemantically(canonicalTargetAnchors)
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 16);
+  const followups = deriveFollowups(canonicalAnchors, extracted.constraints);
   const filteredUnresolvedMentions = filterResolvedUnresolvedMentions(
     [...unresolvedMentions],
-    finalAnchors,
+    canonicalAnchors,
   );
 
   const plan: ResolvedQueryPlan = {
     query: normalizedQuery,
     intent: extracted.intent || "multihop-discovery",
-    anchors: finalAnchors,
+    anchors: canonicalAnchors,
     constraints: extracted.constraints.slice(0, 10),
     unresolvedMentions: filteredUnresolvedMentions.slice(0, 8),
     followups,

@@ -5,6 +5,12 @@ import dynamic from "next/dynamic";
 import type { Core, ElementDefinition } from "cytoscape";
 import { Camera, LocateFixed, Maximize2, Minimize2 } from "lucide-react";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
+import {
+  EDGE_SOURCE_GROUP_META,
+  EDGE_SOURCE_GROUPS,
+  getEdgeSourceGroup,
+  type EdgeSourceGroup,
+} from "@/components/targetgraph/graph-source";
 import { Button } from "@/components/ui/button";
 
 const CytoscapeComponent = dynamic(() => import("react-cytoscapejs"), {
@@ -51,6 +57,18 @@ const edgeColors: Record<GraphEdge["type"], string> = {
 
 const MIN_ZOOM = 0.34;
 const MAX_ZOOM = 1.9;
+
+type SourceCountMap = Record<EdgeSourceGroup, number>;
+
+function createSourceCountMap(): SourceCountMap {
+  return EDGE_SOURCE_GROUPS.reduce(
+    (acc, group) => {
+      acc[group] = 0;
+      return acc;
+    },
+    {} as SourceCountMap,
+  );
+}
 
 function shortLabel(value: string, max = 28): string {
   if (value.length <= max) return value;
@@ -140,6 +158,19 @@ function nodeSize(node: GraphNode): number {
   if (node.type === "pathway") return 24;
   if (node.type === "drug") return 22;
   return 13;
+}
+
+function nodeColorFor(node: GraphNode): string {
+  if (node.type === "interaction") {
+    const category =
+      typeof node.meta.evidenceCategory === "string"
+        ? node.meta.evidenceCategory.toLowerCase()
+        : "";
+    if (category === "exposure") return "#d97706";
+    if (category === "outcome") return "#0f766e";
+    if (category === "mechanism") return "#6d5dd3";
+  }
+  return nodeColors[node.type];
 }
 
 function clampZoom(value: number): number {
@@ -296,6 +327,9 @@ export function GraphCanvas({
         washedNodeIds?.has(node.id) && !activeNodeSet.has(node.id) ? "is-washed" : "",
         selectedNodeId === node.id ? "is-selected" : "",
         node.meta.queryAnchor ? "is-query-anchor" : "",
+        typeof node.meta.evidenceCategory === "string"
+          ? `evidence-${node.meta.evidenceCategory.toLowerCase()}`
+          : "",
         shouldShowLabel ? "" : "label-hidden",
       ]
         .filter(Boolean)
@@ -310,13 +344,15 @@ export function GraphCanvas({
             node.type === "target" ? 16 : node.type === "pathway" ? 28 : 24,
           ),
           rawSize: nodeSize(node),
-          color: nodeColors[node.type],
+          color: nodeColorFor(node),
         },
         classes,
       } satisfies ElementDefinition;
     });
 
     const edgeElements = validEdges.map((edge) => {
+      const sourceGroup = getEdgeSourceGroup(edge);
+      const sourceMeta = EDGE_SOURCE_GROUP_META[sourceGroup];
       const showEdgeLabel =
         activeEdgeSet.has(edge.id) ||
         (edge.type === "disease_disease" && typeof edge.meta.status === "string") ||
@@ -328,6 +364,7 @@ export function GraphCanvas({
         selectedEdgeId === edge.id ? "is-selected" : "",
         washedEdgeIds?.has(edge.id) && !activeEdgeSet.has(edge.id) ? "is-washed" : "",
         showEdgeLabel ? "label-visible" : "",
+        `source-${sourceGroup}`,
       ]
         .filter(Boolean)
         .join(" ");
@@ -338,6 +375,8 @@ export function GraphCanvas({
           source: edge.source,
           target: edge.target,
           type: edge.type,
+          sourceGroup,
+          sourceLabel: sourceMeta.label,
           bridgeStatus:
             typeof edge.meta.status === "string" ? String(edge.meta.status) : "",
           label:
@@ -355,7 +394,7 @@ export function GraphCanvas({
                     ? "interaction"
                     : "mechanism link"),
           weight: edge.weight ?? 0.4,
-          color: edgeColors[edge.type],
+          color: sourceMeta.color ?? edgeColors[edge.type],
         },
         classes,
       } satisfies ElementDefinition;
@@ -440,6 +479,36 @@ export function GraphCanvas({
         },
       },
       {
+        selector: "node.evidence-exposure",
+        style: {
+          shape: "ellipse",
+          width: 18,
+          height: 18,
+          "border-color": "#f6b26b",
+          "text-border-color": "#f3d3a3",
+        },
+      },
+      {
+        selector: "node.evidence-mechanism",
+        style: {
+          shape: "round-rectangle",
+          width: 17,
+          height: 15,
+          "border-color": "#b8aff1",
+          "text-border-color": "#c9c4f5",
+        },
+      },
+      {
+        selector: "node.evidence-outcome",
+        style: {
+          shape: "diamond",
+          width: 17,
+          height: 17,
+          "border-color": "#91d4c9",
+          "text-border-color": "#b4e7df",
+        },
+      },
+      {
         selector: "node.label-hidden",
         style: {
           label: "",
@@ -475,8 +544,8 @@ export function GraphCanvas({
       {
         selector: "node.is-faded",
         style: {
-          opacity: 0.34,
-          "text-opacity": 0.3,
+          opacity: 0.28,
+          "text-opacity": 0.24,
         },
       },
       {
@@ -525,6 +594,72 @@ export function GraphCanvas({
         },
       },
       {
+        selector: "edge.source-opentargets",
+        style: {
+          "line-color": "#7d88e3",
+          "target-arrow-color": "#7d88e3",
+        },
+      },
+      {
+        selector: "edge.source-reactome",
+        style: {
+          "line-color": "#0f9f8c",
+          "target-arrow-color": "#0f9f8c",
+        },
+      },
+      {
+        selector: "edge.source-chembl",
+        style: {
+          "line-color": "#8d63dd",
+          "target-arrow-color": "#8d63dd",
+        },
+      },
+      {
+        selector: "edge.source-string",
+        style: {
+          "line-color": "#4b6fc7",
+          "target-arrow-color": "#4b6fc7",
+        },
+      },
+      {
+        selector: "edge.source-literature",
+        style: {
+          "line-color": "#0d8fa8",
+          "target-arrow-color": "#0d8fa8",
+          "line-style": "dotted",
+        },
+      },
+      {
+        selector: "edge.source-exposure",
+        style: {
+          "line-color": "#d1732a",
+          "target-arrow-color": "#d1732a",
+          "line-style": "dashed",
+          "line-dash-pattern": [3, 2],
+        },
+      },
+      {
+        selector: "edge.source-anchor",
+        style: {
+          "line-color": "#8f6ae8",
+          "target-arrow-color": "#8f6ae8",
+        },
+      },
+      {
+        selector: "edge.source-derived",
+        style: {
+          "line-color": "#6f7ea9",
+          "target-arrow-color": "#6f7ea9",
+        },
+      },
+      {
+        selector: "edge.source-other",
+        style: {
+          "line-color": "#99a3c6",
+          "target-arrow-color": "#99a3c6",
+        },
+      },
+      {
         selector: "edge[bridgeStatus = 'candidate']",
         style: {
           "line-style": "dashed",
@@ -555,7 +690,7 @@ export function GraphCanvas({
       {
         selector: "edge.is-faded",
         style: {
-          opacity: 0.24,
+          opacity: 0.16,
         },
       },
       {
@@ -824,6 +959,21 @@ export function GraphCanvas({
       ),
     [nodes],
   );
+  const edgeSourceCounts = useMemo(() => {
+    const counts = createSourceCountMap();
+    for (const edge of validEdges) {
+      const group = getEdgeSourceGroup(edge);
+      counts[group] += 1;
+    }
+    return counts;
+  }, [validEdges]);
+  const edgeSourceLegend = useMemo(
+    () =>
+      [...EDGE_SOURCE_GROUPS]
+        .filter((group) => edgeSourceCounts[group] > 0)
+        .sort((left, right) => edgeSourceCounts[right] - edgeSourceCounts[left]),
+    [edgeSourceCounts],
+  );
 
   const hoveredNode = useMemo(
     () => (hoveredNodeId ? nodeMap.get(hoveredNodeId) ?? null : null),
@@ -904,6 +1054,9 @@ export function GraphCanvas({
   const hoveredEdgeFacts = useMemo(() => {
     if (!hoveredEdge) return [] as string[];
     const facts: string[] = [];
+    const sourceGroup = getEdgeSourceGroup(hoveredEdge);
+    const sourceMeta = EDGE_SOURCE_GROUP_META[sourceGroup];
+    facts.push(`evidence lane: ${sourceMeta.label}`);
     const sharedTargets = hoveredEdge.meta.sharedTargets;
     if (Array.isArray(sharedTargets) && sharedTargets.length > 0) {
       const symbols = sharedTargets
@@ -933,9 +1086,11 @@ export function GraphCanvas({
     return facts;
   }, [hoveredEdge]);
 
+  const densityBoost = nodes.length > 24 ? Math.min(220, (nodes.length - 24) * 5) : 0;
+  const baseCanvasHeight = Math.max(380, Math.floor(width * 0.48) + densityBoost);
   const canvasHeight = fullscreen
     ? Math.max(420, Math.floor((typeof window !== "undefined" ? window.innerHeight : 900) - 48))
-    : Math.max(360, Math.floor(width * 0.44));
+    : Math.min(760, baseCanvasHeight);
 
   return (
     <div
@@ -1005,6 +1160,22 @@ export function GraphCanvas({
           <span>Interactions: {nodeCounts.interaction ?? 0}</span>
           <span>Edges: {validEdges.length}</span>
         </div>
+        {edgeSourceLegend.length > 0 ? (
+          <div className="mt-1.5 flex max-w-[270px] flex-wrap gap-1">
+            {edgeSourceLegend.map((group) => (
+              <span
+                key={group}
+                className="inline-flex items-center gap-1 rounded-full border border-[#d7dcf5] bg-[#f4f6ff] px-1.5 py-0.5 text-[9px] text-[#5a6597]"
+              >
+                <span
+                  className="inline-block h-1.5 w-1.5 rounded-full"
+                  style={{ backgroundColor: EDGE_SOURCE_GROUP_META[group].color }}
+                />
+                {EDGE_SOURCE_GROUP_META[group].label} {edgeSourceCounts[group]}
+              </span>
+            ))}
+          </div>
+        ) : null}
         {hiddenSummary && hiddenSummary.hiddenEdges > 0 ? (
           <div className="mt-1 rounded-md border border-[#d5dbf4] bg-[#f2f4ff] px-2 py-1 text-[10px] text-[#4f5f8e]">
             +{hiddenSummary.hiddenEdges} more edges hidden ({hiddenSummary.lens} lens)
@@ -1031,7 +1202,7 @@ export function GraphCanvas({
           </span>
         </div>
         <div className="mt-1 text-[9px] text-[#616aa3]">
-          Animated dashed blue edges = currently explored branch.
+          Animated dashed edges = currently explored branch.
         </div>
       </div>
 

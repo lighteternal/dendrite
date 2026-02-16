@@ -25,6 +25,8 @@ UI includes a non-clinical disclaimer: **"Research evidence summary — not clin
 
 ## Quick Start
 
+### Local (full MCP stack)
+
 1. Copy env template and add your key:
    - `cp .env.example .env`
    - Set `OPENAI_API_KEY=...`
@@ -35,10 +37,21 @@ UI includes a non-clinical disclaimer: **"Research evidence summary — not clin
    - `npm --prefix apps/web run dev`
 4. Open `http://localhost:3000`
 
+### Vercel (out-of-the-box, no localhost MCP ports)
+
+1. Deploy `apps/web` as the Vercel project root.
+2. Set environment variables:
+   - `OPENAI_API_KEY`
+   - `MCP_TRANSPORT_MODE=fallback_only`
+3. Deploy.
+
+With `fallback_only`, the app uses direct provider APIs (OpenTargets, Reactome, STRING, ChEMBL, PubMed/Europe PMC/ClinicalTrials) and does not depend on localhost MCP ports.
+
 ## Environment Variables
 
 ```bash
 OPENAI_API_KEY=...
+MCP_TRANSPORT_MODE=auto
 
 OPENTARGETS_MCP_URL=http://localhost:7010/mcp
 REACTOME_MCP_URL=http://localhost:7020/mcp
@@ -47,19 +60,29 @@ CHEMBL_MCP_URL=http://localhost:7040/mcp
 BIOMCP_URL=http://localhost:8000/mcp
 PUBMED_MCP_URL=http://localhost:8000/mcp
 
-PHASE_TIMEOUT_MS=12000
+PHASE_TIMEOUT_MS=600000
 STRING_CONFIDENCE_DEFAULT=0.7
 STRING_MAX_ADDED_NODES=180
 STRING_MAX_ADDED_EDGES=500
 STRING_MAX_NEIGHBORS_PER_SEED=15
 CACHE_TTL_MS=300000
 OPENAI_MODEL=gpt-5.2
-OPENAI_SMALL_MODEL=gpt-5.2
-STREAM_RANKING_TIMEOUT_MS=10000
-STREAM_P5_BUDGET_MS=10000
-STREAM_P5_PER_TARGET_TIMEOUT_MS=3500
+OPENAI_SMALL_MODEL=gpt-5-mini
+OPENAI_NANO_MODEL=gpt-5-nano
+STREAM_RANKING_TIMEOUT_MS=180000
+STREAM_P5_BUDGET_MS=480000
+STREAM_P5_PER_TARGET_TIMEOUT_MS=45000
 STREAM_MAX_LITERATURE_TARGETS=5
+DEEP_DISCOVER_AGENT_TIMEOUT_MS=600000
+DEEP_DISCOVER_TOOL_TIMEOUT_MS=120000
+DEEP_DISCOVER_MAX_RUN_MS=600000
+DEEP_DISCOVER_MAX_PUBMED_SUBQUERIES=20
 ```
+
+`MCP_TRANSPORT_MODE` values:
+- `auto` (default): use MCP endpoints when reachable; on Vercel with localhost endpoints, auto-fallback to direct APIs.
+- `prefer_mcp`: always try MCP first.
+- `fallback_only`: skip MCP transport and use direct API fallbacks only.
 
 ## Local Commands
 
@@ -81,7 +104,7 @@ Disease-only entity resolver used by landing and brief workspace:
 - Restricts to disease entity namespaces (`EFO`, `MONDO`, `ORPHANET`, `DOID`, `HP`)
 - Uses semantic ranking + lexical guardrails to avoid non-disease variants (for example biomarker/measurement entities)
 
-### `GET /api/runCaseStream?query=...&mode=fast|balanced|deep[&diseaseId=...]`
+### `GET /api/runCaseStream?query=...&mode=multihop[&diseaseId=...]`
 
 Decision-brief streaming endpoint consumed by `/brief`:
 
@@ -99,9 +122,7 @@ Decision-brief streaming endpoint consumed by `/brief`:
 
 Modes:
 
-- `fast`: smallest target set for speed
-- `balanced`: default depth with interaction context
-- `deep`: densest run with literature/trial enrichment
+- `multihop`: agentic multihop exploration with streamed graph deltas, execution logs, and citation-grounded synthesis.
 
 ### `GET /api/streamGraph?diseaseQuery=...&maxTargets=...`
 

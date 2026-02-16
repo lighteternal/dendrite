@@ -1,7 +1,7 @@
-import OpenAI from "openai";
 import { createTTLCache } from "@/server/cache/lru";
 import { appConfig } from "@/server/config";
 import { extractDiseaseIntent } from "@/server/openai/disease-resolver";
+import { createTrackedOpenAIClient } from "@/server/openai/client";
 import {
   searchDiseases,
   searchDrugs,
@@ -35,9 +35,9 @@ type ResolveConceptOptions = {
   maxConcepts?: number;
 };
 
-const openai = appConfig.openAiApiKey
-  ? new OpenAI({ apiKey: appConfig.openAiApiKey })
-  : null;
+function getOpenAiClient() {
+  return createTrackedOpenAIClient();
+}
 
 const conceptCache = createTTLCache<string, ResolvedConcept[]>(
   appConfig.cache.ttlMs,
@@ -288,6 +288,7 @@ function heuristicConcepts(query: string): ConceptMention[] {
 }
 
 async function extractConceptMentions(query: string, useLlm: boolean): Promise<ConceptMention[]> {
+  const openai = getOpenAiClient();
   const fallback = heuristicConcepts(query);
   if (!useLlm || !openai) return fallback;
 

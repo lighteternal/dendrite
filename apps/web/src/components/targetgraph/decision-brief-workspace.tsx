@@ -11,13 +11,7 @@ import {
   Play,
   Search,
 } from "lucide-react";
-import { DeepDiscoverer } from "@/components/targetgraph/deep-discoverer";
 import { PathFirstGraph } from "@/components/targetgraph/path-first-graph";
-import {
-  type DiscoverEntity,
-  type DiscoverJourneyEntry,
-  type DiscovererFinal,
-} from "@/hooks/useDeepDiscoverStream";
 import { type BridgeAnalysis } from "@/components/targetgraph/bridge-analysis";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,9 +20,13 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTr
 import { Switch } from "@/components/ui/switch";
 import {
   useCaseRunStream,
+  type AgentFinalAnswer,
+  type JourneyEntry,
   type PathUpdate,
 } from "@/hooks/useCaseRunStream";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Props = {
   initialQuery: string;
@@ -37,14 +35,14 @@ type Props = {
 };
 
 type SourceHealth = Record<string, "green" | "yellow" | "red">;
-type DiscoveryPathState = "active" | "candidate" | "discarded";
+type NarrationPathState = "active" | "candidate" | "discarded" | undefined;
 
 const phaseSummaryMap: Record<string, string> = {
   P0: "I am resolving canonical anchors from your query",
   P1: "I am investigating target evidence and priority signals",
   P2: "I am following pathway trails from the active targets",
   P3: "I am checking compound and mechanism support",
-  P4: "I am testing network bridges and neighborhood context",
+  P4: "I am testing network connectivity and neighborhood context",
   P5: "I am grounding the path with papers and trials",
   P6: "I am closing with a ranked thread and caveats",
 };
@@ -53,6 +51,41 @@ function sourceBadgeTone(value: "green" | "yellow" | "red") {
   if (value === "green") return "bg-[#eef8f2] text-[#1d6f45]";
   if (value === "yellow") return "bg-[#fff6ea] text-[#9a5d21]";
   return "bg-[#fff0f1] text-[#a9324f]";
+}
+
+function narrationPathTone(pathState: NarrationPathState): string {
+  if (pathState === "active") {
+    return "border-[#c4e7d8] bg-[#f2fbf6]";
+  }
+  if (pathState === "candidate") {
+    return "border-[#d5dcf5] bg-[#f6f8ff]";
+  }
+  if (pathState === "discarded") {
+    return "border-[#e3e5ef] bg-[#f8f9fc] opacity-80";
+  }
+  return "border-[#e1defa] bg-[#faf9ff]";
+}
+
+function narrationKindLabel(kind: JourneyEntry["kind"] | "pipeline"): string {
+  if (kind === "tool_start") return "tool call";
+  if (kind === "tool_result") return "tool result";
+  if (kind === "handoff") return "handoff";
+  if (kind === "warning") return "warning";
+  if (kind === "phase") return "phase";
+  if (kind === "followup") return "followup";
+  if (kind === "branch") return "branch";
+  if (kind === "pipeline") return "pipeline";
+  return "insight";
+}
+
+function narrationKindTone(kind: JourneyEntry["kind"] | "pipeline"): string {
+  if (kind === "warning") return "border-[#e7d2ba] bg-[#fff6ec] text-[#8a5829]";
+  if (kind === "tool_start") return "border-[#cad6f2] bg-[#f1f5ff] text-[#3f5f90]";
+  if (kind === "tool_result") return "border-[#c6e6d8] bg-[#edf9f1] text-[#2f6d4e]";
+  if (kind === "handoff") return "border-[#d6d4f7] bg-[#f5f3ff] text-[#5d4ea1]";
+  if (kind === "followup") return "border-[#d3ddf6] bg-[#f3f7ff] text-[#415f93]";
+  if (kind === "branch") return "border-[#d7d8eb] bg-[#f6f7fb] text-[#5a6288]";
+  return "border-[#d8d4f8] bg-white text-[#676ca8]";
 }
 
 function downloadJson(data: unknown, filename: string) {
@@ -70,29 +103,26 @@ function pathSignature(path: PathUpdate | null): string {
   return `${path.nodeIds.slice().sort().join("|")}::${path.edgeIds.slice().sort().join("|")}`;
 }
 
-function isQueryAnchorBridgeEdge(edge: GraphEdge | undefined): boolean {
-  if (!edge) return false;
-  if (edge.type !== "disease_disease") return false;
-  const source = String(edge.meta.source ?? "").toLowerCase();
-  return source === "query_anchor" || source === "query_gap";
-}
-
-function hasExplicitMechanisticPath(path: PathUpdate | null, edges: GraphEdge[]): boolean {
-  if (!path) return false;
-  if (path.nodeIds.length < 3) return false;
-  if (path.edgeIds.length < 2) return false;
-  const edgeMap = new Map(edges.map((edge) => [edge.id, edge]));
-  const mechanisticEdgeCount = path.edgeIds
-    .map((id) => edgeMap.get(id))
-    .filter((edge): edge is GraphEdge => Boolean(edge))
-    .filter((edge) => !isQueryAnchorBridgeEdge(edge))
-    .length;
-  return mechanisticEdgeCount >= 2;
-}
-
 function compact(value: string, max = 148): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max - 1)}…`;
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function formatUsd(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+  if (value >= 1) return `$${value.toFixed(2)}`;
+  if (value >= 0.1) return `$${value.toFixed(3)}`;
+  return `$${value.toFixed(4)}`;
 }
 
 function narrationKey(value: string): string {
@@ -101,6 +131,75 @@ function narrationKey(value: string): string {
     .replace(/\d+/g, "#")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function linkInlineCitationMarkers(
+  text: string,
+  citationIndices: ReadonlySet<number>,
+): string {
+  if (!text || citationIndices.size === 0) return text;
+  return text.replace(/\[(\d{1,3})\](?!\()/g, (full, value) => {
+    const index = Number(value);
+    if (!Number.isFinite(index) || !citationIndices.has(index)) {
+      return full;
+    }
+    return `[\\[${index}\\]](#ref-${index})`;
+  });
+}
+
+function MarkdownAnswer({
+  text,
+  className,
+  citationIndices,
+}: {
+  text: string;
+  className?: string;
+  citationIndices?: ReadonlySet<number>;
+}) {
+  const linkedText = useMemo(
+    () => linkInlineCitationMarkers(text, citationIndices ?? new Set<number>()),
+    [citationIndices, text],
+  );
+
+  return (
+    <div className={className}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+          ul: ({ children }) => <ul className="mb-2 list-disc space-y-1 pl-5 last:mb-0">{children}</ul>,
+          ol: ({ children }) => <ol className="mb-2 list-decimal space-y-1 pl-5 last:mb-0">{children}</ol>,
+          li: ({ children }) => <li>{children}</li>,
+          strong: ({ children }) => <strong className="font-semibold text-[#33457a]">{children}</strong>,
+          em: ({ children }) => <em className="italic">{children}</em>,
+          code: ({ children }) => (
+            <code className="rounded bg-[#eef1ff] px-1 py-0.5 text-[12px] text-[#3b4b86]">{children}</code>
+          ),
+          a: ({ href, children }) => (
+            typeof href === "string" && href.startsWith("#ref-") ? (
+              <a
+                href={href}
+                className="text-[#3d53a0] underline underline-offset-2 hover:text-[#2c3d7b]"
+              >
+                {children}
+              </a>
+            ) : (
+              <a
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                className="text-[#3d53a0] underline underline-offset-2 hover:text-[#2c3d7b]"
+              >
+                {children}
+              </a>
+            )
+          ),
+        }}
+      >
+        {linkedText}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 function summarizeTrailTitle(value: string): string {
@@ -170,6 +269,25 @@ function mergeGraphEdges(base: GraphEdge[], overlay: GraphEdge[]): GraphEdge[] {
   return [...byId.values()];
 }
 
+const AUTO_START_DEDUP_WINDOW_MS = 4_000;
+const recentAutoStarts = new Map<string, number>();
+
+function shouldAutoStart(signature: string): boolean {
+  const now = Date.now();
+  const lastStartedAt = recentAutoStarts.get(signature);
+  if (typeof lastStartedAt === "number" && now - lastStartedAt < AUTO_START_DEDUP_WINDOW_MS) {
+    return false;
+  }
+  recentAutoStarts.set(signature, now);
+  const pruneBefore = now - AUTO_START_DEDUP_WINDOW_MS * 5;
+  for (const [key, startedAt] of recentAutoStarts) {
+    if (startedAt < pruneBefore) {
+      recentAutoStarts.delete(key);
+    }
+  }
+  return true;
+}
+
 export function DecisionBriefWorkspace({
   initialQuery,
   initialDiseaseId,
@@ -179,10 +297,10 @@ export function DecisionBriefWorkspace({
   const stream = useCaseRunStream();
   const startStream = stream.start;
   const stopStream = stream.stop;
+  const runSessionId = stream.runSessionId;
 
   const [query, setQuery] = useState(initialQuery);
   const [submittedQuery, setSubmittedQuery] = useState(initialQuery);
-  const [runSequence, setRunSequence] = useState(1);
   const [diseaseIdOverride, setDiseaseIdOverride] = useState<string | null>(initialDiseaseId ?? null);
   const [diseaseNameOverride, setDiseaseNameOverride] = useState<string | null>(initialDiseaseName ?? null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -194,20 +312,31 @@ export function DecisionBriefWorkspace({
   const [activePath, setActivePath] = useState<PathUpdate | null>(null);
   const [washedPaths, setWashedPaths] = useState<PathUpdate[]>([]);
   const [bridgeAnalysis, setBridgeAnalysis] = useState<BridgeAnalysis | null>(null);
-  const [agentFinalReadout, setAgentFinalReadout] = useState<DiscovererFinal | null>(null);
-  const [discoverEntries, setDiscoverEntries] = useState<DiscoverJourneyEntry[]>([]);
-  const [discoverStatusMessage, setDiscoverStatusMessage] = useState<string | null>(null);
-  const [discoverElapsedMs, setDiscoverElapsedMs] = useState<number | null>(null);
-  const [discoverIsRunning, setDiscoverIsRunning] = useState(false);
+  const agentFinalReadout: AgentFinalAnswer | null = stream.agentFinal;
+  const discoverEntries: JourneyEntry[] = stream.journeyEntries;
+  const discoverStatusMessage = stream.journeyStatusMessage;
+  const discoverElapsedMs = stream.journeyElapsedMs;
+  const discoverIsRunning = stream.journeyIsRunning;
   const activePathRef = useRef<PathUpdate | null>(null);
   const lastNarrationAtRef = useRef<number>(0);
   const [secondsSinceNarration, setSecondsSinceNarration] = useState(0);
+  const [liveNowMs, setLiveNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     lastNarrationAtRef.current = Date.now();
   }, []);
 
   useEffect(() => {
+    const autoStartSignature = [
+      runSessionId,
+      initialQuery.trim().toLowerCase(),
+      (initialDiseaseId ?? "").trim().toLowerCase(),
+      (initialDiseaseName ?? "").trim().toLowerCase(),
+    ].join("|");
+    if (!shouldAutoStart(autoStartSignature)) {
+      return;
+    }
+
     startStream({
       query: initialQuery,
       diseaseId: initialDiseaseId ?? null,
@@ -215,7 +344,7 @@ export function DecisionBriefWorkspace({
     });
 
     return () => stopStream();
-  }, [initialDiseaseId, initialDiseaseName, initialQuery, startStream, stopStream]);
+  }, [initialDiseaseId, initialDiseaseName, initialQuery, runSessionId, startStream, stopStream]);
 
   useEffect(() => {
     const incoming = stream.pathUpdate;
@@ -317,15 +446,17 @@ export function DecisionBriefWorkspace({
   ]);
 
   useEffect(() => {
-    if (!stream.isRunning) return;
+    if (!stream.isRunning && !discoverIsRunning) return;
 
     const timer = window.setInterval(() => {
-      const deltaSec = Math.max(0, Math.floor((Date.now() - lastNarrationAtRef.current) / 1000));
+      const now = Date.now();
+      setLiveNowMs(now);
+      const deltaSec = Math.max(0, Math.floor((now - lastNarrationAtRef.current) / 1000));
       setSecondsSinceNarration(deltaSec);
     }, 1000);
 
     return () => window.clearInterval(timer);
-  }, [stream.isRunning]);
+  }, [discoverIsRunning, stream.isRunning]);
 
   const executionNarration = useMemo(() => {
     const fromAgentSteps = stream.agentSteps
@@ -384,20 +515,22 @@ export function DecisionBriefWorkspace({
       .filter((entry) => (entry.title || entry.detail).trim().length > 0)
       .slice(-24)
       .map((entry) => ({
-      id: `trail:${entry.id}`,
-      title: summarizeTrailTitle(entry.title || entry.detail || "Agent trail"),
-      detail: compact(entry.detail || entry.title, 200),
-      source: entry.source,
-      count: 1,
-      pathState: entry.pathState,
-    }));
+        id: `trail:${entry.id}`,
+        title: summarizeTrailTitle(entry.title || entry.detail || "Agent trail"),
+        detail: compact(entry.detail || entry.title, 200),
+        source: entry.source,
+        kind: entry.kind,
+        count: 1,
+        pathState: entry.pathState,
+      }));
     const fromPipeline = executionNarration.slice(-8).map((entry) => ({
       id: `pipeline:${entry.id}`,
       title: entry.title,
       detail: entry.detail,
       source: "pipeline",
+      kind: "pipeline" as const,
       count: entry.count,
-      pathState: undefined as "active" | "candidate" | "discarded" | undefined,
+      pathState: undefined as NarrationPathState,
     }));
     const merged = fromAgentTrail.length > 0 ? fromAgentTrail : fromPipeline;
     const bySemantic = new Map<string, number>();
@@ -406,8 +539,9 @@ export function DecisionBriefWorkspace({
       title: string;
       detail: string;
       source: string;
+      kind: JourneyEntry["kind"] | "pipeline";
       count: number;
-      pathState: "active" | "candidate" | "discarded" | undefined;
+      pathState: NarrationPathState;
     }> = [];
     for (const entry of merged) {
       const semantic = `${narrationKey(entry.title)}::${narrationKey(entry.detail)}`;
@@ -420,6 +554,7 @@ export function DecisionBriefWorkspace({
         if (!existing) continue;
         existing.id = entry.id;
         existing.detail = entry.detail;
+        existing.kind = entry.kind;
         existing.count += 1;
         if (entry.pathState) {
           existing.pathState = entry.pathState;
@@ -428,6 +563,54 @@ export function DecisionBriefWorkspace({
     }
     return condensed.slice(-12);
   }, [discoverEntries, executionNarration]);
+
+  const journeySignals = useMemo(() => {
+    const sourceCounts = new Map<string, number>();
+    let active = 0;
+    let candidate = 0;
+    let discarded = 0;
+    let toolCalls = 0;
+    let toolResults = 0;
+    let warnings = 0;
+
+    for (const entry of discoverEntries) {
+      sourceCounts.set(entry.source, (sourceCounts.get(entry.source) ?? 0) + 1);
+      if (entry.pathState === "active") active += 1;
+      if (entry.pathState === "candidate") candidate += 1;
+      if (entry.pathState === "discarded") discarded += 1;
+      if (entry.kind === "tool_start") toolCalls += 1;
+      if (entry.kind === "tool_result" || entry.kind === "handoff") toolResults += 1;
+      if (entry.kind === "warning") warnings += 1;
+    }
+
+    const topSources = [...sourceCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4);
+
+    return {
+      total: discoverEntries.length,
+      toolCalls,
+      toolResults,
+      warnings,
+      active,
+      candidate,
+      discarded,
+      topSources,
+    };
+  }, [discoverEntries]);
+
+  const executionActivity = useMemo(() => {
+    const inFlightCalls = Math.max(0, journeySignals.toolCalls - journeySignals.toolResults);
+    const latestTrail = mergedLiveNarration[mergedLiveNarration.length - 1];
+    const latestToolResult = [...discoverEntries]
+      .reverse()
+      .find((entry) => entry.kind === "tool_result" || entry.kind === "handoff");
+    return {
+      inFlightCalls,
+      currentOperation: latestTrail?.title ?? "Waiting for first trail updates",
+      latestEvidenceUpdate: latestToolResult?.title ?? null,
+    };
+  }, [discoverEntries, journeySignals.toolCalls, journeySignals.toolResults, mergedLiveNarration]);
 
   const recommendation = stream.finalBrief?.recommendation ?? stream.recommendation;
   const recommendationIsProvisional = Boolean(
@@ -449,37 +632,20 @@ export function DecisionBriefWorkspace({
     if (!targetNode) return null;
     return String(targetNode.meta.targetSymbol ?? targetNode.label);
   }, [graphEdges, graphNodes]);
+  const resolvedAgentAnswer =
+    agentFinalReadout?.answer?.trim() ||
+    stream.agentAnswerText.trim() ||
+    "";
+  const hasAgentFinalAnswer = Boolean(
+    !stream.isRunning && resolvedAgentAnswer.length > 0,
+  );
   const finalVerdictReady = !stream.isRunning &&
     !discoverIsRunning &&
-    Boolean((!recommendationIsProvisional && recommendation) || liveTargetFallback || stream.finalBrief);
+    Boolean(
+      hasAgentFinalAnswer ||
+      ((!recommendationIsProvisional && recommendation) || liveTargetFallback || stream.finalBrief),
+    );
   const queryPlan = stream.queryPlan;
-  const hasAgentFinalAnswer = Boolean(
-    !stream.isRunning && agentFinalReadout?.answer && agentFinalReadout.answer.trim().length > 0,
-  );
-  const naturalLanguageBrief = useMemo(() => {
-    if (hasAgentFinalAnswer && agentFinalReadout?.answer) {
-      return compact(agentFinalReadout.answer, 240);
-    }
-    if (stream.isRunning || discoverIsRunning) {
-      return graphPath?.summary
-        ? `Live multihop investigation running. Active trail: ${graphPath.summary}.`
-        : "Live multihop investigation running. I am expanding evidence branches and updating the graph.";
-    }
-    const bestTrail =
-      graphPath?.summary ??
-      bridgeAnalysis?.activeConnectedPath?.summary ??
-      recommendation?.pathway ??
-      "not provided";
-    return `Agent synthesis unavailable for this run. Showing provisional evidence trail: ${bestTrail}.`;
-  }, [
-    hasAgentFinalAnswer,
-    agentFinalReadout,
-    graphPath?.summary,
-    bridgeAnalysis?.activeConnectedPath?.summary,
-    discoverIsRunning,
-    recommendation,
-    stream.isRunning,
-  ]);
 
   const queryMode = useMemo(() => {
     const anchors = queryPlan?.anchors ?? [];
@@ -512,12 +678,13 @@ export function DecisionBriefWorkspace({
   }, [queryPlan?.anchors, submittedQuery]);
 
   const scientificVerdict = useMemo(() => {
+    const pendingThreadFallback = "Awaiting first target and pathway evidence batches.";
     const activeThread =
       graphPath?.summary ??
       bridgeAnalysis?.activeConnectedPath?.summary ??
-      `${recommendation?.target ?? liveTargetFallback ?? "not provided"} in ${
-        recommendation?.pathway ?? "not provided"
-      }`;
+      (recommendation?.target && recommendation?.pathway
+        ? `${recommendation.target} in ${recommendation.pathway}`
+        : pendingThreadFallback);
 
     const score = recommendation?.score ?? 0;
     const confidenceLabel = recommendation
@@ -534,7 +701,7 @@ export function DecisionBriefWorkspace({
       return {
         directAnswer:
           queryMode === "bridge"
-            ? `I am testing whether ${queryAnchorsSummary} can be connected through an explicit multihop mechanism path.`
+            ? `I am evaluating whether ${queryAnchorsSummary} can be explained through an explicit multihop mechanism path.`
             : `I am building and ranking mechanism threads for "${submittedQuery}" as evidence streams in.`,
         mechanismThread: activeThread,
         verdictType: "pending" as const,
@@ -542,16 +709,16 @@ export function DecisionBriefWorkspace({
       };
     }
 
-    if (hasAgentFinalAnswer && agentFinalReadout?.answer) {
+    if (hasAgentFinalAnswer && resolvedAgentAnswer) {
       const focusThread = [
-        agentFinalReadout.focusThread.pathway,
-        agentFinalReadout.focusThread.target,
-        agentFinalReadout.focusThread.drug,
+        agentFinalReadout?.focusThread.pathway,
+        agentFinalReadout?.focusThread.target,
+        agentFinalReadout?.focusThread.drug,
       ]
         .filter((item) => item && item !== "not provided")
         .join(" -> ");
       return {
-        directAnswer: agentFinalReadout.answer,
+        directAnswer: resolvedAgentAnswer,
         mechanismThread: focusThread || activeThread,
         verdictType: bridgeAnalysis?.status === "connected" ? ("connected" as const) : ("ranked" as const),
         confidence: confidenceLabel,
@@ -566,7 +733,7 @@ export function DecisionBriefWorkspace({
       if (bridgeAnalysis?.status === "connected") {
         return {
           directAnswer:
-            "Agent final synthesis is missing for this run. A connected multihop trail is present in the graph and should be interpreted as provisional evidence.",
+            "Final synthesis was not produced for this run. A connected multihop mechanism path is present in the graph and should be interpreted as provisional evidence.",
           mechanismThread: bridgeContext,
           verdictType: "connected" as const,
           confidence: confidenceLabel,
@@ -575,7 +742,7 @@ export function DecisionBriefWorkspace({
       if (bridgeAnalysis?.status === "no_connection") {
         return {
           directAnswer:
-            "Agent final synthesis is missing for this run. No complete multihop bridge was closed; the graph keeps unresolved anchor gaps explicit.",
+            "Final synthesis was not produced for this run. No complete multihop mechanism path was closed; unresolved anchor gaps are shown in the graph.",
           mechanismThread: bridgeContext,
           verdictType: "no_connection" as const,
           confidence: "Exploratory only",
@@ -585,7 +752,7 @@ export function DecisionBriefWorkspace({
 
     return {
       directAnswer:
-        "Agent final synthesis is missing for this run. Showing a provisional evidence readout from the active graph state.",
+        "Final synthesis was not produced for this run. Showing a provisional readout from the active graph state.",
       mechanismThread: activeThread,
       verdictType: recommendation && score >= 0.65 ? ("ranked" as const) : ("partial" as const),
       confidence: recommendation ? confidenceLabel : "Low confidence",
@@ -593,9 +760,9 @@ export function DecisionBriefWorkspace({
   }, [
     hasAgentFinalAnswer,
     agentFinalReadout,
+    resolvedAgentAnswer,
     bridgeAnalysis,
     graphPath?.summary,
-    liveTargetFallback,
     queryAnchorsSummary,
     queryMode,
     recommendation,
@@ -603,113 +770,32 @@ export function DecisionBriefWorkspace({
     stream.isRunning,
     submittedQuery,
   ]);
-  const queryAnswer = scientificVerdict.directAnswer;
 
-  const decisionCard = useMemo(() => {
-    const score = recommendation?.score ?? 0;
-    const caveats = stream.finalBrief?.caveats ?? [];
-    const penalty = caveats.reduce((acc, item) => {
-      const lowered = item.toLowerCase();
-      if (lowered.includes("degraded")) return acc + 2;
-      if (lowered.includes("query concept mismatch")) return acc + 2;
-      if (lowered.includes("no literature")) return acc + 1;
-      if (lowered.includes("no trial")) return acc + 1;
-      return acc;
-    }, 0);
-
-    if (!recommendation) {
-      return {
-        action: "Building evidence map",
-        confidence: "In progress",
-        rationale: "Final ranking is still synthesizing.",
-      };
+  const rawProgressPct = Math.max(0, Math.min(100, Math.round(stream.status?.pct ?? 0)));
+  const progressPct = rawProgressPct;
+  const progressBarPct = Math.max(4, progressPct);
+  const runElapsedMs = useMemo(() => {
+    const reported = discoverElapsedMs ?? 0;
+    const startedAt = stream.journeyStartedAtMs;
+    if ((stream.isRunning || discoverIsRunning) && typeof startedAt === "number") {
+      return Math.max(reported, liveNowMs - startedAt);
     }
-
-    if (recommendationIsProvisional) {
-      return {
-        action: "Preliminary lead",
-        confidence: "Evidence still updating",
-        rationale: "Live graph evidence is available; final ranking still refining.",
-      };
+    if (reported > 0) return reported;
+    if (typeof startedAt === "number") {
+      return Math.max(0, liveNowMs - startedAt);
     }
+    return 0;
+  }, [discoverElapsedMs, discoverIsRunning, liveNowMs, stream.isRunning, stream.journeyStartedAtMs]);
 
-    if (score >= 0.78 && penalty <= 1) {
-      return {
-        action: "Advance to validation",
-        confidence: "High confidence",
-        rationale: "Strong evidence score with limited data penalties.",
-      };
-    }
-
-    if (score >= 0.65) {
-      return {
-        action: "Hold + validate",
-        confidence: penalty >= 3 ? "Moderate confidence" : "Medium confidence",
-        rationale: "Signal is usable but requires focused de-risking experiments.",
-      };
-    }
-
-    return {
-      action: "Exploratory only",
-      confidence: "Low confidence",
-      rationale: "Weak or incomplete signal for decision-grade nomination.",
-    };
-  }, [recommendation, recommendationIsProvisional, stream.finalBrief?.caveats]);
-
-  const scoreBreakdown = useMemo(() => {
-    const target = recommendation?.target;
-    if (!target) return [];
-    const trace = stream.finalBrief?.evidenceTrace?.find((item) => item.symbol === target);
-    if (!trace) return [];
-
-    const preferredFields = [
-      "openTargetsEvidence",
-      "drugActionability",
-      "networkCentrality",
-      "literatureSupport",
-      "drugCount",
-      "interactionCount",
-    ];
-
-    return trace.refs
-      .filter((ref) => preferredFields.includes(ref.field))
-      .slice(0, 6)
-      .map((ref) => ({
-        label: ref.field,
-        value: String(ref.value),
-      }));
-  }, [recommendation?.target, stream.finalBrief?.evidenceTrace]);
-
-  const evidenceSnapshot = useMemo(() => {
-    const caveats = stream.finalBrief?.caveats ?? [];
-    let articleSnippets = 0;
-    let trialSnippets = 0;
-    for (const item of caveats) {
-      const articleHit = item.match(/(\d+)\s+article snippets provided/i);
-      if (articleHit) {
-        articleSnippets = Math.max(articleSnippets, Number(articleHit[1] ?? "0"));
-      }
-      const trialHit = item.match(/(\d+)\s+trial snippets provided/i);
-      if (trialHit) {
-        trialSnippets = Math.max(trialSnippets, Number(trialHit[1] ?? "0"));
-      }
-    }
-    const caveatCount = caveats.filter((item) => !/snippets provided/i.test(item)).length;
-    return {
-      articleSnippets,
-      trialSnippets,
-      caveatCount,
-    };
-  }, [stream.finalBrief?.caveats]);
-
-  const verdictCitations = useMemo(
-    () => (stream.finalBrief?.citations ?? []).slice(0, 6),
-    [stream.finalBrief?.citations],
+  const verdictCitations = useMemo(() => {
+    const primary = stream.citationBundle?.citations;
+    if (primary && primary.length > 0) return primary;
+    return stream.finalBrief?.citations ?? [];
+  }, [stream.citationBundle?.citations, stream.finalBrief?.citations]);
+  const verdictCitationIndexSet = useMemo(
+    () => new Set<number>(verdictCitations.map((citation) => citation.index)),
+    [verdictCitations],
   );
-  const citationSuffix = verdictCitations.length
-    ? ` ${verdictCitations.map((citation) => `[${citation.index}]`).join(" ")}`
-    : "";
-  const appendCitationSuffix = !hasAgentFinalAnswer && citationSuffix.length > 0;
 
   const verdictTarget = recommendation?.target ?? liveTargetFallback ?? "not resolved";
   const verdictPathway = recommendation?.pathway ?? "not provided";
@@ -743,12 +829,7 @@ export function DecisionBriefWorkspace({
     activePathRef.current = null;
     setWashedPaths([]);
     setBridgeAnalysis(null);
-    setAgentFinalReadout(null);
-    setDiscoverEntries([]);
-    setDiscoverStatusMessage(null);
-    setDiscoverElapsedMs(null);
     setSubmittedQuery(trimmed);
-    setRunSequence((prev) => prev + 1);
 
     stream.start({
       query: trimmed,
@@ -839,136 +920,10 @@ export function DecisionBriefWorkspace({
     return merged;
   }, [activePath, alternativePaths, washedPaths]);
 
-  const focusEntities = useCallback(
-    (entities: DiscoverEntity[], pathState: DiscoveryPathState = "active") => {
-      if (entities.length === 0) return;
-      const entityLabels = entities
-        .map((entity) => entity.label.trim())
-        .filter((label) => label.length > 0)
-        .slice(0, 6);
-
-      const nodeIds = entities
-        .map((entity) => {
-          if (entity.primaryId) {
-            const byPrimary = graphNodes.find(
-              (node) => node.type === entity.type && node.primaryId === entity.primaryId,
-            );
-            if (byPrimary) return byPrimary.id;
-          }
-
-          const normalizedLabel = entity.label.trim().toUpperCase();
-          const byLabel = graphNodes.find(
-            (node) => node.type === entity.type && node.label.trim().toUpperCase() === normalizedLabel,
-          );
-          if (byLabel) return byLabel.id;
-
-          if (entity.type === "target") {
-            const bySymbol = graphNodes.find(
-              (node) =>
-                node.type === "target" &&
-                String(node.meta.targetSymbol ?? node.label).trim().toUpperCase() === normalizedLabel,
-            );
-            if (bySymbol) return bySymbol.id;
-          }
-
-          return null;
-        })
-        .filter((id): id is string => Boolean(id));
-
-      if (nodeIds.length === 0) {
-        const virtualNodeIds = entityLabels.map((label) =>
-          `virtual:${label.toLowerCase().replace(/\s+/g, "-")}`,
-        );
-        const fallbackPath: PathUpdate = {
-          nodeIds: virtualNodeIds,
-          edgeIds: [],
-          summary: compact(
-            `DeepAgents ${pathState} path: ${
-              entityLabels.length > 0 ? entityLabels.join(" -> ") : "entity branch"
-            }`,
-          ),
-        };
-
-        if (pathState === "discarded") {
-          setWashedPaths((prev) => [fallbackPath, ...prev].slice(0, 8));
-          return;
-        }
-        setWashedPaths((prev) => [fallbackPath, ...prev].slice(0, 8));
-        return;
-      }
-
-      const uniqueNodeIds = [...new Set(nodeIds)];
-      const edgeIds = new Set<string>();
-      for (let index = 0; index < uniqueNodeIds.length - 1; index += 1) {
-        const source = uniqueNodeIds[index]!;
-        const target = uniqueNodeIds[index + 1]!;
-        const edge = graphEdges.find(
-          (item) =>
-            (item.source === source && item.target === target) ||
-            (item.source === target && item.target === source),
-        );
-        if (edge) edgeIds.add(edge.id);
-      }
-
-      const labels = uniqueNodeIds
-        .map((id) => graphNodes.find((node) => node.id === id)?.label ?? id)
-        .slice(0, 6);
-      const nextPath: PathUpdate = {
-        nodeIds: uniqueNodeIds,
-        edgeIds: [...edgeIds],
-        summary: compact(`DeepAgents ${pathState} path: ${labels.join(" -> ")}`),
-      };
-
-      const edgeById = new Map(graphEdges.map((edge) => [edge.id, edge]));
-      const hasOnlyQueryAnchorEdges =
-        nextPath.edgeIds.length > 0 &&
-        nextPath.edgeIds.every((edgeId) => isQueryAnchorBridgeEdge(edgeById.get(edgeId)));
-      const hasStableMechanisticActivePath = hasExplicitMechanisticPath(activePathRef.current, graphEdges);
-
-      if (
-        pathState !== "discarded" &&
-        hasStableMechanisticActivePath &&
-        (hasOnlyQueryAnchorEdges || nextPath.edgeIds.length === 0)
-      ) {
-        setWashedPaths((prev) => [nextPath, ...prev].slice(0, 8));
-        setSelectedNodeId(uniqueNodeIds[uniqueNodeIds.length - 1] ?? null);
-        return;
-      }
-
-      if (pathState === "discarded") {
-        setWashedPaths((prev) => [nextPath, ...prev].slice(0, 8));
-        return;
-      }
-      if (uniqueNodeIds.length >= 2 && edgeIds.size === 0) {
-        setWashedPaths((prev) => [nextPath, ...prev].slice(0, 8));
-        return;
-      }
-
-      const previous = activePathRef.current;
-      const previousSignature = pathSignature(previous);
-      const nextSignature = pathSignature(nextPath);
-      if (previous && previousSignature !== nextSignature) {
-        setWashedPaths((prev) => [previous, ...prev].slice(0, 8));
-      }
-
-      activePathRef.current = nextPath;
-      setActivePath(nextPath);
-      setSelectedNodeId(uniqueNodeIds[uniqueNodeIds.length - 1] ?? null);
-    },
-    [graphEdges, graphNodes],
-  );
-
   const topStatus = stream.status?.message ?? "Preparing run";
   const runLabel = "Multi-hop search";
   const runDescription =
-    "Exhaustive traversal across entities, pathways, compounds, interactions, and literature.";
-  const resolvedDiseaseId =
-    diseaseIdOverride ?? stream.resolverSelection?.selected?.id ?? initialDiseaseId ?? null;
-  const deepDiscoverDiseaseQuery = submittedQuery;
-  const deepDiscoverAutoStart = submittedQuery.trim().length > 0;
-  const deepDiscoverAutoStartKey = `${runSequence}:${submittedQuery
-    .trim()
-    .toLowerCase()}:${resolvedDiseaseId ?? "pending"}`;
+    "Entity resolution and evidence retrieval across OpenTargets, Reactome, ChEMBL, STRING, BioMCP, and PubMed.";
 
   return (
     <main className="min-h-screen bg-transparent pb-6 text-[#252c52]">
@@ -1008,16 +963,16 @@ export function DecisionBriefWorkspace({
             </div>
 
             <Button
-              className="h-9 bg-[#4d47d8] text-white hover:bg-[#403ab8] disabled:cursor-not-allowed disabled:opacity-55"
-              onClick={runBrief}
-              disabled={stream.isRunning}
-            >
+                className="h-9 bg-[#4d47d8] text-white hover:bg-[#403ab8] disabled:cursor-not-allowed disabled:opacity-55"
+                onClick={runBrief}
+                disabled={stream.isRunning}
+              >
               {stream.isRunning ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <Play className="h-3.5 w-3.5" />
               )}
-              Generate brief
+              Run analysis
             </Button>
 
             <Button
@@ -1047,58 +1002,6 @@ export function DecisionBriefWorkspace({
         </div>
       </header>
 
-      <section className="px-3 pb-0 pt-2 md:px-6">
-        <Card className="border-[#d6dbf3] bg-white/96">
-          <CardContent className="space-y-1.5 py-2 text-xs text-[#48558a]">
-            <div className="grid gap-1.5 md:grid-cols-[1.6fr_1fr_1fr]">
-              <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-2.5 py-1.5">
-                <div className="text-[10px] uppercase tracking-[0.12em] text-[#6a64b3]">Direct answer</div>
-                <div className="mt-0.5 text-[12px] leading-5 text-[#353f7a]">
-                  {queryAnswer}
-                  {!stream.isRunning && appendCitationSuffix ? citationSuffix : ""}
-                </div>
-                <div className="mt-1 text-[11px] text-[#606d9f]">
-                  {stream.isRunning
-                    ? "Live evidence stream in progress."
-                    : "Synthesized from active path evidence and caveats."}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-2.5 py-1.5">
-                <div className="text-[10px] uppercase tracking-[0.12em] text-[#6a64b3]">Primary thread</div>
-                <div className="mt-0.5 flex items-center gap-2 text-base font-semibold text-[#303f7f]">
-                  <span>{recommendation?.target ?? liveTargetFallback ?? "Building..."}</span>
-                  {recommendationIsProvisional ? (
-                    <Badge className="border border-[#cbc7fa] bg-[#eeebff] text-[10px] font-medium text-[#4c5199]">
-                      provisional
-                    </Badge>
-                  ) : null}
-                </div>
-                <div className="mt-1 text-[11px] text-[#606d9f]">
-                  {scientificVerdict.mechanismThread}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-2.5 py-1.5">
-                <div className="text-[10px] uppercase tracking-[0.12em] text-[#6a64b3]">Evidence quality</div>
-                <div className="mt-0.5 font-semibold text-[#303f7f]">{decisionCard.action}</div>
-                <div className="text-[11px] text-[#606d9f]">{scientificVerdict.confidence}</div>
-                <div className="mt-1 text-[11px] text-[#606d9f]">
-                  Score {recommendation ? recommendation.score.toFixed(3) : "pending"}
-                </div>
-                <div className="mt-1 text-[11px] text-[#606d9f]">
-                  {evidenceSnapshot.articleSnippets} articles • {evidenceSnapshot.trialSnippets} trials • {evidenceSnapshot.caveatCount} caveats
-                </div>
-              </div>
-            </div>
-
-            <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-2.5 py-1.5 text-[12px] text-[#3f4e8a]">
-              {naturalLanguageBrief}
-            </div>
-          </CardContent>
-        </Card>
-      </section>
-
       <section className="px-3 pt-3 md:px-6">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="space-y-1">
@@ -1107,7 +1010,7 @@ export function DecisionBriefWorkspace({
               Live Search
             </div>
             <div className="text-[11px] text-[#607797]">
-              Graph + narration + verdict update continuously in one workspace.
+              Graph, execution log, and verdict update continuously in one workspace.
             </div>
           </div>
 
@@ -1125,7 +1028,7 @@ export function DecisionBriefWorkspace({
               <SheetHeader className="pb-0">
                 <SheetTitle className="text-[#28446d]">Run Details</SheetTitle>
                 <SheetDescription className="text-[#5a7195]">
-                  Resolver, source health, node/edge inspector, and export controls.
+                  Resolver output, source health, graph inspector, and export controls.
                 </SheetDescription>
               </SheetHeader>
               <div className="space-y-3 overflow-y-auto px-4 pb-4 text-xs text-[#3f557b]">
@@ -1161,6 +1064,44 @@ export function DecisionBriefWorkspace({
                         ))}
                       </div>
                     ) : null}
+                  </CardContent>
+                </Card>
+
+                <Card className="border-[#dbe4f2] bg-white">
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm text-[#2a456f]">LLM Cost</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {stream.llmCost ? (
+                      <>
+                        <div className="rounded-lg border border-[#dbe4f2] bg-[#f7faff] p-2">
+                          <div className="text-[11px] uppercase tracking-[0.12em] text-[#6881a4]">
+                            Total
+                          </div>
+                          <div className="mt-0.5 text-lg font-semibold text-[#31507f]">
+                            {formatUsd(stream.llmCost.totals.estimatedCostUsd)}
+                          </div>
+                          <div className="text-[11px] text-[#6b82a3]">
+                            {stream.llmCost.totalCalls} calls • {stream.llmCost.totals.totalTokens.toLocaleString()} tokens
+                          </div>
+                          <div className="text-[11px] text-[#6b82a3]">
+                            Cache hit {(stream.llmCost.totals.cacheHitRate * 100).toFixed(1)}%
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-[#dbe4f2] bg-[#f7faff] p-2">
+                          <div className="mb-1 font-semibold text-[#375782]">Top cost drivers</div>
+                          {(stream.llmCost.byOperation ?? []).slice(0, 3).map((row) => (
+                            <div key={row.key} className="text-[11px] text-[#607a9d]">
+                              {row.key}: {formatUsd(row.estimatedCostUsd)}
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="rounded-lg border border-[#dbe4f2] bg-[#f7faff] p-2 text-[#6c84a4]">
+                        Cost summary appears after first model calls are recorded.
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
 
@@ -1336,7 +1277,7 @@ export function DecisionBriefWorkspace({
                       onClick={runBrief}
                       disabled={stream.isRunning}
                     >
-                      <Play className="h-3.5 w-3.5" /> Run query
+                      <Play className="h-3.5 w-3.5" /> Run analysis
                     </Button>
                     <Button
                       size="sm"
@@ -1428,7 +1369,73 @@ export function DecisionBriefWorkspace({
           <div className="space-y-2.5">
             <Card className="border-[#d9d4fb] bg-white">
               <CardHeader className="pb-2">
-                <CardTitle className="text-sm text-[#2a456f]">Live Narration</CardTitle>
+                <CardTitle className="text-sm text-[#2a456f]">Scientific answer</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm text-[#35557f] xl:max-h-[72vh] xl:overflow-y-auto xl:pr-1">
+                {stream.isRunning ? (
+                  <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
+                    <div className="font-semibold text-[#47429d]">Answer in progress</div>
+                    <MarkdownAnswer
+                      text={scientificVerdict.directAnswer}
+                      className="mt-1 text-[13px] leading-6 text-[#4f5d91]"
+                      citationIndices={verdictCitationIndexSet}
+                    />
+                    <div className="mt-1 text-[12px] text-[#6170a2]">
+                      Active thread: {scientificVerdict.mechanismThread}
+                    </div>
+                    <div className="mt-1 text-[12px] text-[#6170a2]">
+                      Current phase: {phaseSummaryMap[stream.status?.phase ?? ""] ?? "Streaming evidence"} (
+                      {progressPct}%)
+                    </div>
+                  </div>
+                ) : finalVerdictReady ? (
+                  <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
+                    <div className="font-semibold text-[#47429d]">
+                      {hasAgentFinalAnswer
+                        ? "Agent scientific answer"
+                        : `${verdictHeadingTarget} in ${verdictHeadingPathway}`}
+                    </div>
+                    <MarkdownAnswer
+                      text={scientificVerdict.directAnswer}
+                      className="mt-1 text-[13px] leading-6 text-[#4f5d91]"
+                      citationIndices={verdictCitationIndexSet}
+                    />
+                    <div className="mt-1 text-[12px] text-[#6170a2]">
+                      Primary mechanism path: {scientificVerdict.mechanismThread}
+                    </div>
+                    <div className="mt-1 text-[12px] text-[#6170a2]">
+                      Score {recommendation ? recommendation.score.toFixed(3) : "partial"} • Evidence confidence:{" "}
+                      {scientificVerdict.confidence}
+                    </div>
+                    {agentFinalReadout?.keyFindings?.length ? (
+                      <div className="mt-2 rounded-md border border-[#ddd9fb] bg-white px-2.5 py-2 text-[11px] text-[#576597]">
+                        {agentFinalReadout.keyFindings.slice(0, 4).map((item) => (
+                          <div key={item}>• {item}</div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
+                    <div className="font-semibold text-[#47429d]">No conclusive mechanism identified</div>
+                    <div className="mt-1 text-[13px] text-[#4f5d91]">
+                      This run ended without a stable mechanism thread. Review references and the graph trails.
+                    </div>
+                  </div>
+                )}
+                {stream.finalBrief?.caveats?.length ? (
+                  <div className="rounded-lg border border-[#ddd9fb] bg-[#f7f4ff] px-2.5 py-2 text-xs text-[#665ca3]">
+                    {stream.finalBrief.caveats.slice(0, 4).map((item) => (
+                      <div key={item}>• {item}</div>
+                    ))}
+                  </div>
+                ) : null}
+              </CardContent>
+            </Card>
+
+            <Card className="border-[#d9d4fb] bg-white">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm text-[#2a456f]">Execution log</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2 text-xs text-[#4f688d]">
                 <div className="rounded-lg border border-[#d9d4fb] bg-[#f7f4ff] px-2.5 py-2">
@@ -1441,20 +1448,55 @@ export function DecisionBriefWorkspace({
                   <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#ddd9f8]">
                     <div
                       className="h-full rounded-full bg-[#4f46e5] transition-all duration-500"
-                      style={{ width: `${Math.max(4, Math.min(100, stream.status?.pct ?? 0))}%` }}
+                      style={{ width: `${progressBarPct}%` }}
                     />
                   </div>
                   <div className="mt-1 text-[10px] text-[#696ea6]">
-                    Progress {Math.max(0, Math.min(100, Math.round(stream.status?.pct ?? 0)))}%
+                    Progress {progressPct}%
                   </div>
-                  {discoverElapsedMs !== null ? (
+                  {runElapsedMs > 0 ? (
                     <div className="mt-1 text-[10px] text-[#696ea6]">
-                      Agentic trail {Math.max(0, Math.round(discoverElapsedMs / 1000))}s
+                      Run time {formatDuration(runElapsedMs)}
                     </div>
                   ) : null}
+                  <div className="mt-1 text-[11px] text-[#525aa3]">
+                    Current operation: {executionActivity.currentOperation}
+                  </div>
+                  <div className="mt-1 text-[11px] text-[#525aa3]">
+                    In-flight tool calls: {executionActivity.inFlightCalls}
+                    {executionActivity.latestEvidenceUpdate
+                      ? ` • Last evidence update: ${executionActivity.latestEvidenceUpdate}`
+                      : ""}
+                  </div>
                   {stream.isRunning && secondsSinceNarration >= 8 ? (
                     <div className="mt-1 text-[11px] text-[#525aa3]">
-                      Still working, last narrative update {secondsSinceNarration}s ago.
+                      Last update {secondsSinceNarration}s ago.
+                    </div>
+                  ) : null}
+                  <div className="mt-2 grid grid-cols-2 gap-1.5 text-[10px] md:grid-cols-4">
+                    <div className="rounded border border-[#d5dcf5] bg-white px-1.5 py-1 text-[#4c5b92]">
+                      Calls {journeySignals.toolCalls}
+                    </div>
+                    <div className="rounded border border-[#c6e6d8] bg-white px-1.5 py-1 text-[#2f6d4e]">
+                      Results {journeySignals.toolResults}
+                    </div>
+                    <div className="rounded border border-[#c4e7d8] bg-white px-1.5 py-1 text-[#2e6b4d]">
+                      Active {journeySignals.active}
+                    </div>
+                    <div className="rounded border border-[#e3e5ef] bg-white px-1.5 py-1 text-[#6a718f]">
+                      Discarded {journeySignals.discarded}
+                    </div>
+                  </div>
+                  {journeySignals.topSources.length > 0 ? (
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {journeySignals.topSources.map(([source, count]) => (
+                        <span
+                          key={`${source}-${count}`}
+                          className="rounded-full border border-[#d8d4f8] bg-white px-1.5 py-0.5 text-[10px] text-[#676ca8]"
+                        >
+                          {source} {count}
+                        </span>
+                      ))}
                     </div>
                   ) : null}
                 </div>
@@ -1473,11 +1515,14 @@ export function DecisionBriefWorkspace({
                     mergedLiveNarration.map((entry) => (
                       <div
                         key={entry.id}
-                        className="rounded-md border border-[#e1defa] bg-[#faf9ff] px-2 py-1.5"
+                        className={`rounded-md border px-2 py-1.5 ${narrationPathTone(entry.pathState)}`}
                       >
                         <div className="flex items-center justify-between gap-2">
                           <div className="font-semibold text-[#4a4aa0]">{entry.title}</div>
                           <div className="flex items-center gap-1">
+                            <span className={`rounded-full border px-1.5 py-0.5 text-[10px] ${narrationKindTone(entry.kind)}`}>
+                              {narrationKindLabel(entry.kind)}
+                            </span>
                             <span className="rounded-full border border-[#d8d4f8] bg-white px-1.5 py-0.5 text-[10px] text-[#676ca8]">
                               {entry.source}
                             </span>
@@ -1505,183 +1550,53 @@ export function DecisionBriefWorkspace({
               </CardContent>
             </Card>
 
-            <DeepDiscoverer
-              diseaseQuery={deepDiscoverDiseaseQuery}
-              diseaseId={resolvedDiseaseId}
-              seedQuestion={submittedQuery}
-              autoStart={deepDiscoverAutoStart}
-              autoStartKey={deepDiscoverAutoStartKey}
-              autoFocusLatest={false}
-              hideFinalReadout
-              compact
-              hidePanel
-              onFinalReadout={setAgentFinalReadout}
-              onFocusEntities={focusEntities}
-              onEntriesChange={(payload) => {
-                setDiscoverEntries(payload.entries);
-                setDiscoverIsRunning(payload.isRunning);
-                setDiscoverStatusMessage(payload.statusMessage);
-                setDiscoverElapsedMs(payload.elapsedMs);
-              }}
-            />
           </div>
         </div>
+      </section>
 
-        <Card className="mt-3 border-[#d9d4fb] bg-white">
+      <section className="px-3 pt-3 md:px-6">
+        <Card className="border-[#d9d4fb] bg-white">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm text-[#2a456f]">Final scientific answer</CardTitle>
+            <CardTitle className="text-sm text-[#2a456f]">
+              References ({verdictCitations.length})
+            </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 text-sm text-[#35557f]">
-            {stream.isRunning ? (
-              <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
-                <div className="font-semibold text-[#47429d]">Final verdict pending</div>
-                <div className="mt-1 text-[13px] text-[#4f5d91]">{scientificVerdict.directAnswer}</div>
-                <div className="mt-1 text-[12px] text-[#6170a2]">
-                  Active thread: {scientificVerdict.mechanismThread}
-                </div>
-                <div className="mt-1 text-[12px] text-[#6170a2]">
-                  Current phase: {phaseSummaryMap[stream.status?.phase ?? ""] ?? "Streaming evidence"} (
-                  {Math.max(0, Math.min(100, Math.round(stream.status?.pct ?? 0)))}%)
-                </div>
-              </div>
-            ) : finalVerdictReady ? (
-              <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
-                <div className="font-semibold text-[#47429d]">
-                  {hasAgentFinalAnswer
-                    ? "Agent scientific answer"
-                    : `${verdictHeadingTarget} in ${verdictHeadingPathway}`}
-                </div>
-                <div className="mt-1 text-[13px] text-[#4f5d91]">
-                  {scientificVerdict.directAnswer}
-                  {appendCitationSuffix ? citationSuffix : ""}
-                </div>
-                <div className="mt-1 text-[12px] text-[#6170a2]">
-                  Mechanistic thread: {scientificVerdict.mechanismThread}
-                </div>
-                <div className="mt-1 text-[12px] text-[#6170a2]">
-                  Score {recommendation ? recommendation.score.toFixed(3) : "partial"} • Decision: {decisionCard.action}
-                </div>
-                {bridgeAnalysis?.status === "connected" ? (
-                  <div className="mt-1 text-[12px] text-[#2f6f57]">
-                    Explicit anchor bridge: connected.
+          <CardContent className="pt-0 text-xs text-[#57608f]">
+            {verdictCitations.length > 0 ? (
+              <div className="max-h-[300px] space-y-1.5 overflow-y-auto pr-1">
+                {verdictCitations.map((citation) => (
+                  <div
+                    key={`${citation.kind}-${citation.index}`}
+                    id={`ref-${citation.index}`}
+                    className="scroll-mt-24 rounded-md border border-[#e1dff9] bg-[#f9f8ff] px-2 py-1"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-[#4d48a6]">[{citation.index}]</span>
+                      <span className="rounded-full border border-[#ddd9fb] bg-white px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-[#6a65a9]">
+                        {citation.kind}
+                      </span>
+                      <span className="text-[10px] text-[#6d79ad]">{citation.source}</span>
+                    </div>
+                    {citation.url ? (
+                      <a
+                        href={citation.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-0.5 block text-[11px] text-[#3d53a0] underline underline-offset-2 hover:text-[#2c3d7b]"
+                      >
+                        {citation.label}
+                      </a>
+                    ) : (
+                      <div className="mt-0.5 text-[11px] text-[#4d5f95]">{citation.label}</div>
+                    )}
                   </div>
-                ) : null}
-                {bridgeAnalysis?.status === "no_connection" ? (
-                  <div className="mt-1 text-[12px] text-[#6845ad]">
-                    Explicit anchor bridge: no-connection (broken bridge shown in graph).
-                  </div>
-                ) : null}
-                {agentFinalReadout?.keyFindings?.length ? (
-                  <div className="mt-2 rounded-md border border-[#ddd9fb] bg-white px-2.5 py-2 text-[11px] text-[#576597]">
-                    {agentFinalReadout.keyFindings.slice(0, 3).map((item) => (
-                      <div key={item}>• {item}</div>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
-                <div className="font-semibold text-[#47429d]">No decisive thread yet</div>
-                <div className="mt-1 text-[13px] text-[#4f5d91]">
-                  The run ended without a stable mechanism thread. Review washed paths and caveats.
-                </div>
-              </div>
-            )}
-            {stream.finalBrief?.caveats?.length ? (
-              <div className="rounded-lg border border-[#ddd9fb] bg-[#f7f4ff] px-2.5 py-2 text-xs text-[#665ca3]">
-                {stream.finalBrief.caveats.slice(0, 3).map((item) => (
-                  <div key={item}>• {item}</div>
                 ))}
               </div>
-            ) : null}
-            {verdictCitations.length > 0 ? (
-              <div className="rounded-lg border border-[#ddd9fb] bg-white px-2.5 py-2 text-xs text-[#57608f]">
-                <div className="mb-1 font-semibold text-[#4a4898]">References</div>
-                <div className="space-y-1.5">
-                  {verdictCitations.map((citation) => (
-                    <div key={`${citation.kind}-${citation.index}`} className="rounded-md border border-[#e1dff9] bg-[#f9f8ff] px-2 py-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-semibold text-[#4d48a6]">[{citation.index}]</span>
-                        <span className="rounded-full border border-[#ddd9fb] bg-white px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-[#6a65a9]">
-                          {citation.kind}
-                        </span>
-                        <span className="text-[10px] text-[#6d79ad]">{citation.source}</span>
-                      </div>
-                      {citation.url ? (
-                        <a
-                          href={citation.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="mt-0.5 block text-[11px] text-[#3d53a0] underline underline-offset-2 hover:text-[#2c3d7b]"
-                        >
-                          {citation.label}
-                        </a>
-                      ) : (
-                        <div className="mt-0.5 text-[11px] text-[#4d5f95]">{citation.label}</div>
-                      )}
-                    </div>
-                  ))}
-                </div>
+            ) : (
+              <div className="rounded-md border border-[#e1dff9] bg-[#f9f8ff] px-2 py-2 text-[11px] text-[#6369a1]">
+                References will appear after evidence retrieval completes.
               </div>
-            ) : null}
-          </CardContent>
-        </Card>
-
-        <Card className="mt-3 border-[#d9d4fb] bg-white">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm text-[#2a456f]">Evidence insights</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3 text-xs text-[#4f678b]">
-            <div className="grid gap-2 md:grid-cols-2">
-              <div className="rounded-lg border border-[#e1e9f5] bg-[#f8fbff] p-2">
-                <div className="mb-1 font-semibold text-[#355782]">Alternative threads</div>
-                {stream.finalBrief?.alternatives?.length ? (
-                  <div className="space-y-1.5">
-                    {stream.finalBrief.alternatives.map((item) => (
-                      <div key={item.symbol} className="rounded-md border border-[#e2e9f5] bg-white px-2 py-1.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-semibold text-[#355782]">{item.symbol}</span>
-                          <span className="text-[#6d84a6]">{item.score.toFixed(3)}</span>
-                        </div>
-                        <div className="text-[11px] text-[#607a9d]">{item.reason}</div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="text-[#6c84a4]">Alternatives appear after ranking stage.</div>
-                )}
-              </div>
-
-              <div className="rounded-lg border border-[#e1e9f5] bg-[#f8fbff] p-2">
-                <div className="mb-1 font-semibold text-[#355782]">Why this score</div>
-                {scoreBreakdown.length > 0 ? (
-                  <div className="grid gap-1">
-                    {scoreBreakdown.slice(0, 6).map((entry) => (
-                      <div
-                        key={`${entry.label}-${entry.value}`}
-                        className="rounded-md border border-[#e2e9f5] bg-white px-2 py-1.5 text-[11px]"
-                      >
-                        <div className="font-semibold text-[#355782]">{entry.label}</div>
-                        <div className="text-[#607a9d]">{entry.value}</div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="text-[#6c84a4]">Component metrics appear after ranking stage.</div>
-                )}
-              </div>
-            </div>
-            {stream.finalBrief?.queryAlignment && stream.finalBrief.queryAlignment.status !== "none" ? (
-              <div className="rounded-lg border border-[#e1e9f5] bg-[#f8fbff] px-2.5 py-2 text-sm text-[#4f678b]">
-                <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6a83a5]">
-                  Query alignment
-                </div>
-                <div className="font-medium capitalize text-[#355782]">
-                  {stream.finalBrief.queryAlignment.status}
-                </div>
-                <div className="mt-1 text-[#607a9d]">{stream.finalBrief.queryAlignment.note}</div>
-              </div>
-            ) : null}
+            )}
           </CardContent>
         </Card>
       </section>

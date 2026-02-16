@@ -618,8 +618,8 @@ export function analyzeBridgeOutcomes(input: {
       status: "no_connection",
       reason:
         fromResolved && toResolved
-          ? "No connected bridge found in the current multihop graph."
-          : "One or both anchors unresolved; keeping an explicit broken bridge.",
+          ? "No connected path found in the current multihop graph."
+          : "One or both anchors unresolved; keeping an explicit unresolved connection.",
       nodeIds: [fromNode, toNode],
       edgeIds: [gapEdgeId],
       gapEdgeId,
@@ -661,7 +661,7 @@ export function analyzeBridgeOutcomes(input: {
         ? `${connectedPairs.length}/${pairs.length} anchor pair(s) connected by an explicit multihop path.`
         : `${connectedPairs.length}/${pairs.length} anchor pair(s) connected; remaining pairs are unresolved.`
       : status === "no_connection"
-        ? "No full bridge found yet; broken bridge edges show unresolved or disconnected anchors."
+        ? "No full anchor-to-anchor path found yet; unresolved anchor pairs remain visible."
         : "Anchor connectivity pending.";
 
   return {

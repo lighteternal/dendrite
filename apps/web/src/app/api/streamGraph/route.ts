@@ -32,6 +32,12 @@ import {
   startRequestLog,
   stepRequestLog,
 } from "@/server/telemetry";
+import {
+  beginOpenAiRun,
+  withOpenAiOperationContext,
+  withOpenAiRunContext,
+} from "@/server/openai/cost-tracker";
+import { withOpenAiApiKeyContext } from "@/server/openai/client";
 
 export const runtime = "nodejs";
 
@@ -40,6 +46,13 @@ type PipelinePhase = "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6";
 type SourceHealthState = Record<SourceName, "green" | "yellow" | "red">;
 
 const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
+
+function normalizeApiKey(raw: string | null | undefined): string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  if (!/^sk-[A-Za-z0-9._-]{12,}$/.test(value)) return undefined;
+  return value;
+}
 
 function cleanText(value: unknown): string | undefined {
   if (typeof value === "string") {
@@ -107,6 +120,7 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const diseaseQuery = searchParams.get("diseaseQuery")?.trim();
   const diseaseIdHint = searchParams.get("diseaseId")?.trim();
+  const runId = searchParams.get("runId")?.trim() || null;
   const maxTargets = Number(searchParams.get("maxTargets") ?? 20);
   const seedTargets = (searchParams.get("seedTargets") ?? "")
     .split(",")
@@ -117,8 +131,12 @@ export async function GET(request: NextRequest) {
   const includeDrugs = searchParams.get("drugs") !== "0";
   const includeInteractions = searchParams.get("interactions") !== "0";
   const includeLiterature = searchParams.get("literature") !== "0";
+  const requestApiKey = normalizeApiKey(
+    request.headers.get("x-targetgraph-api-key"),
+  );
   const log = startRequestLog("/api/streamGraph", {
     diseaseQuery: diseaseQuery?.slice(0, 120),
+    runId,
     maxTargets,
     includePathways,
     includeDrugs,
@@ -130,6 +148,10 @@ export async function GET(request: NextRequest) {
   if (!diseaseQuery) {
     endRequestLog(log, { rejected: true, reason: "missing_disease_query" });
     return new Response("Missing diseaseQuery", { status: 400 });
+  }
+
+  if (runId) {
+    beginOpenAiRun(runId, diseaseQuery);
   }
 
   const nodeMap = new Map<string, GraphNode>();
@@ -1081,9 +1103,13 @@ export async function GET(request: NextRequest) {
         });
 
         try {
-          const ranking = await withTimeout(
-            rankTargets(rankingRows),
-            appConfig.stream.rankingTimeoutMs,
+          const ranking = await withOpenAiOperationContext(
+            "stream_graph.rank_targets",
+            () =>
+              withTimeout(
+                rankTargets(rankingRows),
+                appConfig.stream.rankingTimeoutMs,
+              ),
           );
           emit({ event: "ranking", data: ranking });
           emitStatus("P6", "AI narrative refinement complete", 98, {
@@ -1150,7 +1176,11 @@ export async function GET(request: NextRequest) {
         closeStream();
       };
 
-      run().catch((error) => {
+      const execute = runId
+        ? () => withOpenAiRunContext(runId, run)
+        : run;
+
+      withOpenAiApiKeyContext(requestApiKey, execute).catch((error) => {
         emit({
           event: "error",
           data: {

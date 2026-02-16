@@ -9,6 +9,7 @@ import {
   type QueryPlanFollowup,
   type ResolvedQueryPlan,
 } from "@/server/agent/query-plan";
+import { extractEvidenceEntitiesFast } from "@/server/agent/relation-mention-extractor";
 import { getLiteratureAndTrials } from "@/server/mcp/biomcp";
 import { getTargetActivityDrugs } from "@/server/mcp/chembl";
 import {
@@ -26,11 +27,17 @@ import {
 import { findPathwaysByGene } from "@/server/mcp/reactome";
 import { getInteractionNetwork } from "@/server/mcp/stringdb";
 import { appConfig } from "@/server/config";
+import { getOpenAiApiKeyFromContext } from "@/server/openai/client";
 import {
   handleOpenAiRateLimit,
   isOpenAiRateLimited,
 } from "@/server/openai/rate-limit";
 import { chooseDiscovererModel } from "@/server/openai/model-router";
+import {
+  createLangChainUsageCallback,
+  getLangChainPromptCacheConfig,
+  withOpenAiOperationContext,
+} from "@/server/openai/cost-tracker";
 
 export type DiscoverEntity = {
   type:
@@ -46,6 +53,7 @@ export type DiscoverEntity = {
     | "protein";
   label: string;
   primaryId?: string;
+  evidenceCategory?: "exposure" | "mechanism" | "outcome";
 };
 
 export type DiscoverJourneyEntry = {
@@ -70,7 +78,8 @@ export type DiscoverJourneyEntry = {
     | "chembl"
     | "string"
     | "biomcp"
-    | "pubmed";
+    | "pubmed"
+    | "evidence";
   pathState?: "active" | "candidate" | "discarded";
   entities: DiscoverEntity[];
   graphPatch?: {
@@ -93,6 +102,16 @@ export type DiscovererFinal = {
   keyFindings: string[];
   caveats: string[];
   nextActions: string[];
+  evidenceBundle?: {
+    articleSnippets: number;
+    trialSnippets: number;
+    citations: Array<{
+      kind: "article" | "trial";
+      label: string;
+      source: string;
+      url?: string;
+    }>;
+  };
 };
 
 type RunParams = {
@@ -151,7 +170,8 @@ type DiscoveryEdge = {
     | "chembl"
     | "string"
     | "biomcp"
-    | "pubmed";
+    | "pubmed"
+    | "evidence";
   score: number;
   note?: string;
 };
@@ -174,7 +194,10 @@ type DiscoveryState = {
   edges: Map<string, DiscoveryEdge>;
   pubmedSubqueriesUsed: number;
   pubmedSubqueryHits: Array<{ query: string; articles: PubmedArticle[] }>;
+  pubmedByQuery: Map<string, PubmedArticle[]>;
   bioMcpCounts: { articles: number; trials: number };
+  bioMcpArticles: Array<{ id: string; title: string; source: string; url: string }>;
+  bioMcpTrials: Array<{ id: string; title: string; source: string; url: string; status?: string }>;
 };
 
 type CoordinatorTask = {
@@ -191,13 +214,19 @@ type SubagentReport = {
 };
 
 const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
-const AGENT_TIMEOUT_MS = 50_000;
-const TOOL_TIMEOUT_MS = 12_000;
-const MAX_PUBMED_SUBQUERIES = 5;
+const AGENT_TIMEOUT_MS = Math.max(
+  10 * 60 * 1000,
+  appConfig.deepDiscover.agentTimeoutMs,
+);
+const TOOL_TIMEOUT_MS = Math.max(45_000, appConfig.deepDiscover.toolTimeoutMs);
+const MAX_PUBMED_SUBQUERIES = appConfig.deepDiscover.maxPubmedSubqueries;
+const DISCOVERER_MAX_RUN_MS = Math.max(90_000, appConfig.deepDiscover.maxRunMs);
+const COORDINATOR_TIMEOUT_MS = Math.max(120_000, AGENT_TIMEOUT_MS);
+const SUBAGENT_TIMEOUT_MS = Math.max(120_000, AGENT_TIMEOUT_MS);
 
 const coordinatorPlanSchema = z.object({
-  strategy: z.string(),
-  pubmedSubqueries: z.array(z.string()).max(MAX_PUBMED_SUBQUERIES),
+  strategy: z.string().max(320),
+  pubmedSubqueries: z.array(z.string().max(220)).max(MAX_PUBMED_SUBQUERIES),
   tasks: z
     .array(
       z.object({
@@ -207,7 +236,7 @@ const coordinatorPlanSchema = z.object({
           "bridge_hunter",
           "literature_scout",
         ]),
-        objective: z.string(),
+        objective: z.string().max(260),
         seedEntities: z.array(z.string()).max(8),
       }),
     )
@@ -215,9 +244,9 @@ const coordinatorPlanSchema = z.object({
 });
 
 const subagentReportSchema = z.object({
-  summary: z.string(),
-  findings: z.array(z.string()).max(8),
-  followups: z.array(z.string()).max(4),
+  summary: z.string().max(560),
+  findings: z.array(z.string().max(260)).max(5),
+  followups: z.array(z.string().max(180)).max(2),
   pathState: z.enum(["active", "candidate", "discarded"]),
 });
 
@@ -266,10 +295,59 @@ function clean(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function normalizeAnswerMarkdown(value: string): string {
+  return value
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function countWords(value: string): number {
+  return normalizeAnswerMarkdown(value)
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function enrichIfTooBrief(answer: string, keyFindings: string[], caveats: string[] = []): string {
+  const normalized = normalizeAnswerMarkdown(answer);
+  if (!normalized) return normalized;
+  if (countWords(normalized) >= 120) return normalized;
+  const findings = keyFindings
+    .map((item) => clean(item))
+    .filter(Boolean)
+    .slice(0, 4);
+  const uncertainty = caveats
+    .map((item) => clean(item))
+    .filter(Boolean)
+    .slice(0, 4);
+
+  const sections: string[] = [normalized];
+  if (findings.length > 0) {
+    sections.push("", "### Mechanistic support", ...findings.map((item) => `- ${item}`));
+  }
+  if (uncertainty.length > 0) {
+    sections.push("", "### What remains uncertain", ...uncertainty.map((item) => `- ${item}`));
+  }
+  return sections.join("\n");
+}
+
+function normalizePubmedQuery(value: string): string {
+  return clean(value).toLowerCase();
+}
+
 function compact(value: string, max = 180): string {
   const normalized = clean(value);
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max - 1)}…`;
+}
+
+function slugify(value: string, max = 64): string {
+  const slug = clean(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!slug) return "unknown";
+  return slug.slice(0, max);
 }
 
 function toNarrativeDetail(
@@ -358,7 +436,7 @@ function inferBiomedicalCase(query: string): {
   return {
     title: `${compact(query, 86)}: multihop mechanistic discovery`,
     whyAgentic:
-      "Coordinator-guided subagents retrieve evidence across OpenTargets, Reactome, STRING, ChEMBL, BioMCP, and PubMed, then test bridge hypotheses with query-specific follow-ups.",
+      "Coordinator-guided subagents retrieve evidence across OpenTargets, Reactome, STRING, ChEMBL, BioMCP, and PubMed, then test competing mechanism hypotheses with query-specific follow-ups.",
   };
 }
 
@@ -464,6 +542,7 @@ function buildGraphPatch(state: DiscoveryState): {
       meta: {
         displayName: node.entity.label,
         source: "agent_discovery",
+        evidenceCategory: node.entity.evidenceCategory,
         virtual: false,
       },
     });
@@ -481,12 +560,13 @@ function buildGraphPatch(state: DiscoveryState): {
     const sourceId = toGraphNodeId(sourceEntity);
     const targetId = toGraphNodeId(targetEntity);
     const id = makeEdgeId(sourceId, targetId, mapping.type);
-    const status =
-      edge.relation === "query_anchor"
-        ? "candidate"
-        : edge.score >= 0.6
-          ? "connected"
-          : "candidate";
+    const plannerAnchorEdge =
+      edge.relation === "query_anchor" && edge.source === "planner";
+    const status = plannerAnchorEdge
+      ? "candidate"
+      : edge.score >= 0.6
+        ? "connected"
+        : "candidate";
     edgeMap.set(id, {
       id,
       source: sourceId,
@@ -494,11 +574,15 @@ function buildGraphPatch(state: DiscoveryState): {
       type: mapping.type,
       weight: clamp(edge.score, 0.05, 1),
       meta: {
-        source:
-          edge.relation === "query_anchor" ? "query_anchor" : edge.source,
+        source: plannerAnchorEdge ? "query_anchor" : edge.source,
         status,
         note: edge.note,
-        bridgeType: edge.relation === "query_anchor" ? "query_anchor" : edge.relation,
+        bridgeType:
+          edge.relation === "query_anchor"
+            ? plannerAnchorEdge
+              ? "query_anchor"
+              : "cross_anchor_evidence"
+            : edge.relation,
         agentic: true,
       },
     });
@@ -542,7 +626,7 @@ function summarizeThread(state: DiscoveryState): {
 function buildAdjacency(state: DiscoveryState): Map<string, Array<{ to: string; edgeId: string }>> {
   const adjacency = new Map<string, Array<{ to: string; edgeId: string }>>();
   for (const edge of state.edges.values()) {
-    if (edge.relation === "query_anchor") {
+    if (edge.relation === "query_anchor" && edge.source === "planner") {
       // Query anchor links keep the run interpretable but should not be treated
       // as mechanistic bridge evidence.
       continue;
@@ -693,36 +777,118 @@ function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererF
   const bridge = chooseBridgePath(state);
   const bridgeSummary = bridgePathToSummary(state, bridge.connectedPath);
   const pubmedCount = state.pubmedSubqueryHits.reduce((acc, row) => acc + row.articles.length, 0);
+  const anchorScope =
+    bridge.anchorLabels.length >= 2
+      ? bridge.anchorLabels.join(" and ")
+      : bridge.anchorLabels[0] ?? query;
 
   const answer = bridge.connectedPath
-    ? `Provisional synthesis for "${query}": evidence currently supports the multihop chain ${bridgeSummary}.`
-    : `Provisional synthesis for "${query}": no complete multihop bridge is closed yet; the strongest partial thread is ${thread.pathway} -> ${thread.target} -> ${thread.drug}.`;
+    ? `For ${anchorScope}, current evidence supports the multihop mechanism path ${bridgeSummary}.`
+    : `For ${anchorScope}, a complete multihop mechanism path is not yet resolved; the strongest partial thread is ${thread.pathway} -> ${thread.target} -> ${thread.drug}.`;
 
   const caveats: string[] = [];
   if (!bridge.connectedPath) {
-    caveats.push("No explicit connected path across all anchors in this run.");
+    caveats.push("No complete path across all query entities in this run.");
   }
   if (thread.target === "not provided") caveats.push("Target evidence not provided.");
   if (thread.pathway === "not provided") caveats.push("Pathway evidence not provided.");
   if (thread.drug === "not provided") caveats.push("Drug evidence not provided.");
   if (pubmedCount === 0) caveats.push("PubMed subqueries returned no articles.");
+  const hasConcreteThread =
+    thread.pathway !== "not provided" || thread.target !== "not provided" || thread.drug !== "not provided";
+  const mappedAnchorsLine =
+    bridge.anchorLabels.length <= 1
+      ? `Primary query entity mapped: ${bridge.anchorLabels[0] ?? "not provided"}`
+      : `Query entities mapped: ${bridge.anchorLabels.join(" | ")}`;
+  const keyFindings = [
+    mappedAnchorsLine,
+    ...(hasConcreteThread
+      ? [`Strongest thread: ${thread.pathway} -> ${thread.target} -> ${thread.drug}`]
+      : []),
+    `Nodes discovered: ${state.nodes.size}`,
+    `Edges discovered: ${state.edges.size}`,
+    `PubMed subqueries executed: ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}`,
+    `BioMCP snippets: ${state.bioMcpCounts.articles} articles / ${state.bioMcpCounts.trials} trials`,
+  ];
 
   return {
     answer,
     biomedicalCase: inferBiomedicalCase(query),
     focusThread: thread,
-    keyFindings: [
-      `Nodes discovered: ${state.nodes.size}`,
-      `Edges discovered: ${state.edges.size}`,
-      `PubMed subqueries executed: ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}`,
-      `BioMCP snippets: ${state.bioMcpCounts.articles} articles / ${state.bioMcpCounts.trials} trials`,
-    ],
+    keyFindings,
     caveats: caveats.length > 0 ? caveats : ["No major gaps were flagged."],
     nextActions: [
-      "Run follow-up assay design on the strongest connected target-pathway segment.",
-      "Expand interaction neighborhood around the bridge target set.",
+      "Run follow-up assay design on the strongest target-pathway segment.",
+      "Expand interaction neighborhood around the top mechanistic targets.",
       "Increase PubMed depth on unresolved anchor pairs with narrower subqueries.",
     ],
+    evidenceBundle: buildEvidenceBundle(state),
+  };
+}
+
+function buildEvidenceBundle(state: DiscoveryState): NonNullable<DiscovererFinal["evidenceBundle"]> {
+  const citations: NonNullable<DiscovererFinal["evidenceBundle"]>["citations"] = [];
+  const seen = new Set<string>();
+  const pushCitation = (entry: {
+    kind: "article" | "trial";
+    label: string;
+    source: string;
+    url?: string;
+  }) => {
+    const label = compact(clean(entry.label), 180);
+    if (!label) return;
+    const key = `${entry.kind}::${entry.url ?? ""}::${label.toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    citations.push({
+      kind: entry.kind,
+      label,
+      source: clean(entry.source) || (entry.kind === "trial" ? "ClinicalTrials.gov" : "PubMed"),
+      url: entry.url,
+    });
+  };
+
+  for (const row of state.pubmedSubqueryHits) {
+    for (const article of row.articles.slice(0, 4)) {
+      const pmid = clean(article.id);
+      pushCitation({
+        kind: "article",
+        label: article.title,
+        source: article.journal || "PubMed",
+        url: pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : undefined,
+      });
+      if (citations.length >= 28) break;
+    }
+    if (citations.length >= 28) break;
+  }
+
+  for (const article of state.bioMcpArticles.slice(0, 10)) {
+    pushCitation({
+      kind: "article",
+      label: article.title,
+      source: article.source || "BioMCP",
+      url: article.url,
+    });
+    if (citations.length >= 36) break;
+  }
+
+  for (const trial of state.bioMcpTrials.slice(0, 8)) {
+    pushCitation({
+      kind: "trial",
+      label: trial.status ? `${trial.title} (${trial.status})` : trial.title,
+      source: trial.source || "BioMCP",
+      url: trial.url,
+    });
+    if (citations.length >= 40) break;
+  }
+
+  return {
+    articleSnippets: Math.max(
+      state.bioMcpCounts.articles,
+      state.pubmedSubqueryHits.reduce((acc, row) => acc + row.articles.length, 0),
+    ),
+    trialSnippets: state.bioMcpCounts.trials,
+    citations,
   };
 }
 
@@ -743,57 +909,112 @@ type FreeformSynthesisInput = {
   subagentSummaries: string[];
 };
 
+type SubagentSummaryCompressionInput = {
+  objective: string;
+  summary: string;
+  findings: string[];
+};
+
+async function compressSubagentSummary(
+  model: ChatOpenAI,
+  payload: SubagentSummaryCompressionInput,
+): Promise<string | null> {
+  const response = await withOpenAiOperationContext(
+    "deep_discover.utility_compress_summary",
+    () =>
+      withTimeout(
+        model.invoke([
+          {
+            role: "system",
+            content: [
+              "You compress biomedical subagent output into one evidence-grounded sentence.",
+              "Keep entities and mechanism nouns intact.",
+              "Do not invent evidence, certainty, or citations.",
+              "Max length: 180 characters.",
+              "Return plain text only.",
+            ].join(" "),
+          },
+          {
+            role: "user",
+            content: JSON.stringify(payload),
+          },
+        ]),
+        Math.min(TOOL_TIMEOUT_MS, 6_000),
+        "subagent summary compression",
+      ),
+  );
+  const text = clean(toAssistantText(response.content));
+  return text.length > 0 ? compact(text, 180) : null;
+}
+
 async function synthesizeFreeformNarrative(
   model: ChatOpenAI,
   payload: FreeformSynthesisInput,
 ): Promise<string | null> {
-  const response = await withTimeout(
-    model.invoke([
-      {
-        role: "system",
-        content: [
-          "You are a biomedical scientist writing the final run answer.",
-          "Write a concise free-form scientific summary tailored to the exact query.",
-          "Never use generic templates or boilerplate prefixes.",
-          "If bridge is incomplete, explain what was tested and where the gap remains.",
-          "When evidence is available, mention the main intermediate hops explicitly.",
-          "If citation markers are provided, cite only using [1], [2], etc.",
-          "Return plain text only.",
-        ].join(" "),
-      },
-      {
-        role: "user",
-        content: JSON.stringify(
+  const response = await withOpenAiOperationContext(
+    "deep_discover.final_freeform_synthesis",
+    () =>
+      withTimeout(
+        model.invoke([
           {
-            query: payload.query,
-            bridge: payload.bridge,
-            focusThread: payload.thread,
-            evidenceStats: {
-              nodes: payload.state.nodes.size,
-              edges: payload.state.edges.size,
-              targets: payload.state.targetById.size,
-              pathways: payload.state.pathwayById.size,
-              drugs: payload.state.drugById.size,
-              pubmedQueriesUsed: payload.state.pubmedSubqueriesUsed,
-              pubmedArticles: payload.state.pubmedSubqueryHits.reduce(
-                (acc, row) => acc + row.articles.length,
-                0,
-              ),
-              biomcpArticles: payload.state.bioMcpCounts.articles,
-              biomcpTrials: payload.state.bioMcpCounts.trials,
-            },
-            subagentSummaries: payload.subagentSummaries.slice(0, 8),
-            citationPreview: payload.citationPreview,
+            role: "system",
+            content: [
+              "You are a biomedical scientist writing the final run answer.",
+              "Write a rigorous free-form scientific summary tailored to the exact query.",
+              "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
+              "Open with a direct answer sentence that names the main mechanism relation.",
+              "Write a substantive answer (roughly 180-280 words), not a one-liner.",
+              "Mention the key entities from the query and at least one intermediate mechanistic hop if available.",
+              "Never use generic templates or boilerplate prefixes.",
+              "If no complete cross-anchor mechanism path is found, explain what was tested and where the gap remains.",
+              "When evidence is available, mention the main intermediate hops explicitly.",
+              "Cover limitations/uncertainty clearly but concisely (at most 10% of total answer length).",
+              "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
+              "End with a complete sentence; do not stop mid-sentence.",
+              "Do not use internal workflow words such as bridge, branch, planner, or pipeline in the answer text.",
+              "Do not discuss UI state, run progress, or internal orchestration.",
+              "Do not write meta phrases like 'the provided evidence summary' or 'this dataset'.",
+              "Write the biomedical conclusion directly.",
+              "Ignore placeholder values like 'not provided'; never surface them in findings or caveats.",
+              "Do not add caveats about unrelated focus targets unless directly supported by mechanism evidence.",
+              "If citation markers are provided, cite only using [1], [2], etc.",
+              "Return plain text only.",
+            ].join(" "),
           },
-          null,
-          2,
-        ),
-      },
-    ]),
-    AGENT_TIMEOUT_MS,
-    "freeform synthesis",
+          {
+            role: "user",
+            content: JSON.stringify(
+              {
+                query: payload.query,
+                mechanismPath: payload.bridge,
+                focusThread: payload.thread,
+                evidenceStats: {
+                  nodes: payload.state.nodes.size,
+                  edges: payload.state.edges.size,
+                  targets: payload.state.targetById.size,
+                  pathways: payload.state.pathwayById.size,
+                  drugs: payload.state.drugById.size,
+                  pubmedQueriesUsed: payload.state.pubmedSubqueriesUsed,
+                  pubmedArticles: payload.state.pubmedSubqueryHits.reduce(
+                    (acc, row) => acc + row.articles.length,
+                    0,
+                  ),
+                  biomcpArticles: payload.state.bioMcpCounts.articles,
+                  biomcpTrials: payload.state.bioMcpCounts.trials,
+                },
+                subagentSummaries: payload.subagentSummaries.slice(0, 8),
+                citationPreview: payload.citationPreview,
+              },
+              null,
+              2,
+            ),
+          },
+        ]),
+        AGENT_TIMEOUT_MS,
+        "freeform synthesis",
+      ),
   );
-  const text = clean(toAssistantText(response.content));
+  const text = normalizeAnswerMarkdown(toAssistantText(response.content));
   return text.length > 0 ? text : null;
 }
 
@@ -856,7 +1077,10 @@ export async function runDeepDiscoverer({
     edges: new Map(),
     pubmedSubqueriesUsed: 0,
     pubmedSubqueryHits: [],
+    pubmedByQuery: new Map(),
     bioMcpCounts: { articles: 0, trials: 0 },
+    bioMcpArticles: [],
+    bioMcpTrials: [],
   };
 
   let entryCounter = 0;
@@ -881,6 +1105,29 @@ export async function runDeepDiscoverer({
       entities,
       graphPatch: includeGraphPatch ? buildGraphPatch(state) : undefined,
     });
+  };
+
+  const runStartedAtMs = Date.now();
+  const runDeadlineMs = runStartedAtMs + DISCOVERER_MAX_RUN_MS;
+  let runBudgetWarningEmitted = false;
+  const msRemaining = () => runDeadlineMs - Date.now();
+  const hasTimeBudget = (reserveMs = 0) => msRemaining() > reserveMs;
+  const boundedTimeout = (maxMs: number, minMs = 8_000): number => {
+    const remaining = msRemaining() - 2_000;
+    if (!Number.isFinite(remaining) || remaining <= minMs) return minMs;
+    return Math.max(minMs, Math.min(maxMs, remaining));
+  };
+  const emitRunBudgetWarning = (detail: string) => {
+    if (runBudgetWarningEmitted) return;
+    runBudgetWarningEmitted = true;
+    push(
+      "warning",
+      "Run budget reached",
+      detail,
+      "agent",
+      [],
+      "candidate",
+    );
   };
 
   const upsertTargetNode = (target: TargetInfo) => {
@@ -984,6 +1231,125 @@ export async function runDeepDiscoverer({
     });
   };
 
+  const extractAndLinkEvidenceEntities = async (input: {
+    source: "pubmed" | "biomcp";
+    snippets: string[];
+    diseaseName?: string;
+    targetSymbol?: string;
+  }): Promise<Array<{ label: string; category: "exposure" | "mechanism" | "outcome" }>> => {
+    const snippets = input.snippets
+      .map((value) => clean(value))
+      .filter((value) => value.length >= 8)
+      .slice(0, 18);
+    if (snippets.length === 0) return [];
+    if (!hasTimeBudget(8_000)) return [];
+
+    const extracted = await extractEvidenceEntitiesFast({
+      query: normalizedQuestion,
+      snippets,
+      maxEntities: 10,
+      timeoutMs: boundedTimeout(9_000, 2_000),
+    }).catch(() => []);
+    if (extracted.length === 0) return [];
+
+    const diseaseContext =
+      (input.diseaseName
+        ? [...state.diseaseById.values()].find(
+            (row) => row.name.toLowerCase() === input.diseaseName?.toLowerCase(),
+          )
+        : null) ??
+      [...state.diseaseById.values()][0] ??
+      null;
+    const targetContext =
+      (input.targetSymbol
+        ? [...state.targetById.values()].find(
+            (row) => row.symbol.toUpperCase() === input.targetSymbol?.toUpperCase(),
+          )
+        : null) ?? null;
+
+    const contextKeys = new Set<string>();
+    if (diseaseContext) {
+      contextKeys.add(
+        upsertNode(state, {
+          type: "disease",
+          label: diseaseContext.name,
+          primaryId: diseaseContext.id,
+        }),
+      );
+    }
+    if (targetContext) {
+      contextKeys.add(upsertTargetNode(targetContext));
+    }
+
+    const categoryNodeKeys = new Map<
+      "exposure" | "mechanism" | "outcome",
+      string[]
+    >([
+      ["exposure", []],
+      ["mechanism", []],
+      ["outcome", []],
+    ]);
+
+    for (const mention of extracted) {
+      const nodeKey = upsertNode(state, {
+        type: "effect",
+        label: mention.label,
+        primaryId: `EVID_${mention.category}_${slugify(mention.label, 48)}`,
+        evidenceCategory: mention.category,
+      });
+      categoryNodeKeys.get(mention.category)?.push(nodeKey);
+
+      const baseScore = clamp(0.35 + mention.confidence * 0.5, 0.26, 0.9);
+      for (const contextKey of contextKeys) {
+        if (contextKey === nodeKey) continue;
+        upsertEdge(state, {
+          sourceKey: contextKey,
+          targetKey: nodeKey,
+          relation: "pubmed_support",
+          source: "evidence",
+          score: baseScore,
+          note: `${input.source} evidence entity (${mention.category}): ${mention.label}`,
+        });
+      }
+    }
+
+    const exposures = categoryNodeKeys.get("exposure") ?? [];
+    const mechanisms = categoryNodeKeys.get("mechanism") ?? [];
+    const outcomes = categoryNodeKeys.get("outcome") ?? [];
+
+    for (const exposureKey of exposures.slice(0, 3)) {
+      for (const mechanismKey of mechanisms.slice(0, 4)) {
+        if (exposureKey === mechanismKey) continue;
+        upsertEdge(state, {
+          sourceKey: exposureKey,
+          targetKey: mechanismKey,
+          relation: "pubmed_support",
+          source: "evidence",
+          score: 0.5,
+          note: "Exposure-to-mechanism relation from literature entity extraction.",
+        });
+      }
+    }
+    for (const mechanismKey of mechanisms.slice(0, 4)) {
+      for (const outcomeKey of outcomes.slice(0, 3)) {
+        if (mechanismKey === outcomeKey) continue;
+        upsertEdge(state, {
+          sourceKey: mechanismKey,
+          targetKey: outcomeKey,
+          relation: "pubmed_support",
+          source: "evidence",
+          score: 0.48,
+          note: "Mechanism-to-outcome relation from literature entity extraction.",
+        });
+      }
+    }
+
+    return extracted.map((row) => ({
+      label: row.label,
+      category: row.category,
+    }));
+  };
+
   const resolveAnchorNodes = () => {
     const anchors = state.queryPlan?.anchors ?? [];
     const entities = anchors.slice(0, 8).map(nodeEntityFromAnchor);
@@ -1014,6 +1380,111 @@ export async function runDeepDiscoverer({
         "planner",
         entities,
         "active",
+      );
+    }
+  };
+
+  const probeAnchorPairLiterature = async () => {
+    const anchors = (state.queryPlan?.anchors ?? [])
+      .filter((anchor) => clean(anchor.name).length >= 2)
+      .slice(0, 5);
+    if (anchors.length < 2) return;
+
+    const pairKeys = new Set<string>();
+    const pairs: Array<[QueryPlanAnchor, QueryPlanAnchor]> = [];
+    for (let index = 0; index < anchors.length - 1; index += 1) {
+      const left = anchors[index]!;
+      const right = anchors[index + 1]!;
+      const key = [left.id, right.id].sort().join("::");
+      if (pairKeys.has(key)) continue;
+      pairKeys.add(key);
+      pairs.push([left, right]);
+      if (pairs.length >= 2) break;
+    }
+
+    for (const [leftAnchor, rightAnchor] of pairs) {
+      if (!hasTimeBudget(22_000)) {
+        emitRunBudgetWarning(
+          "Anchor-pair literature probing trimmed to preserve synthesis budget.",
+        );
+        break;
+      }
+
+      const leftEntity = nodeEntityFromAnchor(leftAnchor);
+      const rightEntity = nodeEntityFromAnchor(rightAnchor);
+      const leftKey = upsertNode(state, leftEntity);
+      const rightKey = upsertNode(state, rightEntity);
+      const subquery = `${leftAnchor.name} ${rightAnchor.name} mechanism`;
+      const subqueryKey = normalizePubmedQuery(subquery);
+      const cached = state.pubmedByQuery.get(subqueryKey);
+      const canRun = state.pubmedSubqueriesUsed < MAX_PUBMED_SUBQUERIES;
+
+      let articles: PubmedArticle[] = [];
+      if (cached) {
+        articles = cached;
+      } else if (canRun) {
+        state.pubmedSubqueriesUsed += 1;
+        push(
+          "tool_start",
+          "Probe anchor-pair literature",
+          `Subquery ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}: ${subquery}`,
+          "pubmed",
+          [leftEntity, rightEntity],
+          "active",
+        );
+        articles = await searchPubmedByQuery(subquery, 4).catch(() => []);
+        state.pubmedSubqueryHits.push({ query: subquery, articles });
+        state.pubmedByQuery.set(subqueryKey, articles);
+      }
+
+      if (articles.length > 0) {
+        upsertEdge(state, {
+          sourceKey: leftKey,
+          targetKey: rightKey,
+          relation: "query_anchor",
+          source: "pubmed",
+          score: 0.72,
+          note: `${articles.length} PubMed articles support ${leftAnchor.name} <-> ${rightAnchor.name}`,
+        });
+      }
+
+      const extractedEntities =
+        articles.length > 0
+          ? await extractAndLinkEvidenceEntities({
+              source: "pubmed",
+              snippets: articles.map((article) => article.title),
+            })
+          : [];
+      if (extractedEntities.length > 0) {
+        push(
+          "insight",
+          "Exposure-aware evidence lane updated",
+          `${extractedEntities.length} exposure/mechanism/outcome entities extracted from anchor-pair literature.`,
+          "evidence",
+          extractedEntities.slice(0, 6).map((entity) => ({
+            type: "effect",
+            label: entity.label,
+            evidenceCategory: entity.category,
+          })),
+          "active",
+        );
+      }
+
+      push(
+        "tool_result",
+        cached ? "Anchor-pair literature cached" : "Anchor-pair literature probe",
+        `${articles.length} PubMed articles ${
+          articles.length > 0 ? "support" : "did not support"
+        } ${leftAnchor.name} and ${rightAnchor.name}.${
+          extractedEntities.length > 0 ? ` ${extractedEntities.length} evidence entities mapped.` : ""
+        }`,
+        "pubmed",
+        articles.slice(0, 3).map((article) => ({
+          type: "effect",
+          label: article.title,
+          primaryId: article.id,
+        })),
+        articles.length > 0 ? "active" : "candidate",
       );
     }
   };
@@ -1216,10 +1687,21 @@ export async function runDeepDiscoverer({
         linkCount > 0 ? "active" : "candidate",
       );
 
+      const topPathwaysByTarget = effectiveSymbols.map((symbol) => ({
+        symbol,
+        pathways: (state.pathwaysByTarget.get(symbol) ?? [])
+          .slice(0, Math.min(3, cappedPerTarget))
+          .map((pathway) => ({
+            id: pathway.id,
+            name: pathway.name,
+          })),
+      }));
+
       return JSON.stringify({
-        pathwaysByTarget: Object.fromEntries(
-          [...state.pathwaysByTarget.entries()].map(([symbol, pathways]) => [symbol, pathways]),
-        ),
+        requestedTargetCount: effectiveSymbols.length,
+        mappedTargetCount: topPathwaysByTarget.filter((row) => row.pathways.length > 0).length,
+        totalPathwayLinks: linkCount,
+        topPathwaysByTarget,
       });
     },
     {
@@ -1300,10 +1782,22 @@ export async function runDeepDiscoverer({
         linkCount > 0 ? "active" : "candidate",
       );
 
+      const topDrugsByTarget = effectiveSymbols.map((symbol) => ({
+        symbol,
+        drugs: (state.drugsByTarget.get(symbol) ?? [])
+          .slice(0, Math.min(3, cappedPerTarget))
+          .map((drug) => ({
+            id: drug.id,
+            name: drug.name,
+            source: drug.source,
+          })),
+      }));
+
       return JSON.stringify({
-        drugsByTarget: Object.fromEntries(
-          [...state.drugsByTarget.entries()].map(([symbol, drugs]) => [symbol, drugs]),
-        ),
+        requestedTargetCount: effectiveSymbols.length,
+        mappedTargetCount: topDrugsByTarget.filter((row) => row.drugs.length > 0).length,
+        totalDrugLinks: linkCount,
+        topDrugsByTarget,
       });
     },
     {
@@ -1362,9 +1856,26 @@ export async function runDeepDiscoverer({
         network.edges.length > 0 ? "active" : "candidate",
       );
 
+      const topInteractionEdges = [...network.edges]
+        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+        .slice(0, 40)
+        .map((edge) => ({
+          sourceSymbol: edge.sourceSymbol,
+          targetSymbol: edge.targetSymbol,
+          score: edge.score,
+        }));
+      const topInteractionNodes = network.nodes.slice(0, 24).map((node) => ({
+        id: node.id,
+        symbol: node.symbol,
+        annotation: node.annotation,
+      }));
+
       return JSON.stringify({
-        nodes: network.nodes,
-        edges: network.edges,
+        seedTargetCount: effectiveSymbols.length,
+        interactionNodeCount: network.nodes.length,
+        interactionEdgeCount: network.edges.length,
+        topInteractionNodes,
+        topInteractionEdges,
       });
     },
     {
@@ -1405,13 +1916,71 @@ export async function runDeepDiscoverer({
       );
       state.bioMcpCounts.articles += data.articles.length;
       state.bioMcpCounts.trials += data.trials.length;
+      for (const article of data.articles) {
+        if (!state.bioMcpArticles.some((row) => row.id === article.id)) {
+          state.bioMcpArticles.push({
+            id: article.id,
+            title: article.title,
+            source: article.source,
+            url: article.url,
+          });
+        }
+      }
+      for (const trial of data.trials) {
+        if (!state.bioMcpTrials.some((row) => row.id === trial.id)) {
+          state.bioMcpTrials.push({
+            id: trial.id,
+            title: trial.title,
+            source: trial.source,
+            url: trial.url,
+            status: trial.status,
+          });
+        }
+      }
+
+      const extractedEntities = await extractAndLinkEvidenceEntities({
+        source: "biomcp",
+        snippets: [
+          ...data.articles.map((article) => article.title),
+          ...data.trials.map((trial) => trial.title),
+        ],
+        diseaseName: disease,
+        targetSymbol: target,
+      });
+      if (extractedEntities.length > 0) {
+        push(
+          "insight",
+          "Exposure-aware evidence lane updated",
+          `${extractedEntities.length} exposure/mechanism/outcome entities extracted from BioMCP snippets.`,
+          "evidence",
+          extractedEntities.slice(0, 6).map((entity) => ({
+            type: "effect",
+            label: entity.label,
+            evidenceCategory: entity.category,
+          })),
+          "active",
+        );
+      }
 
       push(
         "tool_result",
         "BioMCP evidence collected",
-        `${data.articles.length} article snippets and ${data.trials.length} trial snippets collected.`,
+        `${data.articles.length} article snippets and ${data.trials.length} trial snippets collected.${
+          extractedEntities.length > 0 ? ` ${extractedEntities.length} evidence entities mapped.` : ""
+        }`,
         "biomcp",
-        [],
+        [
+          ...data.articles.slice(0, 3).map((article) => ({
+            type: "effect" as const,
+            label: article.title,
+            primaryId: article.id,
+          })),
+          ...data.trials.slice(0, 2).map((trial) => ({
+            type: "effect" as const,
+            label: trial.title,
+            primaryId: trial.id,
+          })),
+        ],
         data.articles.length + data.trials.length > 0 ? "active" : "candidate",
       );
 
@@ -1439,6 +2008,29 @@ export async function runDeepDiscoverer({
       const capped = clamp(limit, 1, 6);
       if (!disease || !target) {
         return JSON.stringify({ articles: [] });
+      }
+
+      const pairQuery = `${target} AND ${disease}`;
+      const pairKey = normalizePubmedQuery(pairQuery);
+      const cachedPairArticles = state.pubmedByQuery.get(pairKey);
+      if (cachedPairArticles) {
+        push(
+          "tool_result",
+          "PubMed pair evidence cached",
+          `${cachedPairArticles.length} cached articles for ${target} / ${disease}.`,
+          "pubmed",
+          cachedPairArticles.slice(0, 3).map((article) => ({
+            type: "effect",
+            label: article.title,
+            primaryId: article.id,
+          })),
+          cachedPairArticles.length > 0 ? "active" : "candidate",
+        );
+        return JSON.stringify({
+          query: pairQuery,
+          articleCount: cachedPairArticles.length,
+          cached: true,
+        });
       }
 
       if (state.pubmedSubqueriesUsed >= MAX_PUBMED_SUBQUERIES) {
@@ -1470,7 +2062,8 @@ export async function runDeepDiscoverer({
       );
 
       const articles = await getPubmedArticles(disease, target, capped).catch(() => []);
-      state.pubmedSubqueryHits.push({ query: `${target} AND ${disease}`, articles });
+      state.pubmedSubqueryHits.push({ query: pairQuery, articles });
+      state.pubmedByQuery.set(pairKey, articles);
 
       if (articles.length > 0) {
         const targetNode = [...state.targetById.values()].find(
@@ -1494,10 +2087,36 @@ export async function runDeepDiscoverer({
         }
       }
 
+      const extractedEntities =
+        articles.length > 0
+          ? await extractAndLinkEvidenceEntities({
+              source: "pubmed",
+              snippets: articles.map((article) => article.title),
+              diseaseName: disease,
+              targetSymbol: target,
+            })
+          : [];
+      if (extractedEntities.length > 0) {
+        push(
+          "insight",
+          "Exposure-aware evidence lane updated",
+          `${extractedEntities.length} exposure/mechanism/outcome entities extracted from PubMed pair evidence.`,
+          "evidence",
+          extractedEntities.slice(0, 6).map((entity) => ({
+            type: "effect",
+            label: entity.label,
+            evidenceCategory: entity.category,
+          })),
+          "active",
+        );
+      }
+
       push(
         "tool_result",
         "PubMed pair evidence",
-        `${articles.length} articles collected for ${target} / ${disease}.`,
+        `${articles.length} articles collected for ${target} / ${disease}.${
+          extractedEntities.length > 0 ? ` ${extractedEntities.length} evidence entities mapped.` : ""
+        }`,
         "pubmed",
         articles.slice(0, 3).map((article) => ({
           type: "effect",
@@ -1508,14 +2127,14 @@ export async function runDeepDiscoverer({
       );
 
       return JSON.stringify({
-        query: `${target} AND ${disease}`,
+        query: pairQuery,
         articleCount: articles.length,
       });
     },
     {
       name: "collect_pubmed_pair_evidence",
       description:
-        "Collect PubMed evidence for disease-target pairs. This consumes from a strict max-5 PubMed query budget.",
+        `Collect PubMed evidence for disease-target pairs. This consumes from a strict max-${MAX_PUBMED_SUBQUERIES} PubMed query budget.`,
       schema: z.object({
         diseaseName: z.string(),
         targetSymbol: z.string(),
@@ -1530,6 +2149,28 @@ export async function runDeepDiscoverer({
       const capped = clamp(limit, 1, 6);
       if (!query) {
         return JSON.stringify({ articles: [] });
+      }
+
+      const queryKey = normalizePubmedQuery(query);
+      const cachedArticles = state.pubmedByQuery.get(queryKey);
+      if (cachedArticles) {
+        push(
+          "tool_result",
+          "PubMed subquery cached",
+          `${cachedArticles.length} cached articles returned for subquery.`,
+          "pubmed",
+          cachedArticles.slice(0, 3).map((article) => ({
+            type: "effect",
+            label: article.title,
+            primaryId: article.id,
+          })),
+          cachedArticles.length > 0 ? "active" : "candidate",
+        );
+        return JSON.stringify({
+          query,
+          articleCount: cachedArticles.length,
+          cached: true,
+        });
       }
 
       if (state.pubmedSubqueriesUsed >= MAX_PUBMED_SUBQUERIES) {
@@ -1556,11 +2197,36 @@ export async function runDeepDiscoverer({
 
       const articles = await searchPubmedByQuery(query, capped).catch(() => []);
       state.pubmedSubqueryHits.push({ query, articles });
+      state.pubmedByQuery.set(queryKey, articles);
+
+      const extractedEntities =
+        articles.length > 0
+          ? await extractAndLinkEvidenceEntities({
+              source: "pubmed",
+              snippets: articles.map((article) => article.title),
+            })
+          : [];
+      if (extractedEntities.length > 0) {
+        push(
+          "insight",
+          "Exposure-aware evidence lane updated",
+          `${extractedEntities.length} exposure/mechanism/outcome entities extracted from PubMed subquery evidence.`,
+          "evidence",
+          extractedEntities.slice(0, 6).map((entity) => ({
+            type: "effect",
+            label: entity.label,
+            evidenceCategory: entity.category,
+          })),
+          "active",
+        );
+      }
 
       push(
         "tool_result",
         "PubMed subquery complete",
-        `${articles.length} articles returned for subquery.`,
+        `${articles.length} articles returned for subquery.${
+          extractedEntities.length > 0 ? ` ${extractedEntities.length} evidence entities mapped.` : ""
+        }`,
         "pubmed",
         articles.slice(0, 3).map((article) => ({
           type: "effect",
@@ -1575,7 +2241,7 @@ export async function runDeepDiscoverer({
     {
       name: "search_pubmed_subquery",
       description:
-        "Run one free-text PubMed subquery for bridge/mechanism evidence. Use sparingly; global budget is max 5 subqueries per run.",
+        `Run one free-text PubMed subquery for bridge/mechanism evidence. Use sparingly; global budget is max ${MAX_PUBMED_SUBQUERIES} subqueries per run.`,
       schema: z.object({
         subquery: z.string(),
         limit: z.number().int().min(1).max(6),
@@ -1671,16 +2337,28 @@ export async function runDeepDiscoverer({
     },
   );
 
-  const toolset = [
+  const baseToolset = [
     resolveEntityCandidatesTool,
     fetchDiseaseTargetsTool,
     fetchPathwaysTool,
     fetchDrugsTool,
     fetchInteractionsTool,
     collectBioMcpTool,
+    recursiveExpandTool,
+  ];
+
+  const pubmedToolset = [
     collectPubmedPairTool,
     searchPubmedSubqueryTool,
-    recursiveExpandTool,
+  ];
+
+  const toolsetWithPubmed = [
+    ...baseToolset,
+    ...pubmedToolset,
+  ];
+
+  const toolsetNoPubmed = [
+    ...baseToolset,
   ];
 
   const modelDecision = chooseDiscovererModel({
@@ -1688,19 +2366,68 @@ export async function runDeepDiscoverer({
     question: normalizedQuestion,
   });
 
-  const mainModel = new ChatOpenAI({
-    model: modelDecision.model,
-    apiKey: appConfig.openAiApiKey,
+  const strategicModelName = appConfig.openai.model;
+  const subagentModelName = appConfig.openai.smallModel;
+  const utilityModelName =
+    modelDecision.tier === "full"
+      ? appConfig.openai.smallModel
+      : appConfig.openai.nanoModel;
+  const activeOpenAiApiKey = getOpenAiApiKeyFromContext();
+
+  const usageCallback = createLangChainUsageCallback({
+    source: "langchain.chatopenai",
+    operation: "deep_discover",
+  });
+
+  const strategicModel = new ChatOpenAI({
+    model: strategicModelName,
+    apiKey: activeOpenAiApiKey,
+    callbacks: [usageCallback],
+    ...getLangChainPromptCacheConfig(
+      "deep_discover.strategic_model",
+      strategicModelName,
+    ),
+  });
+  const coordinatorModel = new ChatOpenAI({
+    model: subagentModelName,
+    apiKey: activeOpenAiApiKey,
+    callbacks: [usageCallback],
+    maxTokens: 700,
+    ...getLangChainPromptCacheConfig(
+      "deep_discover.coordinator_model",
+      subagentModelName,
+    ),
   });
   const subagentModel = new ChatOpenAI({
-    model: appConfig.openai.smallModel,
-    apiKey: appConfig.openAiApiKey,
+    model: subagentModelName,
+    apiKey: activeOpenAiApiKey,
+    callbacks: [usageCallback],
+    maxTokens: 900,
+    ...getLangChainPromptCacheConfig(
+      "deep_discover.subagent_model",
+      subagentModelName,
+    ),
+  });
+  const utilityModel = new ChatOpenAI({
+    model: utilityModelName,
+    apiKey: activeOpenAiApiKey,
+    callbacks: [usageCallback],
+    maxTokens: 140,
+    ...getLangChainPromptCacheConfig(
+      "deep_discover.utility_model",
+      utilityModelName,
+    ),
   });
 
   push(
     "phase",
     "Model routing",
-    `Using ${modelDecision.model} (${modelDecision.reason}).`,
+    [
+      `Strategic reasoning: ${strategicModelName} (coordinator planning, subquery strategy, final synthesis).`,
+      `Tool-heavy subagents: ${subagentModelName} (MCP interaction + branch exploration).`,
+      `Utility summarization: ${utilityModelName} (compress subagent findings).`,
+      `Complexity signal: ${modelDecision.reason}.`,
+    ].join(" "),
     "agent",
     [],
     "active",
@@ -1716,7 +2443,15 @@ export async function runDeepDiscoverer({
   );
 
   try {
-    state.queryPlan = await withTimeout(planQuery(normalizedQuestion), 18_000, "query plan");
+    state.queryPlan = await withOpenAiOperationContext(
+      "deep_discover.query_planner",
+      () =>
+        withTimeout(
+          planQuery(normalizedQuestion),
+          boundedTimeout(Math.min(AGENT_TIMEOUT_MS, 180_000), 20_000),
+          "query plan",
+        ),
+    );
   } catch (error) {
     push(
       "warning",
@@ -1761,6 +2496,10 @@ export async function runDeepDiscoverer({
         "candidate",
       );
     }
+  }
+
+  if (hasTimeBudget(24_000)) {
+    await probeAnchorPairLiterature();
   }
 
   const deterministicBackfill = async (reason: string) => {
@@ -1814,13 +2553,15 @@ export async function runDeepDiscoverer({
         if (state.pubmedSubqueriesUsed < MAX_PUBMED_SUBQUERIES) {
           state.pubmedSubqueriesUsed += 1;
           const articles = await getPubmedArticles(disease.name, symbol, 2).catch(() => []);
-          state.pubmedSubqueryHits.push({ query: `${symbol} AND ${disease.name}`, articles });
+          const query = `${symbol} AND ${disease.name}`;
+          state.pubmedSubqueryHits.push({ query, articles });
+          state.pubmedByQuery.set(normalizePubmedQuery(query), articles);
         }
       }
     }
   };
 
-  if (!appConfig.openAiApiKey) {
+  if (!activeOpenAiApiKey) {
     push(
       "warning",
       "OpenAI key missing",
@@ -1846,36 +2587,24 @@ export async function runDeepDiscoverer({
     return buildFallbackSummary(state, normalizedQuestion);
   }
 
-  const coordinatorAgent = createAgent({
-    model: mainModel,
-    tools: [],
-    responseFormat: coordinatorPlanSchema,
-    systemPrompt: [
-      "You are a coordinator for a multihop biomedical discovery workflow.",
-      "Plan query-specific tasks, do not produce generic disease pipelines.",
-      "The system has specialized subagents: pathway_mapper, translational_scout, bridge_hunter, literature_scout.",
-      "Return max 6 tasks, each with subagent, objective, and seed entities.",
-      `Return max ${MAX_PUBMED_SUBQUERIES} PubMed subqueries tailored to this question.`,
-      "Subqueries should be specific and mechanism-oriented, not boilerplate.",
-      "If the query has multiple anchors, include at least one bridge_hunter task.",
-      "If the query is mechanism/explain style, include at least one translational_scout or pathway_mapper task.",
-    ].join(" "),
-  });
+  const coordinatorPlanner = coordinatorModel.withStructuredOutput(coordinatorPlanSchema);
 
   const subagentContext = {
     query: normalizedQuestion,
     queryPlan: state.queryPlan
       ? {
           intent: state.queryPlan.intent,
-          anchors: state.queryPlan.anchors.map((anchor) => ({
+          anchors: state.queryPlan.anchors.slice(0, 6).map((anchor) => ({
             mention: anchor.mention,
             entityType: anchor.entityType,
             id: anchor.id,
             name: anchor.name,
             confidence: anchor.confidence,
           })),
-          constraints: state.queryPlan.constraints,
-          followups: state.queryPlan.followups,
+          constraints: state.queryPlan.constraints.slice(0, 6),
+          followups: state.queryPlan.followups
+            .slice(0, 3)
+            .map((row) => row.question),
         }
       : null,
   };
@@ -1883,70 +2612,81 @@ export async function runDeepDiscoverer({
   const subagentPromptCommon = [
     "Use tools to gather real evidence. Do not invent data.",
     "Prioritize anchor-specific subqueries and follow-up retrievals.",
+    "Treat PubMed calls as expensive; only use them to close clear evidence gaps.",
     "If evidence is weak, mark pathState as candidate or discarded with explicit gaps.",
     "Return concise findings with named entities and mechanistic steps.",
   ].join(" ");
 
-  const pathwayMapperAgent = createAgent({
-    model: subagentModel,
-    tools: toolset,
-    responseFormat: subagentReportSchema,
-    systemPrompt: [
-      "You are pathway_mapper.",
-      "Goal: map target/pathway/interactions that answer the exact query.",
-      "Prefer fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
-      "Use resolve_entity_candidates when anchors are ambiguous.",
-      subagentPromptCommon,
-    ].join(" "),
+  type DiscovererTool = (typeof toolsetWithPubmed)[number];
+  const createSubagentMap = (
+    toolsForSubagent: DiscovererTool[],
+  ): Record<CoordinatorTask["subagent"], ReturnType<typeof createAgent>> => ({
+    pathway_mapper: createAgent({
+      model: subagentModel,
+      tools: toolsForSubagent,
+      responseFormat: subagentReportSchema,
+      systemPrompt: [
+        "You are pathway_mapper.",
+        "Goal: map target/pathway/interactions that answer the exact query.",
+        "Prefer fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
+        "Use resolve_entity_candidates when anchors are ambiguous.",
+        subagentPromptCommon,
+      ].join(" "),
+    }),
+    translational_scout: createAgent({
+      model: subagentModel,
+      tools: toolsForSubagent,
+      responseFormat: subagentReportSchema,
+      systemPrompt: [
+        "You are translational_scout.",
+        "Goal: map target->drug/moa evidence and identify tractable mechanistic threads.",
+        "Prefer fetch_target_drugs, fetch_target_pathways, collect_biomcp_evidence, collect_pubmed_pair_evidence, search_pubmed_subquery.",
+        "Use recursive_expand_multihop when direct links are weak.",
+        subagentPromptCommon,
+      ].join(" "),
+    }),
+    bridge_hunter: createAgent({
+      model: subagentModel,
+      tools: toolsForSubagent,
+      responseFormat: subagentReportSchema,
+      systemPrompt: [
+        "You are bridge_hunter.",
+        "Goal: connect multiple query anchors through explicit intermediate entities.",
+        "Never claim direct bridge unless intermediate nodes are mapped.",
+        "Prefer resolve_entity_candidates, fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
+        subagentPromptCommon,
+      ].join(" "),
+    }),
+    literature_scout: createAgent({
+      model: subagentModel,
+      tools: toolsForSubagent,
+      responseFormat: subagentReportSchema,
+      systemPrompt: [
+        "You are literature_scout.",
+        "Goal: generate focused PubMed/BioMCP evidence for active mechanistic branches.",
+        "Use max-precision subqueries and tie each evidence pull to an active entity pair.",
+        "Prefer search_pubmed_subquery, collect_pubmed_pair_evidence, collect_biomcp_evidence.",
+        subagentPromptCommon,
+      ].join(" "),
+    }),
   });
 
-  const translationalScoutAgent = createAgent({
-    model: subagentModel,
-    tools: toolset,
-    responseFormat: subagentReportSchema,
-    systemPrompt: [
-      "You are translational_scout.",
-      "Goal: map target->drug/moa evidence and identify tractable mechanistic threads.",
-      "Prefer fetch_target_drugs, fetch_target_pathways, collect_biomcp_evidence, collect_pubmed_pair_evidence, search_pubmed_subquery.",
-      "Use recursive_expand_multihop when direct links are weak.",
-      subagentPromptCommon,
-    ].join(" "),
-  });
-
-  const bridgeHunterAgent = createAgent({
-    model: subagentModel,
-    tools: toolset,
-    responseFormat: subagentReportSchema,
-    systemPrompt: [
-      "You are bridge_hunter.",
-      "Goal: connect multiple query anchors through explicit intermediate entities.",
-      "Never claim direct bridge unless intermediate nodes are mapped.",
-      "Prefer resolve_entity_candidates, fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
-      subagentPromptCommon,
-    ].join(" "),
-  });
-
-  const literatureScoutAgent = createAgent({
-    model: subagentModel,
-    tools: toolset,
-    responseFormat: subagentReportSchema,
-    systemPrompt: [
-      "You are literature_scout.",
-      "Goal: generate focused PubMed/BioMCP evidence for active mechanistic branches.",
-      "Use max-precision subqueries and tie each evidence pull to an active entity pair.",
-      "Prefer search_pubmed_subquery, collect_pubmed_pair_evidence, collect_biomcp_evidence.",
-      subagentPromptCommon,
-    ].join(" "),
-  });
-
-  const subagentMap: Record<CoordinatorTask["subagent"], ReturnType<typeof createAgent>> = {
-    pathway_mapper: pathwayMapperAgent,
-    translational_scout: translationalScoutAgent,
-    bridge_hunter: bridgeHunterAgent,
-    literature_scout: literatureScoutAgent,
-  };
+  const subagentMapWithPubmed = createSubagentMap(toolsetWithPubmed);
+  const subagentMapNoPubmed = createSubagentMap(toolsetNoPubmed);
 
   const runSubagentTask = async (task: CoordinatorTask): Promise<SubagentReport> => {
+    if (!hasTimeBudget(12_000)) {
+      emitRunBudgetWarning(
+        "Subagent expansion stopped to preserve time for final synthesis.",
+      );
+      return {
+        summary: `${task.subagent} skipped due remaining run-time budget.`,
+        findings: [],
+        followups: [],
+        pathState: "candidate",
+      };
+    }
+
     push(
       "handoff",
       "Subagent handoff",
@@ -1956,23 +2696,35 @@ export async function runDeepDiscoverer({
       "active",
     );
 
-    const subagent = subagentMap[task.subagent];
-    const response = await withTimeout(
-      subagent.invoke({
-        messages: [
-          {
-            role: "user",
-            content: [
-              `Query: ${normalizedQuestion}`,
-              `Task objective: ${task.objective}`,
-              `Seed entities: ${task.seedEntities.join(", ") || "none provided"}`,
-              `Structured query plan: ${JSON.stringify(subagentContext.queryPlan)}`,
-            ].join("\n"),
-          },
-        ],
-      }),
-      AGENT_TIMEOUT_MS,
-      `${task.subagent} invoke`,
+    const pubmedBudgetRemaining = Math.max(0, MAX_PUBMED_SUBQUERIES - state.pubmedSubqueriesUsed);
+    const activeSubagentMap =
+      pubmedBudgetRemaining > 0 ? subagentMapWithPubmed : subagentMapNoPubmed;
+    const subagent = activeSubagentMap[task.subagent];
+    const response = await withOpenAiOperationContext(
+      `deep_discover.subagent.${task.subagent}`,
+      () =>
+        withTimeout(
+          subagent.invoke({
+            messages: [
+              {
+                role: "user",
+                content: [
+                  `Query: ${normalizedQuestion}`,
+                  `Task objective: ${task.objective}`,
+                  `Seed entities: ${task.seedEntities.join(", ") || "none provided"}`,
+                  `PubMed budget remaining: ${pubmedBudgetRemaining}/${MAX_PUBMED_SUBQUERIES}. ${
+                    pubmedBudgetRemaining > 0
+                      ? "Use PubMed tools only when a branch has unresolved mechanistic evidence."
+                      : "Do not call search_pubmed_subquery or collect_pubmed_pair_evidence in this task."
+                  }`,
+                  `Structured query plan: ${JSON.stringify(subagentContext.queryPlan)}`,
+                ].join("\n"),
+              },
+            ],
+          }),
+          boundedTimeout(SUBAGENT_TIMEOUT_MS, 12_000),
+          `${task.subagent} invoke`,
+        ),
     );
 
     const structured = response.structuredResponse as SubagentReport | undefined;
@@ -1985,24 +2737,44 @@ export async function runDeepDiscoverer({
       pathState: "candidate",
     };
 
+    const compressedSummary =
+      report.summary.length > 180 || report.findings.length > 0
+        ? await compressSubagentSummary(utilityModel, {
+            objective: task.objective,
+            summary: report.summary,
+            findings: report.findings.slice(0, 4),
+          }).catch(() => null)
+        : null;
+    const normalizedReport: SubagentReport = {
+      ...report,
+      summary: compressedSummary ?? report.summary,
+    };
+
     push(
       "insight",
       `${task.subagent} summary`,
-      compact(report.summary, 220),
+      compact(normalizedReport.summary, 220),
       "agent",
       [],
-      report.pathState,
+      normalizedReport.pathState,
     );
 
-    for (const finding of report.findings.slice(0, 4)) {
-      push("tool_result", "Subagent finding", compact(finding, 220), "agent", [], report.pathState);
+    for (const finding of normalizedReport.findings.slice(0, 4)) {
+      push(
+        "tool_result",
+        "Subagent finding",
+        compact(finding, 220),
+        "agent",
+        [],
+        normalizedReport.pathState,
+      );
     }
 
-    for (const followup of report.followups.slice(0, 3)) {
+    for (const followup of normalizedReport.followups.slice(0, 3)) {
       push("followup", "Follow-up spawned", compact(followup, 200), "agent", [], "candidate");
     }
 
-    return report;
+    return normalizedReport;
   };
 
   const buildDefaultTasks = (): CoordinatorTask[] => {
@@ -2043,47 +2815,63 @@ export async function runDeepDiscoverer({
   );
 
   try {
-    const plannerResponse = await withTimeout(
-      coordinatorAgent.invoke({
-        messages: [
-          {
-            role: "user",
-            content: JSON.stringify(
-              {
-                query: normalizedQuestion,
-                queryPlan: subagentContext.queryPlan,
-                diseaseHint: diseaseQuery,
-                maxPubmedSubqueries: MAX_PUBMED_SUBQUERIES,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      }),
-      AGENT_TIMEOUT_MS,
-      "coordinator planning",
-    );
-
-    const plan = plannerResponse.structuredResponse as
-      | {
-          strategy: string;
-          pubmedSubqueries: string[];
-          tasks: CoordinatorTask[];
-        }
-      | undefined;
-
-    if (plan) {
-      coordinatorTasks = (plan.tasks ?? []).slice(0, 6);
-      initialPubmedSubqueries = (plan.pubmedSubqueries ?? []).slice(0, MAX_PUBMED_SUBQUERIES);
-      push(
-        "handoff",
-        "Coordinator plan ready",
-        `${coordinatorTasks.length} tasks planned. Strategy: ${compact(plan.strategy, 140)}`,
-        "planner",
-        [],
-        "active",
+    if (!hasTimeBudget(25_000)) {
+      emitRunBudgetWarning(
+        "Skipping coordinator replanning to reserve budget for answer synthesis.",
       );
+    } else {
+      const plan = await withOpenAiOperationContext(
+        "deep_discover.coordinator_planning",
+        () =>
+          withTimeout(
+            coordinatorPlanner.invoke([
+              {
+                role: "system",
+                content: [
+                  "You are a coordinator for a multihop biomedical discovery workflow.",
+                  "Plan query-specific tasks, do not produce generic disease pipelines.",
+                  "The system has specialized subagents: pathway_mapper, translational_scout, bridge_hunter, literature_scout.",
+                  "Return max 6 tasks, each with subagent, objective, and seed entities.",
+                  `Return max ${MAX_PUBMED_SUBQUERIES} PubMed subqueries tailored to this question.`,
+                  "Subqueries should be specific and mechanism-oriented, not boilerplate.",
+                  "If the query has multiple anchors, include at least one bridge_hunter task.",
+                  "If the query is mechanism/explain style, include at least one translational_scout or pathway_mapper task.",
+                ].join(" "),
+              },
+              {
+                role: "user",
+                content: JSON.stringify(
+                  {
+                    query: normalizedQuestion,
+                    queryPlan: subagentContext.queryPlan,
+                    diseaseHint: diseaseQuery,
+                    maxPubmedSubqueries: MAX_PUBMED_SUBQUERIES,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ]),
+            boundedTimeout(COORDINATOR_TIMEOUT_MS, 10_000),
+            "coordinator planning",
+          ),
+      );
+
+      if (plan) {
+        coordinatorTasks = (plan.tasks ?? []).slice(0, 6);
+        initialPubmedSubqueries = (plan.pubmedSubqueries ?? []).slice(
+          0,
+          MAX_PUBMED_SUBQUERIES,
+        );
+        push(
+          "handoff",
+          "Coordinator plan ready",
+          `${coordinatorTasks.length} tasks planned. Strategy: ${compact(plan.strategy, 140)}`,
+          "planner",
+          [],
+          "active",
+        );
+      }
     }
   } catch (error) {
     handleOpenAiRateLimit(error);
@@ -2109,6 +2897,12 @@ export async function runDeepDiscoverer({
   }
 
   for (const subquery of initialPubmedSubqueries.slice(0, MAX_PUBMED_SUBQUERIES)) {
+    if (!hasTimeBudget(40_000)) {
+      emitRunBudgetWarning(
+        "Stopped prefetching PubMed subqueries to keep budget for synthesis.",
+      );
+      break;
+    }
     await searchPubmedSubqueryTool.invoke({ subquery, limit: 4 }).catch(() => undefined);
   }
 
@@ -2122,6 +2916,12 @@ export async function runDeepDiscoverer({
   }
 
   for (const task of secondaryTasks) {
+    if (!hasTimeBudget(35_000)) {
+      emitRunBudgetWarning(
+        "Secondary task execution trimmed to preserve synthesis budget.",
+      );
+      break;
+    }
     try {
       reports.push(await runSubagentTask(task));
     } catch (error) {
@@ -2142,7 +2942,13 @@ export async function runDeepDiscoverer({
   ];
   const dedupedFollowups = [...new Set(followupQueue.map((row) => clean(row)).filter(Boolean))].slice(0, 4);
 
-  for (const followup of dedupedFollowups) {
+  for (const followup of dedupedFollowups.slice(0, 2)) {
+    if (!hasTimeBudget(28_000)) {
+      emitRunBudgetWarning(
+        "Follow-up branch expansion trimmed to close with a complete answer.",
+      );
+      break;
+    }
     const routed = routeFollowupToSubagent(followup);
     const task: CoordinatorTask = {
       subagent: routed,
@@ -2176,7 +2982,7 @@ export async function runDeepDiscoverer({
     "Active path",
     bridge.connectedPath
       ? `Connected path: ${bridgeSummary}`
-      : `No complete bridge. Best available thread: ${thread.pathway} -> ${thread.target} -> ${thread.drug}`,
+      : `No complete multihop path yet. Best available thread: ${thread.pathway} -> ${thread.target} -> ${thread.drug}`,
     "agent",
     bridge.connectedPath
       ? bridge.connectedPath.nodeKeys
@@ -2202,15 +3008,28 @@ export async function runDeepDiscoverer({
   }
 
   const synthesisAgent = createAgent({
-    model: mainModel,
+    model: strategicModel,
     tools: [],
     responseFormat: synthesisSchema,
     systemPrompt: [
       "You are a biomedical multihop synthesis agent.",
       "Answer the exact user query using only provided evidence summary.",
+      "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
+      "The first sentence must be a direct biomedical answer to the query.",
+      "Write a substantive answer (roughly 180-280 words), not a one-liner.",
+      "Name the query entities and the strongest supported mechanism path.",
       "Never return generic disease-centric text if query asks cross-anchor relations.",
-      "If bridge is incomplete, state explicit gap and what intermediate nodes were tested.",
+      "If no complete mechanism path is found across the query entities, state that gap in plain biomedical language and list key intermediates that were tested.",
       "Use concise scientific language and include mechanism thread with intermediate hops when available.",
+      "Cover unresolved evidence, contradictory findings, and missing links clearly but concisely (at most 10% of answer length).",
+      "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
+      "End with a complete sentence; do not stop mid-sentence.",
+      "Do not use internal workflow words such as bridge, branch, planner, pipeline, anchor pair, or query graph in the answer text.",
+      "Do not discuss UI state, run progress, or internal orchestration.",
+      "Do not write meta phrases like 'the provided evidence summary' or 'this dataset'.",
+      "Write the biomedical conclusion directly.",
+      "Ignore placeholder values like 'not provided'; never surface them in findings or caveats.",
+      "Do not add caveats about unrelated focus targets unless directly supported by mechanism evidence.",
       "Do not fabricate literature or confidence.",
     ].join(" "),
   });
@@ -2233,57 +3052,68 @@ export async function runDeepDiscoverer({
     subagentSummaries: reports.slice(0, 8).map((row) => row.summary),
   };
 
+  if (!hasTimeBudget(8_000)) {
+    emitRunBudgetWarning(
+      "Synthesis budget was exhausted; returning deterministic summary.",
+    );
+    return buildFallbackSummary(state, normalizedQuestion);
+  }
+
   try {
-    const synthesisResponse = await withTimeout(
-      synthesisAgent.invoke({
-        messages: [
-          {
-            role: "user",
-            content: JSON.stringify(
+    const synthesisResponse = await withOpenAiOperationContext(
+      "deep_discover.final_structured_synthesis",
+      () =>
+        withTimeout(
+          synthesisAgent.invoke({
+            messages: [
               {
-                query: normalizedQuestion,
-                queryPlan: {
-                  intent: state.queryPlan?.intent,
-                  anchors: state.queryPlan?.anchors.map((anchor) => ({
-                    mention: anchor.mention,
-                    entityType: anchor.entityType,
-                    id: anchor.id,
-                    name: anchor.name,
-                  })),
-                  constraints: state.queryPlan?.constraints,
-                },
-                bridge: {
-                  connected: synthesisInput.bridge.connected,
-                  summary: synthesisInput.bridge.summary,
-                  unresolvedPairs: synthesisInput.bridge.unresolvedPairs,
-                },
-                evidenceStats: {
-                  nodes: synthesisInput.state.nodes.size,
-                  edges: synthesisInput.state.edges.size,
-                  targets: synthesisInput.state.targetById.size,
-                  pathways: synthesisInput.state.pathwayById.size,
-                  drugs: synthesisInput.state.drugById.size,
-                  pubmedQueriesUsed: synthesisInput.state.pubmedSubqueriesUsed,
-                  pubmedArticles: synthesisInput.state.pubmedSubqueryHits.reduce(
-                    (acc, row) => acc + row.articles.length,
-                    0,
-                  ),
-                  biomcpArticles: synthesisInput.state.bioMcpCounts.articles,
-                  biomcpTrials: synthesisInput.state.bioMcpCounts.trials,
-                },
-                focusThread: synthesisInput.thread,
-                activePath: synthesisInput.bridge.summary,
-                citationPreview: synthesisInput.citationPreview,
-                subagentSummaries: synthesisInput.subagentSummaries,
+                role: "user",
+                content: JSON.stringify(
+                  {
+                    query: normalizedQuestion,
+                    queryPlan: {
+                      intent: state.queryPlan?.intent,
+                      anchors: state.queryPlan?.anchors.map((anchor) => ({
+                        mention: anchor.mention,
+                        entityType: anchor.entityType,
+                        id: anchor.id,
+                        name: anchor.name,
+                      })),
+                      constraints: state.queryPlan?.constraints,
+                    },
+                    mechanismPath: {
+                      connected: synthesisInput.bridge.connected,
+                      summary: synthesisInput.bridge.summary,
+                      unresolvedPairs: synthesisInput.bridge.unresolvedPairs,
+                    },
+                    evidenceStats: {
+                      nodes: synthesisInput.state.nodes.size,
+                      edges: synthesisInput.state.edges.size,
+                      targets: synthesisInput.state.targetById.size,
+                      pathways: synthesisInput.state.pathwayById.size,
+                      drugs: synthesisInput.state.drugById.size,
+                      pubmedQueriesUsed: synthesisInput.state.pubmedSubqueriesUsed,
+                      pubmedArticles: synthesisInput.state.pubmedSubqueryHits.reduce(
+                        (acc, row) => acc + row.articles.length,
+                        0,
+                      ),
+                      biomcpArticles: synthesisInput.state.bioMcpCounts.articles,
+                      biomcpTrials: synthesisInput.state.bioMcpCounts.trials,
+                    },
+                    focusThread: synthesisInput.thread,
+                    activePath: synthesisInput.bridge.summary,
+                    citationPreview: synthesisInput.citationPreview,
+                    subagentSummaries: synthesisInput.subagentSummaries,
+                  },
+                  null,
+                  2,
+                ),
               },
-              null,
-              2,
-            ),
-          },
-        ],
-      }),
-      AGENT_TIMEOUT_MS,
-      "final synthesis",
+            ],
+          }),
+          boundedTimeout(AGENT_TIMEOUT_MS, 8_000),
+          "final synthesis",
+        ),
     );
 
     const structured = synthesisResponse.structuredResponse as
@@ -2296,19 +3126,32 @@ export async function runDeepDiscoverer({
       | undefined;
 
     const fallback = buildFallbackSummary(state, normalizedQuestion);
-    const structuredAnswer = clean(structured?.directAnswer ?? "");
+    const structuredAnswer = normalizeAnswerMarkdown(structured?.directAnswer ?? "");
     const rescueAnswer = structuredAnswer
       ? null
-      : await synthesizeFreeformNarrative(mainModel, synthesisInput).catch(() => null);
-
-    return {
-      answer:
-        structuredAnswer ||
-        rescueAnswer ||
+      : hasTimeBudget(7_000)
+        ? await synthesizeFreeformNarrative(strategicModel, synthesisInput).catch(() => null)
+        : null;
+    const fallbackFindings = fallback.keyFindings.filter((item) => !/\bnot provided\b/i.test(item));
+    const structuredFindings = (structured?.keyFindings ?? []).filter(Boolean).slice(0, 6);
+    const structuredCaveats = (structured?.caveats ?? []).filter(Boolean).slice(0, 6);
+    const selectedAnswerRaw =
+      structuredAnswer ||
+      rescueAnswer ||
+      normalizeAnswerMarkdown(
         toAssistantText(
           synthesisResponse.messages[synthesisResponse.messages.length - 1]?.content,
-        ) ||
-        fallback.answer,
+        ),
+      ) ||
+      fallback.answer;
+    const selectedAnswer = enrichIfTooBrief(
+      normalizeAnswerMarkdown(selectedAnswerRaw),
+      structuredFindings.length > 0 ? structuredFindings : fallbackFindings,
+      structuredCaveats.length > 0 ? structuredCaveats : fallback.caveats,
+    );
+
+    return {
+      answer: selectedAnswer,
       biomedicalCase: inferBiomedicalCase(normalizedQuestion),
       focusThread: bridge.connectedPath
         ? {
@@ -2318,8 +3161,8 @@ export async function runDeepDiscoverer({
           }
         : thread,
       keyFindings:
-        structured?.keyFindings?.length
-          ? [...structured.keyFindings.slice(0, 6), ...fallback.keyFindings.slice(0, 2)]
+        structuredFindings.length > 0
+          ? [...structuredFindings, ...fallbackFindings.slice(0, Math.max(0, 6 - structuredFindings.length))]
           : fallback.keyFindings,
       caveats:
         structured?.caveats?.length
@@ -2329,6 +3172,7 @@ export async function runDeepDiscoverer({
         structured?.nextActions?.length
           ? structured.nextActions
           : fallback.nextActions,
+      evidenceBundle: buildEvidenceBundle(state),
     };
   } catch (error) {
     const reason = classifyDiscovererError(error);
@@ -2344,12 +3188,15 @@ export async function runDeepDiscoverer({
       "candidate",
     );
     if (reason !== "OpenAI rate-limited") {
-      const rescued = await synthesizeFreeformNarrative(mainModel, synthesisInput).catch(() => null);
+      const rescued = hasTimeBudget(7_000)
+        ? await synthesizeFreeformNarrative(strategicModel, synthesisInput).catch(() => null)
+        : null;
       if (rescued) {
         const fallback = buildFallbackSummary(state, normalizedQuestion);
         return {
           ...fallback,
-          answer: rescued,
+          answer: enrichIfTooBrief(rescued, fallback.keyFindings, fallback.caveats),
+          evidenceBundle: buildEvidenceBundle(state),
         };
       }
     }

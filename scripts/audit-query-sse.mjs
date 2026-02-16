@@ -8,7 +8,7 @@ if (!query) {
   process.exit(1);
 }
 
-const timeoutMs = Number(process.env.SSE_TIMEOUT_MS || 170000);
+const timeoutMs = Number(process.env.SSE_TIMEOUT_MS || 420000);
 const outDir = "/tmp/targetgraph-ui-usability";
 await fs.mkdir(outDir, { recursive: true });
 
@@ -69,8 +69,28 @@ const summary = {
   finalNodeCount: null,
   finalEdgeCount: null,
   graphPatchCount: 0,
+  graphDeltaCount: 0,
   pathUpdateCount: 0,
   agentStepCount: 0,
+  narrationCount: 0,
+  branchUpdateCount: 0,
+  toolCallCount: 0,
+  toolResultCount: 0,
+  answerDeltaCount: 0,
+  finalAnswer: null,
+  runCompleted: null,
+  citationCount: 0,
+  llmCost: null,
+  llmTopFactors: [],
+  eventCounts: {},
+  lifecycle: {
+    runStarted: false,
+    planReady: false,
+    runCompleted: false,
+    finalAnswer: false,
+    done: false,
+  },
+  runErrors: [],
   warnings: [],
   errors: [],
   finalDonePayload: null,
@@ -91,6 +111,7 @@ try {
       rawEvents.push(parsed);
 
       const { event, data } = parsed;
+      summary.eventCounts[event] = (summary.eventCounts[event] ?? 0) + 1;
       if (event === "status" && data && typeof data === "object") {
         const phase = data.phase ?? null;
         const message = data.message ?? null;
@@ -118,17 +139,74 @@ try {
         summary.selectedDiseaseRationale = data.rationale ?? null;
       }
 
+      if (event === "run_started") summary.lifecycle.runStarted = true;
+      if (event === "plan_ready") summary.lifecycle.planReady = true;
+
       if (event === "graph_patch") summary.graphPatchCount += 1;
+      if (event === "graph_delta") summary.graphDeltaCount += 1;
       if (event === "path_update") summary.pathUpdateCount += 1;
       if (event === "agent_step") summary.agentStepCount += 1;
+      if (event === "narration_delta") summary.narrationCount += 1;
+      if (event === "branch_update") summary.branchUpdateCount += 1;
+      if (event === "tool_call") summary.toolCallCount += 1;
+      if (event === "tool_result") summary.toolResultCount += 1;
+      if (event === "answer_delta") summary.answerDeltaCount += 1;
 
       if (event === "warning") {
         summary.warnings.push(data);
       }
 
+      if (event === "run_error") {
+        summary.runErrors.push(data);
+      }
+
       if (event === "error") {
         summary.errored = true;
         summary.errors.push(data);
+      }
+
+      if (event === "citation_bundle" && data?.citations && Array.isArray(data.citations)) {
+        summary.citationCount = data.citations.length;
+      }
+
+      if (event === "llm_cost" && data && typeof data === "object") {
+        summary.llmCost = {
+          totalCalls: data.totalCalls ?? 0,
+          totals: data.totals ?? null,
+          byModel: Array.isArray(data.byModel) ? data.byModel.slice(0, 5) : [],
+          byOperation: Array.isArray(data.byOperation) ? data.byOperation.slice(0, 6) : [],
+        };
+        const topFactors = Array.isArray(data.byOperation) ? data.byOperation : [];
+        summary.llmTopFactors = topFactors
+          .slice(0, 3)
+          .map((item) => ({
+            operation: item.key ?? "unknown",
+            totalTokens: item.totalTokens ?? 0,
+            estimatedCostUsd: item.estimatedCostUsd ?? null,
+          }));
+      }
+
+      if (event === "final_answer" && data && typeof data === "object") {
+        summary.lifecycle.finalAnswer = true;
+        summary.finalAnswer = {
+          answer: data.answer ?? null,
+          focusThread: data.focusThread ?? null,
+          keyFindings: Array.isArray(data.keyFindings) ? data.keyFindings.slice(0, 5) : [],
+        };
+      }
+
+      if (event === "run_completed" && data && typeof data === "object") {
+        summary.lifecycle.runCompleted = true;
+        summary.runCompleted = data;
+        if (data.finalAnswer && typeof data.finalAnswer === "object") {
+          summary.finalAnswer = {
+            answer: data.finalAnswer.answer ?? null,
+            focusThread: data.finalAnswer.focusThread ?? null,
+            keyFindings: Array.isArray(data.finalAnswer.keyFindings)
+              ? data.finalAnswer.keyFindings.slice(0, 5)
+              : [],
+          };
+        }
       }
 
       if (event === "brief_section" && data?.section === "final_brief" && data?.data) {
@@ -139,8 +217,15 @@ try {
       }
 
       if (event === "done") {
+        summary.lifecycle.done = true;
         summary.finalDonePayload = data;
-        if (data?.graph) {
+        if (!summary.llmCost && data?.llmCost && typeof data.llmCost === "object") {
+          summary.llmCost = data.llmCost;
+        }
+        if (data?.stats) {
+          summary.finalNodeCount = data.stats.totalNodes ?? null;
+          summary.finalEdgeCount = data.stats.totalEdges ?? null;
+        } else if (data?.graph) {
           const nodes = Array.isArray(data.graph.nodes) ? data.graph.nodes.length : null;
           const edges = Array.isArray(data.graph.edges) ? data.graph.edges.length : null;
           summary.finalNodeCount = nodes;

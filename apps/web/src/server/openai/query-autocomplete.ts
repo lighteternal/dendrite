@@ -1,14 +1,15 @@
-import OpenAI from "openai";
 import { createTTLCache } from "@/server/cache/lru";
 import { appConfig } from "@/server/config";
+import { createTrackedOpenAIClient } from "@/server/openai/client";
 import { chooseAutocompleteModel } from "@/server/openai/model-router";
 
 const AUTOCOMPLETE_TIMEOUT_MS = 360;
 const OPENAI_AUTOCOMPLETE_ENABLED = process.env.AUTOCOMPLETE_USE_OPENAI === "1";
 
-const openai = OPENAI_AUTOCOMPLETE_ENABLED && appConfig.openAiApiKey
-  ? new OpenAI({ apiKey: appConfig.openAiApiKey })
-  : null;
+function getOpenAiClient() {
+  if (!OPENAI_AUTOCOMPLETE_ENABLED) return null;
+  return createTrackedOpenAIClient();
+}
 
 const autocompleteCache = createTTLCache<string, string[]>(
   Math.min(appConfig.cache.ttlMs, 2 * 60 * 1000),
@@ -348,6 +349,7 @@ function deterministicSuggestions(prefix: string, limit: number): string[] {
 }
 
 async function maybeOpenAiSuggestions(prefix: string, limit: number): Promise<string[]> {
+  const openai = getOpenAiClient();
   if (!openai) return [];
 
   const schema = {
@@ -418,6 +420,7 @@ export async function suggestQueryCompletions(
   prefix: string,
   limit = 5,
 ): Promise<string[]> {
+  const openai = getOpenAiClient();
   const normalized = normalizePrefix(prefix);
   if (normalized.length < 3) return [];
 

@@ -35,6 +35,10 @@ import {
   createTrackedOpenAIClient,
   withOpenAiApiKeyContext,
 } from "@/server/openai/client";
+import {
+  getReplayFixture,
+  type ReplayFixture,
+} from "@/server/replay/example-replays";
 
 export const runtime = "nodejs";
 
@@ -82,10 +86,8 @@ const INTERNAL_STREAM_CONNECT_TIMEOUT_MS = 35_000;
 const SESSION_RUN_STALE_MS = 15 * 60 * 1000;
 const SESSION_API_KEY_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_JOURNEY_EVENTS = 300;
-const DISCOVERER_TIMEOUT_MS = Math.max(
-  10 * 60 * 1000,
-  appConfig.deepDiscover.maxRunMs + 30_000,
-);
+const RUN_HARD_BUDGET_MS = 10 * 60 * 1000;
+const DISCOVERER_TIMEOUT_MS = RUN_HARD_BUDGET_MS;
 const FALLBACK_SYNTHESIS_TIMEOUT_MS = 180_000;
 const FINAL_GROUNDING_TIMEOUT_MS = 180_000;
 
@@ -117,6 +119,16 @@ type FinalBriefSnapshot = {
     articleSnippets?: number;
     trialSnippets?: number;
   };
+};
+
+type PathFocusSnapshot = {
+  summary: string;
+  connectedAcrossAnchors: boolean;
+  unresolvedAnchorPairs: string[];
+  diseases: string[];
+  targets: string[];
+  pathways: string[];
+  drugs: string[];
 };
 
 type SupplementalEvidenceCitation = {
@@ -228,6 +240,322 @@ function parseSseBlock(block: string): { event: string; data: string } | null {
 
   if (dataLines.length === 0) return null;
   return { event, data: dataLines.join("\n") };
+}
+
+function toRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  if (signal.aborted) return Promise.reject(new Error("replay aborted"));
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(new Error("replay aborted"));
+    };
+
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function remapReplayProgress(
+  originalPct: unknown,
+  eventIndex: number,
+  totalEvents: number,
+  lastPct: number,
+): number {
+  const linearTarget = Math.max(
+    1,
+    Math.min(99, Math.round(((eventIndex + 1) / Math.max(totalEvents, 1)) * 99)),
+  );
+  const sourcePct =
+    typeof originalPct === "number" && Number.isFinite(originalPct)
+      ? Math.max(1, Math.min(99, Math.round(originalPct)))
+      : linearTarget;
+  const blended = Math.round(linearTarget * 0.72 + sourcePct * 0.28);
+  return Math.max(lastPct, Math.min(99, blended));
+}
+
+type ReplayPatchContext = {
+  runId: string;
+  query: string;
+  startedAt: number;
+  elapsedMs: number;
+  eventIndex: number;
+  totalEvents: number;
+  lastStatusPct: number;
+};
+
+function patchReplayEventData(
+  eventName: string,
+  eventData: unknown,
+  context: ReplayPatchContext,
+): {
+  skip: boolean;
+  data: unknown;
+  nextStatusPct: number;
+} {
+  let nextStatusPct = context.lastStatusPct;
+
+  if (eventName === "llm_cost") {
+    return {
+      skip: true,
+      data: null,
+      nextStatusPct,
+    };
+  }
+
+  if (eventName === "run_started") {
+    const row = toRecord(eventData) ?? {};
+    return {
+      skip: false,
+      data: {
+        ...row,
+        replay: true,
+        runId: context.runId,
+        query: context.query,
+        startedAt: new Date(context.startedAt).toISOString(),
+      },
+      nextStatusPct,
+    };
+  }
+
+  if (eventName === "status") {
+    const row = toRecord(eventData) ?? {};
+    const pct = remapReplayProgress(
+      row.pct,
+      context.eventIndex,
+      context.totalEvents,
+      context.lastStatusPct,
+    );
+    nextStatusPct = pct;
+    return {
+      skip: false,
+      data: {
+        ...row,
+        replay: true,
+        pct,
+        elapsedMs: context.elapsedMs,
+      },
+      nextStatusPct,
+    };
+  }
+
+  if (eventName === "query_plan") {
+    const row = toRecord(eventData) ?? {};
+    return {
+      skip: false,
+      data: {
+        ...row,
+        replay: true,
+        query: context.query,
+      },
+      nextStatusPct,
+    };
+  }
+
+  if (eventName === "resolver_selected") {
+    const row = toRecord(eventData) ?? {};
+    return {
+      skip: false,
+      data: {
+        ...row,
+        replay: true,
+        query: context.query,
+      },
+      nextStatusPct,
+    };
+  }
+
+  if (eventName === "plan_ready") {
+    const row = toRecord(eventData) ?? {};
+    const queryPlan = toRecord(row.queryPlan)
+      ? {
+          ...((row.queryPlan as Record<string, unknown>) ?? {}),
+          query: context.query,
+        }
+      : row.queryPlan;
+    const resolver = toRecord(row.resolver)
+      ? {
+          ...((row.resolver as Record<string, unknown>) ?? {}),
+          query: context.query,
+        }
+      : row.resolver;
+    return {
+      skip: false,
+      data: {
+        ...row,
+        replay: true,
+        runId: context.runId,
+        query: context.query,
+        queryPlan,
+        resolver,
+      },
+      nextStatusPct,
+    };
+  }
+
+  if (eventName === "run_completed" || eventName === "done") {
+    const row = toRecord(eventData) ?? {};
+    return {
+      skip: false,
+      data: {
+        ...row,
+        replay: true,
+        runId: context.runId,
+        elapsedMs: context.elapsedMs,
+        llmCost: null,
+      },
+      nextStatusPct,
+    };
+  }
+
+  if (eventName === "final_answer") {
+    const row = toRecord(eventData) ?? {};
+    return {
+      skip: false,
+      data: {
+        ...row,
+        replay: true,
+      },
+      nextStatusPct,
+    };
+  }
+
+  return {
+    skip: false,
+    data: eventData,
+    nextStatusPct,
+  };
+}
+
+async function streamReplayFixture(params: {
+  fixture: ReplayFixture;
+  runId: string;
+  query: string;
+  startedAt: number;
+  abortSignal: AbortSignal;
+  emit: (event: string, data: unknown) => void;
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+}) {
+  const {
+    fixture,
+    runId,
+    query,
+    startedAt,
+    abortSignal,
+    emit,
+    nodeMap,
+    edgeMap,
+  } = params;
+  const events = fixture.events ?? [];
+  const replayDurationMs = Math.max(20_000, fixture.durationMs);
+  const totalEvents = Math.max(1, events.length);
+
+  let lastStatusPct = 0;
+  let emittedDone = false;
+  let emittedRunCompleted = false;
+
+  emit("replay_info", {
+    replay: true,
+    id: fixture.id,
+    query,
+    durationMs: replayDurationMs,
+    evidenceReview: fixture.evidenceReview,
+  });
+
+  for (let index = 0; index < events.length; index += 1) {
+    if (abortSignal.aborted) {
+      throw new Error("replay aborted");
+    }
+
+    const targetElapsed = Math.round(((index + 1) / totalEvents) * replayDurationMs);
+    const elapsedBeforeWait = Date.now() - startedAt;
+    if (targetElapsed > elapsedBeforeWait) {
+      await sleepWithAbort(targetElapsed - elapsedBeforeWait, abortSignal);
+    }
+
+    const row = events[index];
+    if (!row || typeof row.event !== "string") continue;
+
+    const elapsedMs = Date.now() - startedAt;
+    const patched = patchReplayEventData(row.event, row.data, {
+      runId,
+      query,
+      startedAt,
+      elapsedMs,
+      eventIndex: index,
+      totalEvents,
+      lastStatusPct,
+    });
+    lastStatusPct = patched.nextStatusPct;
+    if (patched.skip) continue;
+
+    if ((row.event === "graph_patch" || row.event === "graph_delta") && toRecord(patched.data)) {
+      const payload = patched.data as Record<string, unknown>;
+      const nodes = Array.isArray(payload.nodes) ? (payload.nodes as GraphNode[]) : [];
+      const edges = Array.isArray(payload.edges) ? (payload.edges as GraphEdge[]) : [];
+      for (const node of nodes) {
+        nodeMap.set(node.id, node);
+      }
+      for (const edge of edges) {
+        edgeMap.set(edge.id, edge);
+      }
+    }
+
+    if (row.event === "run_completed") {
+      emittedRunCompleted = true;
+    }
+    if (row.event === "done") {
+      emittedDone = true;
+    }
+
+    emit(row.event, patched.data);
+  }
+
+  const elapsedMs = Date.now() - startedAt;
+  if (!emittedRunCompleted) {
+    emit("run_completed", {
+      replay: true,
+      runId,
+      elapsedMs,
+      stats: {
+        nodes: nodeMap.size,
+        edges: edgeMap.size,
+      },
+      llmCost: null,
+    });
+  }
+  if (!emittedDone) {
+    emit("done", {
+      replay: true,
+      runId,
+      elapsedMs,
+      stats: {
+        totalNodes: nodeMap.size,
+        totalEdges: edgeMap.size,
+      },
+      counts: {
+        nodes: nodeMap.size,
+        edges: edgeMap.size,
+      },
+      llmCost: null,
+    });
+  }
 }
 
 function modeConfig() {
@@ -382,6 +710,27 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
+function remainingRunBudgetMs(startedAt: number, reserveMs = 0): number {
+  const elapsed = Math.max(0, Date.now() - startedAt);
+  return Math.max(0, RUN_HARD_BUDGET_MS - elapsed - Math.max(0, reserveMs));
+}
+
+function boundedStageTimeoutMs(
+  startedAt: number,
+  desiredMs: number,
+  options?: {
+    reserveMs?: number;
+    minMs?: number;
+  },
+): number {
+  const reserveMs = Math.max(0, options?.reserveMs ?? 15_000);
+  const minMs = Math.max(5_000, options?.minMs ?? 15_000);
+  const remaining = remainingRunBudgetMs(startedAt, reserveMs);
+  if (remaining <= 0) return 0;
+  if (remaining <= minMs) return remaining;
+  return Math.max(minMs, Math.min(desiredMs, remaining));
+}
+
 function cleanAnswerMarkdown(value: string): string {
   return value
     .replace(/\r/g, "")
@@ -418,18 +767,80 @@ function hasInlineCitationMarker(text: string): boolean {
   return /\[\d+\]/.test(text);
 }
 
+function sanitizePathSummaryForNarrative(summary: string | null | undefined): string {
+  const raw = String(summary ?? "").trim();
+  if (!raw) return "";
+  return raw
+    .replace(/(?:\d+\s+additional\s+connected\s+anchor\s+pair\(s\)\s+retained\s+in\s+graph\s+context\.?)/gi, "")
+    .replace(/(?:\d+\s+anchor\s+pair\(s\)\s+connected;?\s*remaining\s+pairs?\s+are\s+unresolved\.?)/gi, "")
+    .replace(/Bridge\s+confirmed:/gi, "Mechanistic path identified:")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\s+\./g, ".")
+    .trim();
+}
+
+function scrubInternalNarrativeTokens(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(/\bconnectedAcrossAnchors\b/gi, "cross-entity connectivity")
+    .replace(/\bgraphPathContext\b/gi, "graph evidence context")
+    .replace(/\bquery[_\s-]?bridge\b/gi, "graph-supported link")
+    .replace(/\bquery[_\s-]?gap\b/gi, "unresolved connection")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\s+\./g, ".")
+    .trim();
+}
+
+function normalizeCitationMarkersAgainstLedger(
+  text: string,
+  citations: NonNullable<FinalBriefSnapshot["citations"]>,
+): string {
+  if (!text) return text;
+  const allowed = new Set(citations.map((item) => item.index));
+
+  const normalized = expandInlineCitationRanges(text).replace(
+    /\[([^\]\n]+)\](?!\()/g,
+    (full, tokenRaw) => {
+      const token = String(tokenRaw ?? "").trim();
+      if (!token) return "";
+      if (/^\d{1,3}$/.test(token)) {
+        const index = Number(token);
+        if (allowed.size === 0 || allowed.has(index)) return `[${index}]`;
+        return "";
+      }
+      return "";
+    },
+  );
+
+  return normalized
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function truncateWords(text: string, maxWords: number): string {
   const words = text.trim().split(/\s+/).filter(Boolean);
   if (words.length <= maxWords) return text.trim();
-  return `${words.slice(0, maxWords).join(" ").trim()}...`;
+  let selected = words.slice(0, maxWords);
+  while (
+    selected.length > 8 &&
+    /^(and|or|to|in|of|for|with|by|on|at|the|a|an)$/i.test(selected[selected.length - 1] ?? "")
+  ) {
+    selected = selected.slice(0, -1);
+  }
+  const truncated = selected.join(" ").trim();
+  if (!truncated) return "";
+  if (/[.!?]$/.test(truncated)) return truncated;
+  return `${truncated}.`;
 }
 
 function capUncertaintySection(
   text: string,
   options?: { maxBullets?: number; maxWords?: number },
 ): string {
-  const maxBullets = Math.max(1, Math.min(5, options?.maxBullets ?? 3));
-  const maxWords = Math.max(20, Math.min(160, options?.maxWords ?? 72));
+  const maxBullets = Math.max(1, Math.min(5, options?.maxBullets ?? 2));
+  const maxWords = Math.max(24, Math.min(200, options?.maxWords ?? 84));
   const marker = /###\s*What remains uncertain/i;
   const match = marker.exec(text);
   if (!match) return text;
@@ -447,7 +858,7 @@ function capUncertaintySection(
   const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line));
   const selectedBullets = bulletLines.slice(0, maxBullets).map((line) => {
     const bulletBody = line.replace(/^[-*]\s+/, "");
-    return `- ${truncateWords(bulletBody, 26)}`;
+    return `- ${truncateWords(bulletBody, 42)}`;
   });
 
   if (selectedBullets.length > 0) {
@@ -542,12 +953,16 @@ function prioritizeCitationsForGrounding(
 function ensureInlineCitations(text: string, citations: NonNullable<FinalBriefSnapshot["citations"]>): string {
   const normalized = capUncertaintySection(normalizeAnswerEnding(text));
   if (!normalized) return normalized;
-  if (hasInlineCitationMarker(normalized)) return normalized;
+  const scrubbed = scrubInternalNarrativeTokens(
+    normalizeCitationMarkersAgainstLedger(normalized, citations),
+  );
+  if (!scrubbed) return scrubbed;
+  if (hasInlineCitationMarker(scrubbed)) return scrubbed;
   const refs = citations
     .slice(0, 6)
     .map((item) => `[${item.index}]`);
-  if (refs.length === 0) return normalized;
-  return `${normalized}\n\nSupporting references: ${refs.join(", ")}`;
+  if (refs.length === 0) return scrubbed;
+  return `${scrubbed}\n\nSupporting references: ${refs.join(", ")}`;
 }
 
 function buildGraphPathContext(input: {
@@ -566,17 +981,189 @@ function buildGraphPathContext(input: {
       source: input.nodeMap.get(edge.source)?.label ?? edge.source,
       target: input.nodeMap.get(edge.target)?.label ?? edge.target,
       type: edge.type,
-      sourceTag: typeof edge.meta.source === "string" ? edge.meta.source : null,
-      status: typeof edge.meta.status === "string" ? edge.meta.status : null,
       weight: edge.weight ?? null,
     }));
 
   return {
-    summary: input.pathUpdate.summary,
+    summary: sanitizePathSummaryForNarrative(input.pathUpdate.summary),
     nodeLabels: [...new Set(nodeLabels)],
     edgeTrail,
     connectedAcrossAnchors: Boolean(input.pathUpdate.connectedAcrossAnchors),
     unresolvedAnchorPairs: input.pathUpdate.unresolvedAnchorPairs ?? [],
+  };
+}
+
+function derivePathFocusSnapshot(input: {
+  pathUpdate: DerivedPathUpdate | null;
+  nodeMap: Map<string, GraphNode>;
+}): PathFocusSnapshot | null {
+  const { pathUpdate, nodeMap } = input;
+  if (!pathUpdate) return null;
+
+  const diseases: string[] = [];
+  const targets: string[] = [];
+  const pathways: string[] = [];
+  const drugs: string[] = [];
+
+  const pushUnique = (bucket: string[], value: string | null | undefined) => {
+    const normalized = String(value ?? "").trim();
+    if (!normalized) return;
+    if (!bucket.includes(normalized)) bucket.push(normalized);
+  };
+
+  for (const nodeId of pathUpdate.nodeIds) {
+    const node = nodeMap.get(nodeId);
+    if (!node) continue;
+    if (node.type === "disease") {
+      pushUnique(
+        diseases,
+        String(node.meta.displayName ?? node.label ?? "").trim(),
+      );
+      continue;
+    }
+    if (node.type === "target") {
+      pushUnique(
+        targets,
+        String(node.meta.targetSymbol ?? node.label ?? "").trim(),
+      );
+      continue;
+    }
+    if (node.type === "pathway") {
+      pushUnique(
+        pathways,
+        String(node.meta.displayName ?? node.label ?? "").trim(),
+      );
+      continue;
+    }
+    if (node.type === "drug") {
+      pushUnique(
+        drugs,
+        String(node.meta.displayName ?? node.label ?? "").trim(),
+      );
+    }
+  }
+
+  return {
+    summary: sanitizePathSummaryForNarrative(pathUpdate.summary),
+    connectedAcrossAnchors: Boolean(pathUpdate.connectedAcrossAnchors),
+    unresolvedAnchorPairs: pathUpdate.unresolvedAnchorPairs ?? [],
+    diseases,
+    targets,
+    pathways,
+    drugs,
+  };
+}
+
+function collectAllowedEntityLabels(
+  nodeMap: Map<string, GraphNode>,
+  limit = 220,
+): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  for (const node of nodeMap.values()) {
+    const labelRaw =
+      node.type === "target"
+        ? String(node.meta.targetSymbol ?? node.label ?? "")
+        : String(node.meta.displayName ?? node.label ?? "");
+    const label = labelRaw.trim();
+    if (!label) continue;
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    ordered.push(label);
+    if (ordered.length >= limit) break;
+  }
+  return ordered;
+}
+
+function mergePathFocusIntoBrief(
+  brief: ReturnType<typeof generateBriefSections>,
+  pathFocus: PathFocusSnapshot | null,
+): ReturnType<typeof generateBriefSections> {
+  if (!pathFocus?.connectedAcrossAnchors) return brief;
+  const primaryTarget = pathFocus.targets[0];
+  if (!primaryTarget || !brief.recommendation) return brief;
+  if (brief.recommendation.target?.toUpperCase() === primaryTarget.toUpperCase()) {
+    return brief;
+  }
+  const primaryPathway = pathFocus.pathways[0] ?? "not provided";
+  const primaryDrug = pathFocus.drugs[0] ?? "not provided";
+  const whySegments = [
+    `Path-supported mechanism thread: ${pathFocus.summary}.`,
+    brief.recommendation.why,
+  ]
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean);
+
+  return {
+    ...brief,
+    recommendation: {
+      ...brief.recommendation,
+      target: primaryTarget,
+      pathway: primaryPathway,
+      drugHook: primaryDrug,
+      why: whySegments.join(" "),
+    },
+  };
+}
+
+function alignFinalFocusThreadToPath(
+  final: DiscovererFinal,
+  pathFocus: PathFocusSnapshot | null,
+): DiscovererFinal {
+  if (!pathFocus?.connectedAcrossAnchors) return final;
+  const primaryTarget = pathFocus.targets[0];
+  if (!primaryTarget) return final;
+
+  return {
+    ...final,
+    focusThread: {
+      ...final.focusThread,
+      target: primaryTarget,
+      pathway: pathFocus.pathways[0] ?? "not provided",
+      drug: pathFocus.drugs[0] ?? "not provided",
+    },
+  };
+}
+
+function alignKeyFindingsToPath(
+  final: DiscovererFinal,
+  pathFocus: PathFocusSnapshot | null,
+  activePathSummary: string | null,
+): DiscovererFinal {
+  if (!pathFocus?.connectedAcrossAnchors) return final;
+  const summary =
+    sanitizePathSummaryForNarrative(activePathSummary) ||
+    [
+      pathFocus.diseases[0],
+      pathFocus.targets[0],
+      pathFocus.pathways[0],
+      pathFocus.drugs[0],
+    ]
+      .filter((item): item is string => Boolean(item && item.trim().length > 0))
+      .join(" -> ");
+  if (!summary) return final;
+
+  let replaced = false;
+  const keyFindings = (final.keyFindings ?? [])
+    .map((item) => {
+      const row = String(item ?? "").trim();
+      if (!row) return "";
+      if (/^strongest thread:/i.test(row) || /^active thread:/i.test(row)) {
+        replaced = true;
+        return `Strongest thread: ${summary}`;
+      }
+      return row;
+    })
+    .filter(Boolean);
+
+  if (!replaced) {
+    keyFindings.unshift(`Strongest thread: ${summary}`);
+  }
+
+  return {
+    ...final,
+    keyFindings: keyFindings.slice(0, 6),
   };
 }
 
@@ -586,16 +1173,25 @@ async function groundFinalAnswerWithInlineCitations(input: {
   brief: FinalBriefSnapshot;
   activePathSummary: string | null;
   graphPathContext?: ReturnType<typeof buildGraphPathContext> | null;
+  pathFocus?: PathFocusSnapshot | null;
   queryPlan?: ResolvedQueryPlan | null;
+  allowedEntityLabels?: string[];
+  timeoutMs?: number;
 }): Promise<DiscovererFinal> {
   const synthesisClient = createTrackedOpenAIClient();
   const citations = prioritizeCitationsForGrounding(input.brief.citations ?? [], input.query, 32);
   if (!synthesisClient || citations.length === 0) {
+    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
     return {
-      ...input.draft,
-      answer: ensureInlineCitations(input.draft.answer, citations),
+      ...alignedDraft,
+      answer: ensureInlineCitations(alignedDraft.answer, citations),
     };
   }
+
+  const groundingTimeoutMs = Math.max(
+    8_000,
+    Math.min(FINAL_GROUNDING_TIMEOUT_MS, input.timeoutMs ?? FINAL_GROUNDING_TIMEOUT_MS),
+  );
 
   try {
     const response = await withOpenAiOperationContext(
@@ -605,7 +1201,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 1280,
+            max_output_tokens: 1800,
             input: [
               {
                 role: "system",
@@ -617,10 +1213,15 @@ async function groundFinalAnswerWithInlineCitations(input: {
                       "Use only claims supported by the provided evidence snapshot and citation ledger.",
                       "The first paragraph must answer the user question directly in concrete biomedical terms.",
                       "Prioritize the graph-supported mechanism path as the primary answer thread when a path context is provided.",
+                      "If the path focus is connected across query anchors, the first paragraph must center on the path focus target/pathway and stay consistent with that trail.",
                       "Do not assert a primary mechanism hop that is absent from the provided graph path edge trail.",
+                      "Keep the direct answer and mechanism bullets focused on entities present in the allowed graph entity labels.",
+                      "Do not introduce additional molecular entities outside the allowed graph entity labels.",
                       "Do not treat association scores, pathway annotations, or druggability hooks alone as causal evidence.",
                       "If the mapped evidence does not provide a complete end-to-end path between the query entities, state that the link remains incomplete.",
+                      "Keep uncertainty statements mostly in the '### What remains uncertain' section instead of the direct answer.",
                       "Insert inline numeric citation markers like [12] directly after factual claims.",
+                      "Use square brackets only for numeric citations (for example [12]); never emit bracketed labels such as [query_bridge] or [OpenTargets evidence].",
                       "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
                       "Use only citation indices present in the ledger; do not invent citation numbers.",
                       "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
@@ -653,6 +1254,8 @@ async function groundFinalAnswerWithInlineCitations(input: {
                         caveats: input.draft.caveats.slice(0, 4),
                         activePathSummary: input.activePathSummary,
                         graphPathContext: input.graphPathContext ?? null,
+                        pathFocus: input.pathFocus ?? null,
+                        allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                         recommendation: input.brief.recommendation ?? null,
                         evidenceSummary: input.brief.evidenceSummary ?? null,
                         queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((row) => ({
@@ -676,11 +1279,11 @@ async function groundFinalAnswerWithInlineCitations(input: {
               },
             ],
           }),
-          FINAL_GROUNDING_TIMEOUT_MS,
+          groundingTimeoutMs,
         ),
     );
 
-    const grounded = normalizeAnswerEnding(String(response.output_text ?? ""));
+    let grounded = normalizeAnswerEnding(String(response.output_text ?? ""));
     if (!grounded) {
       return {
         ...input.draft,
@@ -688,14 +1291,123 @@ async function groundFinalAnswerWithInlineCitations(input: {
       };
     }
 
+    const requiredPathTarget =
+      input.pathFocus?.connectedAcrossAnchors && input.pathFocus.targets.length > 0
+        ? input.pathFocus.targets[0]!
+        : null;
+    const requiredPathSecondaryTarget =
+      input.pathFocus?.connectedAcrossAnchors && input.pathFocus.targets.length > 1
+        ? input.pathFocus.targets[1]!
+        : null;
+    const requiredPathPathway =
+      input.pathFocus?.connectedAcrossAnchors && input.pathFocus.pathways.length > 0
+        ? input.pathFocus.pathways[0]!
+        : null;
+    const requiredPathDiseaseHead =
+      input.pathFocus?.connectedAcrossAnchors && input.pathFocus.diseases.length > 0
+        ? input.pathFocus.diseases[0]!
+        : null;
+    const requiredPathDiseaseTail =
+      input.pathFocus?.connectedAcrossAnchors && input.pathFocus.diseases.length > 1
+        ? input.pathFocus.diseases[input.pathFocus.diseases.length - 1]!
+        : null;
+    const groundedLower = grounded.toLowerCase();
+    const targetMissing =
+      requiredPathTarget !== null &&
+      !groundedLower.includes(requiredPathTarget.toLowerCase());
+    const secondaryTargetMissing =
+      requiredPathSecondaryTarget !== null &&
+      !groundedLower.includes(requiredPathSecondaryTarget.toLowerCase());
+    const pathwayMissing =
+      requiredPathPathway !== null &&
+      !groundedLower.includes(requiredPathPathway.toLowerCase());
+    const diseaseHeadMissing =
+      requiredPathDiseaseHead !== null &&
+      !groundedLower.includes(requiredPathDiseaseHead.toLowerCase());
+    const diseaseTailMissing =
+      requiredPathDiseaseTail !== null &&
+      !groundedLower.includes(requiredPathDiseaseTail.toLowerCase());
+
+    if (
+      (targetMissing ||
+        secondaryTargetMissing ||
+        pathwayMissing ||
+        diseaseHeadMissing ||
+        diseaseTailMissing) &&
+      input.pathFocus?.connectedAcrossAnchors
+    ) {
+      const rescue = await withOpenAiOperationContext(
+        "run_case.inline_citation_alignment_rescue",
+        () =>
+          withTimeout(
+            synthesisClient.responses.create({
+              model: appConfig.openai.smallModel,
+              reasoning: { effort: "minimal" },
+              max_output_tokens: 1200,
+              input: [
+                {
+                  role: "system",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: [
+                        "Rewrite this biomedical answer so it remains fully evidence-grounded and citation-based.",
+                        "Keep markdown headings unchanged: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
+                        "The direct answer and mechanism bullets must center on the required graph-supported path focus target/pathway.",
+                        "Do not add unsupported claims.",
+                        "Keep uncertainty concise (<=10%).",
+                        "Keep inline numeric citation markers.",
+                        "Return markdown only.",
+                      ].join(" "),
+                    },
+                  ],
+                },
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: JSON.stringify(
+                        {
+                          query: input.query,
+                          currentAnswer: grounded,
+                          requiredPathFocus: input.pathFocus,
+                          recommendation: input.brief.recommendation ?? null,
+                          citations: citations.map((item) => ({
+                            index: item.index,
+                            kind: item.kind,
+                            label: compactText(item.label, 140),
+                            source: item.source,
+                          })),
+                        },
+                        null,
+                        2,
+                      ),
+                    },
+                  ],
+                },
+              ],
+            }),
+            Math.max(8_000, Math.min(45_000, Math.floor(groundingTimeoutMs * 0.5))),
+          ),
+      ).catch(() => null);
+
+      const rescued = normalizeAnswerEnding(String(rescue?.output_text ?? ""));
+      if (rescued.trim().length > 0) {
+        grounded = rescued;
+      }
+    }
+
+    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
     return {
-      ...input.draft,
+      ...alignedDraft,
       answer: ensureInlineCitations(grounded, citations),
     };
   } catch {
+    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
     return {
-      ...input.draft,
-      answer: ensureInlineCitations(input.draft.answer, citations),
+      ...alignedDraft,
+      answer: ensureInlineCitations(alignedDraft.answer, citations),
     };
   }
 }
@@ -705,14 +1417,29 @@ async function synthesizeFallbackFinalAnswer(input: {
   selectedDiseaseName: string;
   activePathSummary: string | null;
   brief: FinalBriefSnapshot;
+  pathFocus?: PathFocusSnapshot | null;
+  allowedEntityLabels?: string[];
+  timeoutMs?: number;
 }): Promise<DiscovererFinal | null> {
   const synthesisClient = createTrackedOpenAIClient();
   if (!synthesisClient) return null;
 
   const recommendation = input.brief.recommendation ?? null;
-  const focusPathway = recommendation?.pathway?.trim() || input.activePathSummary || "not provided";
-  const focusTarget = recommendation?.target?.trim() || "not provided";
-  const focusDrug = recommendation?.drugHook?.trim() || "not provided";
+  const pathFocusConnected = Boolean(
+    input.pathFocus?.connectedAcrossAnchors && (input.pathFocus.targets[0] || input.pathFocus.pathways[0]),
+  );
+  const focusPathway =
+    (pathFocusConnected ? input.pathFocus?.pathways[0] : null)?.trim() ||
+    recommendation?.pathway?.trim() ||
+    "not provided";
+  const focusTarget =
+    (pathFocusConnected ? input.pathFocus?.targets[0] : null)?.trim() ||
+    recommendation?.target?.trim() ||
+    "not provided";
+  const focusDrug =
+    (pathFocusConnected ? input.pathFocus?.drugs[0] : null)?.trim() ||
+    recommendation?.drugHook?.trim() ||
+    "not provided";
   const prioritizedCitations = prioritizeCitationsForGrounding(
     input.brief.citations ?? [],
     input.query,
@@ -720,6 +1447,11 @@ async function synthesizeFallbackFinalAnswer(input: {
   );
   const citationCount = Array.isArray(input.brief.citations) ? input.brief.citations.length : 0;
   const evidenceSummary = input.brief.evidenceSummary ?? {};
+
+  const fallbackTimeoutMs = Math.max(
+    8_000,
+    Math.min(FALLBACK_SYNTHESIS_TIMEOUT_MS, input.timeoutMs ?? FALLBACK_SYNTHESIS_TIMEOUT_MS),
+  );
 
   try {
     const response = await withOpenAiOperationContext(
@@ -729,7 +1461,7 @@ async function synthesizeFallbackFinalAnswer(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 1200,
+            max_output_tokens: 1600,
             input: [
               {
                 role: "system",
@@ -741,12 +1473,17 @@ async function synthesizeFallbackFinalAnswer(input: {
                       "Write the final user-facing scientific answer from the evidence snapshot.",
                       "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
                       "Start with a direct answer sentence to the query under '### Direct answer'.",
+                      "When path focus is connected across anchors, center the answer on that target/pathway thread.",
                       "Write a substantive summary (~180-280 words), not a one-liner.",
                       "Use concrete biomedical entities and mechanism hops when available.",
+                      "Keep mechanism entities constrained to the allowed graph entity labels.",
+                      "Do not introduce additional molecular entities outside the allowed graph entity labels.",
                       "Under '### Mechanistic support', include evidence-grounded bullets with entities and intermediates.",
                       "Do not present association scores, pathway hooks, or druggability hooks as causal proof on their own.",
                       "Under '### What remains uncertain', include unresolved links and missing evidence; keep this section concise (at most 10% of the answer).",
+                      "Keep uncertainty language primarily in the uncertainty section, not in the direct answer.",
                       "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
+                      "Use square brackets only for numeric citations (for example [12]); never emit bracketed labels such as [query_bridge] or [OpenTargets evidence].",
                       "End with a complete sentence.",
                       "Do not include references section headings; keep only the answer body.",
                       "Do not echo JSON field names (for example activePathSummary or recommendation).",
@@ -767,6 +1504,8 @@ async function synthesizeFallbackFinalAnswer(input: {
                         query: input.query,
                         selectedDisease: input.selectedDiseaseName,
                         activePathSummary: input.activePathSummary,
+                        pathFocus: input.pathFocus ?? null,
+                        allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                         recommendation,
                         alternatives: (input.brief.alternatives ?? []).slice(0, 3),
                         caveats: (input.brief.caveats ?? []).slice(0, 4),
@@ -791,7 +1530,7 @@ async function synthesizeFallbackFinalAnswer(input: {
               },
             ],
           }),
-          FALLBACK_SYNTHESIS_TIMEOUT_MS,
+          fallbackTimeoutMs,
         ),
     );
 
@@ -880,6 +1619,20 @@ function tokenSetOverlapScore(left: string, right: string): number {
   return (2 * precision * recall) / Math.max(0.001, precision + recall);
 }
 
+function diseaseAcronym(name: string): string | null {
+  const stopTokens = new Set(["and", "of", "the", "with", "without", "in", "on", "to"]);
+  const tokens = tokenizeDiseaseText(name).filter((token) => !stopTokens.has(token));
+  if (tokens.length < 2 || tokens.length > 8) return null;
+  const acronym = tokens
+    .map((token) => token.replace(/[^a-z0-9]/gi, ""))
+    .filter((token) => token.length > 0)
+    .map((token) => token[0]!)
+    .join("")
+    .toLowerCase();
+  if (acronym.length < 3) return null;
+  return acronym;
+}
+
 function scoreDiseaseCandidate(query: string, candidate: DiseaseCandidate): number {
   const queryNorm = trimDiseaseNoise(query);
   const candidateNorm = trimDiseaseNoise(candidate.name);
@@ -895,6 +1648,11 @@ function scoreDiseaseCandidate(query: string, candidate: DiseaseCandidate): numb
   const candidateTokens = tokenizeDiseaseText(candidateNorm);
   const unmatched = candidateTokens.filter((token) => !queryTokens.has(token)).length;
   score -= unmatched * 0.45;
+
+  const acronym = diseaseAcronym(candidate.name);
+  if (acronym && queryTokens.has(acronym)) {
+    score += 5.8;
+  }
 
   if (/^(EFO|MONDO|DOID|ORPHANET)_/i.test(candidate.id)) score += 0.5;
   if (/^HP_/i.test(candidate.id)) score -= 0.3;
@@ -1303,12 +2061,49 @@ function resolveAnchorNodeId(
   return best?.nodeId ?? null;
 }
 
+function isAnchorExplicitlyMentionedInQuery(
+  anchor: ResolvedQueryPlan["anchors"][number],
+  query: string,
+): boolean {
+  const queryNorm = normalizeForMatch(query);
+  if (!queryNorm) return false;
+  const paddedQuery = ` ${queryNorm} `;
+
+  const candidates = [
+    normalizeForMatch(anchor.mention ?? ""),
+    normalizeForMatch(anchor.name),
+  ].filter((value) => value.length >= 2);
+
+  for (const candidate of candidates) {
+    const paddedCandidate = ` ${candidate} `;
+    if (paddedQuery.includes(paddedCandidate)) {
+      return true;
+    }
+  }
+
+  if (anchor.entityType === "disease") {
+    const acronym = diseaseAcronym(anchor.name);
+    if (acronym) {
+      const queryTokens = new Set(tokenizeDiseaseText(queryNorm));
+      if (queryTokens.has(acronym)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function deriveAnchorPathUpdate(
   nodeMap: Map<string, GraphNode>,
   edgeMap: Map<string, GraphEdge>,
   queryPlan?: ResolvedQueryPlan | null,
 ): DerivedPathUpdate | null {
-  const anchors = (queryPlan?.anchors ?? []).slice(0, 5);
+  const allAnchors = queryPlan?.anchors ?? [];
+  const explicitAnchors = allAnchors.filter((anchor) =>
+    isAnchorExplicitlyMentionedInQuery(anchor, queryPlan?.query ?? ""),
+  );
+  const anchors = (explicitAnchors.length >= 2 ? explicitAnchors : allAnchors).slice(0, 5);
   if (anchors.length < 2) return null;
 
   const anchorNodeIds = anchors
@@ -2307,6 +3102,7 @@ function generateBriefSections(options: {
   hasInterventionConcept: boolean;
   queryAnchorCount?: number;
   pathFocusTargetSymbols?: string[];
+  pathConnectedAcrossAnchors?: boolean;
   enrichmentLinksByNodeId: EnrichmentLinksByNodeId;
 }) {
   const {
@@ -2319,6 +3115,7 @@ function generateBriefSections(options: {
     hasInterventionConcept,
     queryAnchorCount,
     pathFocusTargetSymbols,
+    pathConnectedAcrossAnchors,
     enrichmentLinksByNodeId,
   } = options;
   const nodes = [...nodeMap.values()];
@@ -2390,17 +3187,23 @@ function generateBriefSections(options: {
     !!matchedQueryTarget &&
     (matchedQueryTarget.score >= 0.32 || matchedQueryTarget.rank <= 12) &&
     (baselineTop?.score ?? 0) - matchedQueryTarget.score <= 0.26;
+  const hasConnectedAnchorPath = Boolean(
+    pathConnectedAcrossAnchors && (pathFocusTargetSymbols ?? []).length > 0,
+  );
   const shouldPreferPathFocused =
-    normalizedQueryAnchorCount >= 2 &&
-    !shouldAnchorToQuery &&
     !!pathFocusedTarget &&
-    (pathFocusedTarget.score >= 0.28 || pathFocusedTarget.rank <= 12);
+    (hasConnectedAnchorPath ||
+      (normalizedQueryAnchorCount >= 2 &&
+        !shouldAnchorToQuery &&
+        (pathFocusedTarget.score >= 0.28 || pathFocusedTarget.rank <= 12)));
 
-  const selectedTop = shouldAnchorToQuery
-    ? matchedQueryTarget
-    : shouldPreferPathFocused
-      ? pathFocusedTarget
-      : baselineTop;
+  const selectedTop = hasConnectedAnchorPath
+    ? pathFocusedTarget ?? baselineTop
+    : shouldAnchorToQuery
+      ? matchedQueryTarget
+      : shouldPreferPathFocused
+        ? pathFocusedTarget
+        : baselineTop;
 
   const pathways = selectedTop?.pathwayHooks ?? [];
   const dataGaps = resolvedRanking.systemSummary.dataGaps;
@@ -2576,6 +3379,8 @@ export async function GET(request: NextRequest) {
   const mode: RunMode = "multihop";
   const diseaseIdHint = params.get("diseaseId")?.trim();
   const diseaseNameHint = params.get("diseaseName")?.trim();
+  const replayId = params.get("replay")?.trim().toLowerCase() ?? null;
+  const replayFixture = getReplayFixture(replayId);
   const runId =
     params.get("runId")?.trim() ??
     `run-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
@@ -2585,6 +3390,7 @@ export async function GET(request: NextRequest) {
     query: query?.slice(0, 180),
     hasDiseaseIdHint: Boolean(diseaseIdHint),
     hasSessionApiKey: Boolean(requestApiKey),
+    replayId,
     runId,
     sessionKey: sessionKey.slice(0, 64),
   });
@@ -2592,6 +3398,10 @@ export async function GET(request: NextRequest) {
   if (!query) {
     endRequestLog(log, { rejected: true, reason: "missing_query" });
     return new Response("Missing query", { status: 400 });
+  }
+  if (replayId && !replayFixture) {
+    endRequestLog(log, { rejected: true, reason: "unknown_replay" });
+    return new Response("Unknown replay id", { status: 400 });
   }
 
   const existingRun = activeSessionRuns.get(sessionKey);
@@ -2644,6 +3454,7 @@ export async function GET(request: NextRequest) {
       let discovererFinal: DiscovererFinal | null = null;
       let discovererAnswerEmitted = false;
       let journeyEventCount = 0;
+      let latestPathUpdate: DerivedPathUpdate | null = null;
       const supplementalEvidence = createSupplementalEvidenceAccumulator();
 
       const emit = (event: string, data: unknown) => {
@@ -2724,6 +3535,57 @@ export async function GET(request: NextRequest) {
         }
         cleanupSessionRun();
       };
+
+      if (replayFixture) {
+        try {
+          await streamReplayFixture({
+            fixture: replayFixture,
+            runId,
+            query,
+            startedAt,
+            abortSignal: streamAbort.signal,
+            emit,
+            nodeMap,
+            edgeMap,
+          });
+          endRequestLog(log, {
+            completed: true,
+            replay: true,
+            nodeCount: nodeMap.size,
+            edgeCount: edgeMap.size,
+          });
+          close();
+          return;
+        } catch (error) {
+          if (streamAbort.signal.aborted || streamState.closed) {
+            endRequestLog(log, {
+              completed: false,
+              canceled: true,
+              replay: true,
+              nodeCount: nodeMap.size,
+              edgeCount: edgeMap.size,
+            });
+            close();
+            return;
+          }
+          emit("run_error", {
+            phase: "replay",
+            message:
+              error instanceof Error ? error.message : "replay stream failed",
+            recoverable: false,
+          });
+          errorRequestLog(log, "run_case.replay_failed", error, {
+            nodeCount: nodeMap.size,
+            edgeCount: edgeMap.size,
+          });
+          endRequestLog(log, {
+            completed: false,
+            replay: true,
+          });
+          close();
+          return;
+        }
+      }
 
       beginOpenAiRun(runId, query);
 
@@ -3255,15 +4117,25 @@ export async function GET(request: NextRequest) {
             id: anchor.id,
             name: anchor.name,
             description: anchor.description,
+            explicitInQuery: isAnchorExplicitlyMentionedInQuery(anchor, query),
           }));
-        const planSecondaryCandidates = diseaseAnchorsFromPlan.filter(
+        const explicitDiseaseAnchorsFromPlan = diseaseAnchorsFromPlan.filter(
+          (anchor) => anchor.explicitInQuery,
+        );
+        const candidateDiseaseAnchorPool =
+          explicitDiseaseAnchorsFromPlan.length >= 2
+            ? explicitDiseaseAnchorsFromPlan
+            : diseaseAnchorsFromPlan;
+        const planSecondaryCandidatesScoped = candidateDiseaseAnchorPool.filter(
           (candidate) =>
             candidate.id !== chosen.selected.id &&
             !/^HP_/i.test(candidate.id),
         );
+        const allowMentionSecondaryCandidates = explicitDiseaseAnchorsFromPlan.length < 2;
         const mentionSecondaryCandidates = mentionAnchoredMatches
           .filter(
             (item) =>
+              allowMentionSecondaryCandidates &&
               item.disease.id !== chosen.selected.id &&
               item.score >= 1.25 &&
               !/^HP_/i.test(item.disease.id),
@@ -3272,7 +4144,7 @@ export async function GET(request: NextRequest) {
         const secondaryDiseaseCandidates = (
           relationQuery
             ? dedupeDistinctDiseases(
-                mergeDiseaseCandidates(planSecondaryCandidates, mentionSecondaryCandidates),
+                mergeDiseaseCandidates(planSecondaryCandidatesScoped, mentionSecondaryCandidates),
               )
             : []
         )
@@ -3345,7 +4217,12 @@ export async function GET(request: NextRequest) {
           currentRanking: RankingResponse | null,
           provisional: boolean,
         ) => {
-          const livePathUpdate = derivePathUpdate(nodeMap, edgeMap, resolvedQueryPlan);
+          const livePathUpdate =
+            latestPathUpdate ?? derivePathUpdate(nodeMap, edgeMap, resolvedQueryPlan);
+          const pathFocus = derivePathFocusSnapshot({
+            pathUpdate: livePathUpdate,
+            nodeMap,
+          });
           const brief = generateBriefSections({
             ranking: currentRanking,
             nodeMap,
@@ -3356,18 +4233,23 @@ export async function GET(request: NextRequest) {
             hasInterventionConcept: hasInterventionConceptEarly,
             queryAnchorCount: (resolvedQueryPlan?.anchors ?? []).length,
             pathFocusTargetSymbols: extractPathFocusTargetSymbols(livePathUpdate, nodeMap),
+            pathConnectedAcrossAnchors: Boolean(livePathUpdate?.connectedAcrossAnchors),
             enrichmentLinksByNodeId,
           });
+          const pathAlignedBrief = mergePathFocusIntoBrief(brief, pathFocus);
 
-          if (!brief.recommendation || brief.recommendation.target === "not provided") {
+          if (
+            !pathAlignedBrief.recommendation ||
+            pathAlignedBrief.recommendation.target === "not provided"
+          ) {
             return;
           }
 
           const signature = [
             provisional ? "provisional" : "final",
-            brief.recommendation.target,
-            brief.recommendation.pathway,
-            brief.recommendation.score.toFixed(3),
+            pathAlignedBrief.recommendation.target,
+            pathAlignedBrief.recommendation.pathway,
+            pathAlignedBrief.recommendation.score.toFixed(3),
           ].join("::");
           if (signature === lastRecommendationSignature) return;
           lastRecommendationSignature = signature;
@@ -3378,7 +4260,7 @@ export async function GET(request: NextRequest) {
           emit("brief_section", {
             section: "recommendation",
             data: {
-              ...brief.recommendation,
+              ...pathAlignedBrief.recommendation,
               provisional,
             },
           });
@@ -3480,6 +4362,7 @@ export async function GET(request: NextRequest) {
                   const signature = `${pathUpdate.nodeIds.join("|")}::${pathUpdate.edgeIds.join("|")}`;
                   if (signature !== lastPathSignature) {
                     lastPathSignature = signature;
+                    latestPathUpdate = pathUpdate;
                     const pathSummary =
                       pathUpdate.connectedAcrossAnchors === false
                         ? `Partial anchor path: ${pathUpdate.summary}`
@@ -4049,7 +4932,7 @@ export async function GET(request: NextRequest) {
                       if (edgeDelta !== 0) return edgeDelta;
                       return b.score - a.score;
                     })[0];
-                    emit("path_update", {
+                    const bridgePathUpdate: DerivedPathUpdate = {
                       nodeIds: strongestSegment?.nodeIds ?? [primaryNodeId, ...bridgePatch.secondaryNodeIds],
                       edgeIds: strongestSegment?.edgeIds ?? [...bridgeEdges.values()].map((edge) => edge.id),
                       summary:
@@ -4059,7 +4942,16 @@ export async function GET(request: NextRequest) {
                               connectedOutcomes.length - 1,
                             )} additional connected anchor pair(s) retained in graph context.`
                           : `No strong multihop mechanism path found between ${chosen.selected.name} and ${secondaryNames} in this run.`,
-                    });
+                      connectedAcrossAnchors: Boolean(strongestSegment),
+                      unresolvedAnchorPairs: strongestSegment
+                        ? []
+                        : outcomes
+                            .filter((item) => !item.connected)
+                            .map((item) => `${chosen.selected.name} -> ${item.disease.name}`),
+                    };
+                    latestPathUpdate = bridgePathUpdate;
+                    lastPathSignature = `${bridgePathUpdate.nodeIds.join("|")}::${bridgePathUpdate.edgeIds.join("|")}`;
+                    emit("path_update", bridgePathUpdate);
                   }
                 }
 
@@ -4076,11 +4968,17 @@ export async function GET(request: NextRequest) {
                 const hasInterventionConcept = (resolvedQueryPlan?.anchors ?? []).some(
                   (anchor) => anchor.requestedType === "intervention" || anchor.entityType === "drug",
                 );
-                const initialPathUpdate = derivePathUpdate(
+                const initialPathUpdate =
+                  latestPathUpdate ??
+                  derivePathUpdate(
+                    nodeMap,
+                    edgeMap,
+                    resolvedQueryPlan,
+                  );
+                const initialPathFocus = derivePathFocusSnapshot({
+                  pathUpdate: initialPathUpdate,
                   nodeMap,
-                  edgeMap,
-                  resolvedQueryPlan,
-                );
+                });
 
                 let brief = mergeSupplementalEvidenceIntoBrief(
                   generateBriefSections({
@@ -4096,10 +4994,12 @@ export async function GET(request: NextRequest) {
                       initialPathUpdate,
                       nodeMap,
                     ),
+                    pathConnectedAcrossAnchors: Boolean(initialPathUpdate?.connectedAcrossAnchors),
                     enrichmentLinksByNodeId,
                   }),
                   supplementalEvidence,
                 );
+                brief = mergePathFocusIntoBrief(brief, initialPathFocus);
 
                 const emitBriefSnapshot = (
                   snapshot: ReturnType<typeof generateBriefSections>,
@@ -4165,27 +5065,34 @@ export async function GET(request: NextRequest) {
                   });
 
                   const synthesisStartedAt = Date.now();
-                  const synthesisBudgetMs = Math.max(
-                    90_000,
-                    DISCOVERER_TIMEOUT_MS - (synthesisStartedAt - startedAt) - 30_000,
+                  const synthesisBudgetMs = boundedStageTimeoutMs(
+                    startedAt,
+                    DISCOVERER_TIMEOUT_MS,
+                    {
+                      reserveMs: 22_000,
+                      minMs: 60_000,
+                    },
                   );
                   const synthesisProgressWindowMs = Math.max(
-                    120_000,
-                    Math.min(9 * 60 * 1000, synthesisBudgetMs),
+                    90_000,
+                    Math.min(6 * 60 * 1000, synthesisBudgetMs || 90_000),
                   );
                   const synthesisHeartbeat = setInterval(() => {
                     if (streamState.closed || streamAbort.signal.aborted) return;
                     const elapsed = Math.max(0, Date.now() - synthesisStartedAt);
+                    const remainingBudgetMs = remainingRunBudgetMs(startedAt, 0);
                     const waitingSeconds = Math.floor(elapsed / 1000);
                     const ratio = Math.min(0.99, elapsed / synthesisProgressWindowMs);
                     const pct = Math.max(
                       86,
-                      Math.min(98, 86 + Math.floor(ratio * 12)),
+                      Math.min(98, 86 + Math.floor(ratio * 13)),
                     );
                     emit("status", {
                       phase: "P6",
                       message:
-                        waitingSeconds >= Math.floor(synthesisProgressWindowMs / 1000) * 0.6
+                        remainingBudgetMs <= 90_000
+                          ? "Approaching run budget; finalizing with current evidence and citations"
+                          : waitingSeconds >= Math.floor(synthesisProgressWindowMs / 1000) * 0.6
                           ? "Synthesis still running; validating thread quality and caveats"
                           : "Synthesis running; assembling mechanism rationale and caveats",
                       pct,
@@ -4200,10 +5107,21 @@ export async function GET(request: NextRequest) {
                   }, 5000);
 
                   try {
-                    const final = await withTimeout(
-                      discovererPromise,
-                      Math.max(90_000, DISCOVERER_TIMEOUT_MS - 5_000),
-                    ).catch(() => null);
+                    const discovererWaitMs = boundedStageTimeoutMs(
+                      startedAt,
+                      DISCOVERER_TIMEOUT_MS - 5_000,
+                      {
+                        reserveMs: 24_000,
+                        minMs: 45_000,
+                      },
+                    );
+                    const final =
+                      discovererWaitMs > 0
+                        ? await withTimeout(
+                            discovererPromise,
+                            discovererWaitMs,
+                          ).catch(() => null)
+                        : null;
                     if (final) {
                       discovererFinal = final;
                       ingestDiscovererFinalEvidenceBundle(
@@ -4212,11 +5130,17 @@ export async function GET(request: NextRequest) {
                       );
                     }
 
-                    const finalPathUpdate = derivePathUpdate(
+                    const finalPathUpdate =
+                      latestPathUpdate ??
+                      derivePathUpdate(
+                        nodeMap,
+                        edgeMap,
+                        resolvedQueryPlan,
+                      );
+                    const finalPathFocus = derivePathFocusSnapshot({
+                      pathUpdate: finalPathUpdate,
                       nodeMap,
-                      edgeMap,
-                      resolvedQueryPlan,
-                    );
+                    });
                     brief = mergeSupplementalEvidenceIntoBrief(
                       generateBriefSections({
                         ranking,
@@ -4231,27 +5155,51 @@ export async function GET(request: NextRequest) {
                           finalPathUpdate,
                           nodeMap,
                         ),
+                        pathConnectedAcrossAnchors: Boolean(finalPathUpdate?.connectedAcrossAnchors),
                         enrichmentLinksByNodeId,
                       }),
                       supplementalEvidence,
                     );
+                    brief = mergePathFocusIntoBrief(brief, finalPathFocus);
                     emitBriefSnapshot(brief);
 
                     if (!final) {
-                      const fallbackFinal = await synthesizeFallbackFinalAnswer({
-                        query,
-                        selectedDiseaseName: chosen.selected.name,
-                        activePathSummary: finalPathUpdate?.summary ?? null,
-                        brief,
-                      }).catch(() => null);
+                      const fallbackTimeoutMs = boundedStageTimeoutMs(
+                        startedAt,
+                        FALLBACK_SYNTHESIS_TIMEOUT_MS,
+                        {
+                          reserveMs: 14_000,
+                          minMs: 18_000,
+                        },
+                      );
+                      const fallbackFinal =
+                        fallbackTimeoutMs > 0
+                          ? await synthesizeFallbackFinalAnswer({
+                              query,
+                              selectedDiseaseName: chosen.selected.name,
+                              activePathSummary:
+                                sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                              brief,
+                              pathFocus: finalPathFocus,
+                              allowedEntityLabels: collectAllowedEntityLabels(nodeMap, 220),
+                              timeoutMs: fallbackTimeoutMs,
+                            }).catch(() => null)
+                          : null;
                       if (fallbackFinal?.answer?.trim()) {
-                        discovererFinal = fallbackFinal;
+                        discovererFinal = alignKeyFindingsToPath(
+                          alignFinalFocusThreadToPath(
+                            fallbackFinal,
+                            finalPathFocus,
+                          ),
+                          finalPathFocus,
+                          sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                        );
                         if (!discovererAnswerEmitted) {
                           emit("answer_delta", {
-                            text: fallbackFinal.answer.trim(),
+                            text: discovererFinal.answer.trim(),
                             final: true,
                           });
-                          emit("final_answer", fallbackFinal);
+                          emit("final_answer", discovererFinal);
                           discovererAnswerEmitted = true;
                         }
                         emit("narration_delta", {
@@ -4276,26 +5224,52 @@ export async function GET(request: NextRequest) {
                     }
 
                     if (discovererFinal?.answer?.trim()) {
+                      const alignedDraft = alignKeyFindingsToPath(
+                        alignFinalFocusThreadToPath(
+                          discovererFinal,
+                          finalPathFocus,
+                        ),
+                        finalPathFocus,
+                        sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                      );
+                      const groundingTimeoutMs = boundedStageTimeoutMs(
+                        startedAt,
+                        FINAL_GROUNDING_TIMEOUT_MS,
+                        {
+                          reserveMs: 8_000,
+                          minMs: 12_000,
+                        },
+                      );
                       const groundedFinal =
-                        (await groundFinalAnswerWithInlineCitations({
-                          query,
-                          draft: discovererFinal,
-                          brief,
-                          activePathSummary: finalPathUpdate?.summary ?? null,
-                          graphPathContext: buildGraphPathContext({
-                            pathUpdate: finalPathUpdate,
-                            nodeMap,
-                            edgeMap,
-                          }),
-                          queryPlan: resolvedQueryPlan,
-                        }).catch(() => discovererFinal)) ?? discovererFinal;
-                      discovererFinal = groundedFinal;
+                        groundingTimeoutMs > 0
+                          ? (await groundFinalAnswerWithInlineCitations({
+                              query,
+                              draft: alignedDraft,
+                              brief,
+                              activePathSummary:
+                                sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                              graphPathContext: buildGraphPathContext({
+                                pathUpdate: finalPathUpdate,
+                                nodeMap,
+                                edgeMap,
+                              }),
+                              pathFocus: finalPathFocus,
+                              queryPlan: resolvedQueryPlan,
+                              allowedEntityLabels: collectAllowedEntityLabels(nodeMap, 220),
+                              timeoutMs: groundingTimeoutMs,
+                            }).catch(() => alignedDraft)) ?? alignedDraft
+                          : alignedDraft;
+                      discovererFinal = alignKeyFindingsToPath(
+                        groundedFinal,
+                        finalPathFocus,
+                        sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                      );
                       if (!discovererAnswerEmitted && groundedFinal.answer.trim().length > 0) {
                         emit("answer_delta", {
-                          text: groundedFinal.answer.trim(),
+                          text: discovererFinal.answer.trim(),
                           final: true,
                         });
-                        emit("final_answer", groundedFinal);
+                        emit("final_answer", discovererFinal);
                         discovererAnswerEmitted = true;
                       }
                     }

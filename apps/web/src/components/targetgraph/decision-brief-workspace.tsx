@@ -32,6 +32,7 @@ type Props = {
   initialQuery: string;
   initialDiseaseId?: string;
   initialDiseaseName?: string;
+  initialReplayId?: string;
 };
 
 type SourceHealth = Record<string, "green" | "yellow" | "red">;
@@ -133,12 +134,99 @@ function narrationKey(value: string): string {
     .trim();
 }
 
+function hasInlineCitationMarkers(text: string): boolean {
+  if (!text) return false;
+  return (
+    /\[(\d{1,3})\](?!\()/.test(text) ||
+    /\[(\d{1,3})\s*[–-]\s*(\d{1,3})\](?!\()/.test(text)
+  );
+}
+
+function appendCitationSuffixToBlock(block: string, suffix: string): string {
+  const lines = block.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const row = lines[index];
+    if (!row || row.trim().length === 0) continue;
+    lines[index] = `${row.trimEnd()} ${suffix}`;
+    return lines.join("\n");
+  }
+  return block;
+}
+
+function injectFallbackInlineCitations(
+  text: string,
+  citationIndices: ReadonlySet<number>,
+): string {
+  if (!text || citationIndices.size === 0 || hasInlineCitationMarkers(text)) {
+    return text;
+  }
+
+  const ordered = [...citationIndices].sort((a, b) => a - b);
+  if (ordered.length === 0) return text;
+
+  const markerBudget = ordered.slice(0, Math.min(ordered.length, 10));
+  const blocks = text.split(/\n\s*\n/);
+  const candidateIndexes = blocks
+    .map((block, index) => {
+      const trimmed = block.trim();
+      if (!trimmed) return -1;
+      if (/^#{1,6}\s/.test(trimmed)) return -1;
+      if (/^```/.test(trimmed)) return -1;
+      if (!/[A-Za-z]/.test(trimmed)) return -1;
+      return index;
+    })
+    .filter((index) => index >= 0);
+
+  if (candidateIndexes.length === 0) {
+    return appendCitationSuffixToBlock(
+      text,
+      markerBudget.map((value) => `[${value}]`).join(""),
+    );
+  }
+
+  let markerCursor = 0;
+  for (let index = 0; index < candidateIndexes.length; index += 1) {
+    if (markerCursor >= markerBudget.length) break;
+    const blockIndex = candidateIndexes[index];
+    if (typeof blockIndex !== "number") continue;
+    const remaining = markerBudget.length - markerCursor;
+    const allocateCount = index === 0 && remaining >= 2 ? 2 : 1;
+    const assigned = markerBudget.slice(markerCursor, markerCursor + allocateCount);
+    markerCursor += assigned.length;
+    if (assigned.length === 0) continue;
+    blocks[blockIndex] = appendCitationSuffixToBlock(
+      blocks[blockIndex] ?? "",
+      assigned.map((value) => `[${value}]`).join(""),
+    );
+  }
+
+  return blocks.join("\n\n");
+}
+
 function linkInlineCitationMarkers(
   text: string,
   citationIndices: ReadonlySet<number>,
 ): string {
   if (!text || citationIndices.size === 0) return text;
-  return text.replace(/\[(\d{1,3})\](?!\()/g, (full, value) => {
+  const seeded = injectFallbackInlineCitations(text, citationIndices);
+  const ranged = seeded.replace(
+    /\[(\d{1,3})\s*[–-]\s*(\d{1,3})\](?!\()/g,
+    (full, startValue, endValue) => {
+      const startIndex = Number(startValue);
+      const endIndex = Number(endValue);
+      if (
+        !Number.isFinite(startIndex) ||
+        !Number.isFinite(endIndex) ||
+        !citationIndices.has(startIndex) ||
+        !citationIndices.has(endIndex)
+      ) {
+        return full;
+      }
+      return `([\\[${startIndex}\\]](#ref-${startIndex})–[\\[${endIndex}\\]](#ref-${endIndex}))`;
+    },
+  );
+
+  return ranged.replace(/\[(\d{1,3})\](?!\()/g, (full, value) => {
     const index = Number(value);
     if (!Number.isFinite(index) || !citationIndices.has(index)) {
       return full;
@@ -292,6 +380,7 @@ export function DecisionBriefWorkspace({
   initialQuery,
   initialDiseaseId,
   initialDiseaseName,
+  initialReplayId,
 }: Props) {
   const router = useRouter();
   const stream = useCaseRunStream();
@@ -332,6 +421,7 @@ export function DecisionBriefWorkspace({
       initialQuery.trim().toLowerCase(),
       (initialDiseaseId ?? "").trim().toLowerCase(),
       (initialDiseaseName ?? "").trim().toLowerCase(),
+      (initialReplayId ?? "").trim().toLowerCase(),
     ].join("|");
     if (!shouldAutoStart(autoStartSignature)) {
       return;
@@ -341,10 +431,19 @@ export function DecisionBriefWorkspace({
       query: initialQuery,
       diseaseId: initialDiseaseId ?? null,
       diseaseName: initialDiseaseName ?? null,
+      replayId: initialReplayId ?? null,
     });
 
     return () => stopStream();
-  }, [initialDiseaseId, initialDiseaseName, initialQuery, runSessionId, startStream, stopStream]);
+  }, [
+    initialDiseaseId,
+    initialDiseaseName,
+    initialQuery,
+    initialReplayId,
+    runSessionId,
+    startStream,
+    stopStream,
+  ]);
 
   useEffect(() => {
     const incoming = stream.pathUpdate;

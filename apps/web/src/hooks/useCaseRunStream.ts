@@ -252,6 +252,7 @@ type StartOptions = {
   query: string;
   diseaseId?: string | null;
   diseaseName?: string | null;
+  replayId?: string | null;
   mode?: RunMode;
 };
 
@@ -374,7 +375,7 @@ export function useCaseRunStream() {
   }, [stop]);
 
   const start = useCallback(
-    ({ query, diseaseId, diseaseName, mode = "multihop" }: StartOptions) => {
+    ({ query, diseaseId, diseaseName, replayId, mode = "multihop" }: StartOptions) => {
       const trimmed = query.trim();
       if (!trimmed) return;
       if (isRunningRef.current) {
@@ -444,6 +445,9 @@ export function useCaseRunStream() {
           }
           if (diseaseName?.trim()) {
             params.set("diseaseName", diseaseName.trim());
+          }
+          if (replayId?.trim()) {
+            params.set("replay", replayId.trim());
           }
 
           const source = new EventSource(`/api/runCaseStream?${params.toString()}`);

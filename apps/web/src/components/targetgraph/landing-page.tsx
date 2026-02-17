@@ -6,13 +6,13 @@ import { ArrowRight, Search } from "lucide-react";
 import { LandingMoleculeBackground } from "@/components/targetgraph/landing-molecule-background";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { EXAMPLE_REPLAY_ID, EXAMPLE_REPLAY_QUERY } from "@/lib/example-replay";
 
 const SAMPLE_QUERIES = [
-  "What targets and pathways connect ALS to oxidative stress?",
+  EXAMPLE_REPLAY_QUERY,
   "How might obesity lead to type 2 diabetes through inflammatory signaling?",
   "Which mechanistic path could connect lupus, IL-6 signaling, and obesity?",
 ] as const;
-const EXAMPLE_QUERY = "What targets and pathways connect ALS to oxidative stress?";
 
 const LIVE_WORDS = ["live.", "discover.", "answer evidence-first."] as const;
 
@@ -103,11 +103,13 @@ export function LandingPage() {
     inputQuery: string,
     options?: {
       allowEmptyKey?: boolean;
+      replayId?: string | null;
     },
   ) => {
     const trimmedQuery = inputQuery.trim();
     if (trimmedQuery.length < 6) return;
     const allowEmptyKey = options?.allowEmptyKey ?? false;
+    const replayId = options?.replayId?.trim() || null;
     if (!allowEmptyKey && !hasApiKey) {
       setApiKeyError("Enter your OpenAI API key to run a custom query.");
       return;
@@ -115,8 +117,13 @@ export function LandingPage() {
     setApiKeyError(null);
     setIsPersistingKey(true);
     try {
-      await persistSessionApiKey();
-      router.push(`/brief?query=${encodeURIComponent(trimmedQuery)}`);
+      if (!replayId || hasApiKey) {
+        await persistSessionApiKey();
+      }
+      const nextUrl = replayId
+        ? `/brief?query=${encodeURIComponent(trimmedQuery)}&replay=${encodeURIComponent(replayId)}`
+        : `/brief?query=${encodeURIComponent(trimmedQuery)}`;
+      router.push(nextUrl);
     } catch (error) {
       setApiKeyError(error instanceof Error ? error.message : "Could not start run.");
     } finally {
@@ -151,7 +158,8 @@ export function LandingPage() {
                 className="h-9 w-full rounded-lg border border-[#d7e5f3] bg-white px-3 text-sm text-[#244062] outline-none ring-[#2f7ab3] placeholder:text-[#8094b4] focus:ring-2"
               />
               <div className="mt-1 text-[11px] text-[#5e7698]">
-                Enter your key for live runs. We never store it as footprint.
+                You will need an OpenAI API key to run a live query. We never store keys. Use Run example to see
+                how it works without a key.
               </div>
             </div>
           </div>
@@ -259,7 +267,10 @@ export function LandingPage() {
                 variant="outline"
                 className="h-11 border-[#b7cae3] bg-white text-[#2e5f8a] hover:bg-[#eef6ff]"
                 onClick={() => {
-                  void runWithQuery(EXAMPLE_QUERY, { allowEmptyKey: true });
+                  void runWithQuery(EXAMPLE_REPLAY_QUERY, {
+                    allowEmptyKey: true,
+                    replayId: EXAMPLE_REPLAY_ID,
+                  });
                 }}
                 disabled={isPersistingKey}
               >

@@ -41,6 +41,7 @@ import {
 } from "@/server/replay/example-replays";
 
 export const runtime = "nodejs";
+export const maxDuration = 800;
 
 type RunMode = "multihop";
 
@@ -87,9 +88,14 @@ const SESSION_RUN_STALE_MS = 15 * 60 * 1000;
 const SESSION_API_KEY_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_JOURNEY_EVENTS = 300;
 const RUN_HARD_BUDGET_MS = 10 * 60 * 1000;
-const DISCOVERER_TIMEOUT_MS = RUN_HARD_BUDGET_MS;
-const FALLBACK_SYNTHESIS_TIMEOUT_MS = 180_000;
-const FINAL_GROUNDING_TIMEOUT_MS = 180_000;
+const FINALIZATION_RESERVE_MS = 90_000;
+const DISCOVERER_TIMEOUT_MS = Math.max(
+  120_000,
+  RUN_HARD_BUDGET_MS - FINALIZATION_RESERVE_MS,
+);
+const MAX_DISCOVERER_FINAL_WAIT_MS = 150_000;
+const FALLBACK_SYNTHESIS_TIMEOUT_MS = 120_000;
+const FINAL_GROUNDING_TIMEOUT_MS = 120_000;
 
 type FinalBriefSnapshot = {
   recommendation?: {
@@ -731,11 +737,428 @@ function boundedStageTimeoutMs(
   return Math.max(minMs, Math.min(desiredMs, remaining));
 }
 
+const SCIENTIFIC_TEMPLATE_HEADINGS = [
+  "Working conclusion",
+  "Evidence synthesis",
+  "Biological interpretation",
+  "What to test next",
+  "Residual uncertainty",
+] as const;
+
+type ScientificTemplateHeading = (typeof SCIENTIFIC_TEMPLATE_HEADINGS)[number];
+type RecognizedScientificHeading = ScientificTemplateHeading | "Internal critique";
+
+function canonicalScientificSectionHeading(label: string): RecognizedScientificHeading | null {
+  const normalized = label
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+  if (
+    normalized.startsWith("working conclusion") ||
+    normalized.startsWith("direct answer") ||
+    normalized.startsWith("conclusion")
+  ) {
+    return "Working conclusion";
+  }
+  if (
+    normalized.startsWith("evidence synthesis") ||
+    normalized.startsWith("evidence summary") ||
+    normalized.startsWith("mechanistic support")
+  ) {
+    return "Evidence synthesis";
+  }
+  if (normalized.startsWith("biological interpretation") || normalized === "interpretation") {
+    return "Biological interpretation";
+  }
+  if (
+    normalized.startsWith("self critique") ||
+    normalized.startsWith("self-critique") ||
+    normalized.startsWith("critique and correction") ||
+    normalized.startsWith("alignment check")
+  ) {
+    return "Internal critique";
+  }
+  if (
+    normalized.startsWith("what to test next") ||
+    normalized.startsWith("next experiments") ||
+    normalized.startsWith("next experiment") ||
+    normalized.startsWith("next actions") ||
+    normalized.startsWith("experiment plan")
+  ) {
+    return "What to test next";
+  }
+  if (
+    normalized.startsWith("residual uncertainty") ||
+    normalized.startsWith("what remains uncertain") ||
+    normalized.startsWith("uncertainty")
+  ) {
+    return "Residual uncertainty";
+  }
+  return null;
+}
+
+function isScientificTemplateHeading(
+  value: RecognizedScientificHeading | null,
+): value is ScientificTemplateHeading {
+  return value !== null && value !== "Internal critique";
+}
+
+function countScientificTemplateHeadings(text: string): number {
+  const required = new Set<ScientificTemplateHeading>(SCIENTIFIC_TEMPLATE_HEADINGS);
+  const seen = new Set<ScientificTemplateHeading>();
+  const headingMatches = text.matchAll(/^\s*#{1,6}\s+([^\n]+)$/gim);
+  for (const match of headingMatches) {
+    const canonical = canonicalScientificSectionHeading(match[1] ?? "");
+    if (isScientificTemplateHeading(canonical) && required.has(canonical)) seen.add(canonical);
+  }
+  return seen.size;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isScientificTemplateCompliant(text: string): boolean {
+  const normalized = stripInternalCritiqueSection(cleanAnswerMarkdown(text));
+  if (!normalized) return false;
+  if (countScientificTemplateHeadings(normalized) < SCIENTIFIC_TEMPLATE_HEADINGS.length) {
+    return false;
+  }
+  const headingPositions = SCIENTIFIC_TEMPLATE_HEADINGS.map((heading) => {
+    const re = new RegExp(`^###\\s*${escapeRegex(heading)}\\s*$`, "gim");
+    const matches = [...normalized.matchAll(re)];
+    if (matches.length !== 1 || typeof matches[0]?.index !== "number") {
+      return -1;
+    }
+    return matches[0].index;
+  });
+  if (headingPositions.some((index) => index < 0)) return false;
+  for (let index = 1; index < headingPositions.length; index += 1) {
+    if (headingPositions[index]! <= headingPositions[index - 1]!) return false;
+  }
+  return true;
+}
+
 function cleanAnswerMarkdown(value: string): string {
-  return value
-    .replace(/\r/g, "")
+  const normalizedEscapes = (() => {
+    const base = value.replace(/\r/g, "");
+    const escapedNewlineCount = (base.match(/\\n/g) ?? []).length;
+    const realNewlineCount = (base.match(/\n/g) ?? []).length;
+    if (escapedNewlineCount >= 2 && realNewlineCount <= 1) {
+      return base
+        .replace(/\\r\\n/g, "\n")
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "  ");
+    }
+    return base;
+  })();
+
+  const sectionPattern =
+    /^(?:[-*]\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?\s*((?:working\s+conclusion(?:\s+and\s+practical\s+next\s+step)?|direct\s+answer|conclusion|evidence\s+synthesis|evidence\s+summary|mechanistic\s+support|biological\s+interpretation|interpretation|self[-\s]*critique(?:\s+and\s+correction)?|critique\s+and\s+correction|alignment\s+check|what\s+to\s+test\s+next|next\s+experiments?|next\s+actions?|experiment\s+plan|residual\s+uncertainty|what\s+remains\s+uncertain|uncertainty))[^:]*\s*(?:\*\*|__)?\s*:?\s*(.*)$/i;
+  const lines = normalizedEscapes
+    .replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n\n$2")
+    .split("\n");
+  const rebuilt: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const match = trimmed.match(sectionPattern);
+    if (!match) {
+      rebuilt.push(line);
+      continue;
+    }
+    const heading = canonicalScientificSectionHeading(match[1] ?? "");
+    if (!heading) {
+      rebuilt.push(line);
+      continue;
+    }
+    const inlineContent = (match[2] ?? "").trim();
+    if (heading === "Internal critique") {
+      rebuilt.push("### Internal critique");
+      if (inlineContent.length > 0) rebuilt.push(inlineContent);
+      continue;
+    }
+    rebuilt.push(`### ${heading}`);
+    if (inlineContent.length > 0) rebuilt.push(inlineContent);
+  }
+
+  const normalized = rebuilt
+    .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+  return normalized;
+}
+
+type ScientificTemplateHints = {
+  workingConclusion?: string | null;
+  evidenceItems?: string[];
+  interpretation?: string | null;
+  nextActions?: string[];
+  residualUncertainty?: string[];
+};
+
+function stripInternalCritiqueSection(text: string): string {
+  if (!text) return text;
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  let skipping = false;
+
+  for (const line of lines) {
+    const headingMatch = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const canonical = canonicalScientificSectionHeading(headingMatch[1] ?? "");
+      if (canonical === "Internal critique") {
+        skipping = true;
+        continue;
+      }
+      if (skipping) {
+        skipping = false;
+      }
+    }
+    if (!skipping) kept.push(line);
+  }
+
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function sanitizeSectionBody(body: string): string {
+  return body
+    .split("\n")
+    .filter((line) => !/^#{1,6}\s+/.test(line.trim()))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function clean(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function firstMeaningfulSentence(text: string): string {
+  const normalized = clean(text);
+  if (!normalized) return "";
+  const sentence = normalized.match(/[^.!?]+[.!?](?:\s*\[\d+\])*/)?.[0]?.trim();
+  return sentence || normalized;
+}
+
+function formatBulletLines(rows: Array<string | undefined | null>, max = 4): string {
+  const normalized = rows
+    .map((row) => clean(String(row ?? "")))
+    .filter(Boolean)
+    .slice(0, max);
+  if (normalized.length === 0) return "";
+  return normalized.map((row) => `- ${row}`).join("\n");
+}
+
+function sectionBlocksFromAnswer(text: string): Record<ScientificTemplateHeading, string> {
+  const sections: Record<ScientificTemplateHeading, string[]> = {
+    "Working conclusion": [],
+    "Evidence synthesis": [],
+    "Biological interpretation": [],
+    "What to test next": [],
+    "Residual uncertainty": [],
+  };
+  const normalized = stripInternalCritiqueSection(cleanAnswerMarkdown(text));
+  if (!normalized) {
+    return {
+      "Working conclusion": "",
+      "Evidence synthesis": "",
+      "Biological interpretation": "",
+      "What to test next": "",
+      "Residual uncertainty": "",
+    };
+  }
+
+  const preamble: string[] = [];
+  let activeHeading: ScientificTemplateHeading | null = null;
+  for (const line of normalized.split("\n")) {
+    const headingMatch = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const canonical = canonicalScientificSectionHeading(headingMatch[1] ?? "");
+      if (isScientificTemplateHeading(canonical)) {
+        activeHeading = canonical;
+      } else {
+        activeHeading = null;
+      }
+      continue;
+    }
+
+    if (activeHeading) {
+      sections[activeHeading].push(line);
+    } else {
+      preamble.push(line);
+    }
+  }
+
+  const preambleText = sanitizeSectionBody(preamble.join("\n"));
+  if (preambleText) {
+    const existing = sanitizeSectionBody(sections["Working conclusion"].join("\n"));
+    sections["Working conclusion"] = [preambleText, existing].filter(Boolean);
+  }
+
+  return {
+    "Working conclusion": sanitizeSectionBody(sections["Working conclusion"].join("\n")),
+    "Evidence synthesis": sanitizeSectionBody(sections["Evidence synthesis"].join("\n")),
+    "Biological interpretation": sanitizeSectionBody(
+      sections["Biological interpretation"].join("\n"),
+    ),
+    "What to test next": sanitizeSectionBody(sections["What to test next"].join("\n")),
+    "Residual uncertainty": sanitizeSectionBody(sections["Residual uncertainty"].join("\n")),
+  };
+}
+
+function enforceScientificTemplate(
+  text: string,
+  hints?: ScientificTemplateHints,
+): string {
+  const stripped = stripInternalCritiqueSection(cleanAnswerMarkdown(text));
+  const sections = sectionBlocksFromAnswer(stripped);
+  const paragraphs = stripped
+    .split(/\n{2,}/)
+    .map((block) => sanitizeSectionBody(block))
+    .filter(Boolean);
+
+  const workingConclusion =
+    sections["Working conclusion"] ||
+    sanitizeSectionBody(clean(hints?.workingConclusion ?? "")) ||
+    paragraphs[0] ||
+    stripInternalCritiqueSection(cleanAnswerMarkdown(text));
+
+  const evidenceSynthesis =
+    sections["Evidence synthesis"] ||
+    formatBulletLines(hints?.evidenceItems ?? [], 6) ||
+    paragraphs.slice(1).join("\n\n") ||
+    formatBulletLines([workingConclusion], 1);
+
+  const biologicalInterpretation =
+    sections["Biological interpretation"] ||
+    sanitizeSectionBody(clean(hints?.interpretation ?? "")) ||
+    firstMeaningfulSentence(paragraphs.slice(1).join(" ")) ||
+    firstMeaningfulSentence(workingConclusion);
+
+  const whatToTestNext =
+    sections["What to test next"] ||
+    formatBulletLines(hints?.nextActions ?? [], 4) ||
+    formatBulletLines(hints?.evidenceItems ?? [], 3) ||
+    formatBulletLines([firstMeaningfulSentence(workingConclusion)], 1);
+
+  const residualUncertainty =
+    sections["Residual uncertainty"] ||
+    sanitizeSectionBody((hints?.residualUncertainty ?? []).map((row) => clean(String(row))).filter(Boolean).slice(0, 2).join(" ")) ||
+    firstMeaningfulSentence(paragraphs.slice(-1).join(" "));
+
+  const bodyByHeading: Record<ScientificTemplateHeading, string> = {
+    "Working conclusion": sanitizeSectionBody(workingConclusion),
+    "Evidence synthesis": sanitizeSectionBody(evidenceSynthesis),
+    "Biological interpretation": sanitizeSectionBody(biologicalInterpretation),
+    "What to test next": sanitizeSectionBody(whatToTestNext),
+    "Residual uncertainty": sanitizeSectionBody(residualUncertainty),
+  };
+
+  const rebuilt = SCIENTIFIC_TEMPLATE_HEADINGS.map((heading) => {
+    const body = bodyByHeading[heading] || bodyByHeading["Working conclusion"];
+    return `### ${heading}\n${body}`.trim();
+  })
+    .join("\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return rebuilt;
+}
+
+function countWordsInText(value: string): number {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function trimSectionToWordBudget(section: string, maxWords: number): string {
+  const budget = Math.max(1, maxWords);
+  const lines = section
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return "";
+
+  const selected: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    const stripped = line.replace(/^[-*]\s+/, "").trim();
+    const words = countWordsInText(stripped);
+    if (words === 0) continue;
+    if (used + words <= budget) {
+      selected.push(line);
+      used += words;
+      continue;
+    }
+    const remaining = budget - used;
+    if (remaining <= 0) break;
+    const trimmed = truncateWords(stripped, remaining);
+    if (!trimmed) break;
+    const prefix = /^[-*]\s+/.test(line) ? "- " : "";
+    selected.push(`${prefix}${trimmed}`);
+    used = budget;
+    break;
+  }
+
+  const merged = selected.join("\n").trim();
+  if (!merged) return truncateWords(lines.join(" "), budget);
+  return merged;
+}
+
+function clampScientificTemplateWordBudget(text: string, maxWords = 700): string {
+  const maxBudget = Math.max(320, maxWords);
+  const normalized = enforceScientificTemplate(text);
+  if (countWordsInText(normalized) <= maxBudget) return normalized;
+
+  const sections = sectionBlocksFromAnswer(normalized);
+  const budgets: Record<ScientificTemplateHeading, number> = {
+    "Working conclusion": 130,
+    "Evidence synthesis": 250,
+    "Biological interpretation": 170,
+    "What to test next": 110,
+    "Residual uncertainty": 40,
+  };
+  const rebuilt = SCIENTIFIC_TEMPLATE_HEADINGS.map((heading) => {
+    const body = trimSectionToWordBudget(sections[heading], budgets[heading]);
+    return `### ${heading}\n${body}`.trim();
+  })
+    .join("\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  if (countWordsInText(rebuilt) <= maxBudget) return rebuilt;
+
+  const adaptiveBudgets = { ...budgets };
+  let adaptive = rebuilt;
+  const minBudgets: Record<ScientificTemplateHeading, number> = {
+    "Working conclusion": 95,
+    "Evidence synthesis": 180,
+    "Biological interpretation": 120,
+    "What to test next": 70,
+    "Residual uncertainty": 28,
+  };
+  for (let iteration = 0; iteration < 5; iteration += 1) {
+    for (const heading of SCIENTIFIC_TEMPLATE_HEADINGS) {
+      adaptiveBudgets[heading] = Math.max(
+        minBudgets[heading],
+        Math.floor(adaptiveBudgets[heading] * 0.9),
+      );
+    }
+    adaptive = SCIENTIFIC_TEMPLATE_HEADINGS.map((heading) => {
+      const body = trimSectionToWordBudget(sections[heading], adaptiveBudgets[heading]);
+      return `### ${heading}\n${body}`.trim();
+    })
+      .join("\n\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    if (countWordsInText(adaptive) <= maxBudget) return adaptive;
+  }
+
+  return adaptive;
 }
 
 function expandInlineCitationRanges(text: string): string {
@@ -755,7 +1178,9 @@ function expandInlineCitationRanges(text: string): string {
 }
 
 function normalizeAnswerEnding(text: string): string {
-  const normalized = cleanAnswerMarkdown(expandInlineCitationRanges(text));
+  const normalized = stripInternalCritiqueSection(
+    cleanAnswerMarkdown(expandInlineCitationRanges(text)),
+  );
   if (!normalized) return normalized;
   if (/[.!?](?:\s*\[\d+\])*\s*$/.test(normalized)) {
     return normalized;
@@ -835,13 +1260,38 @@ function truncateWords(text: string, maxWords: number): string {
   return `${truncated}.`;
 }
 
+function prioritizeCaveatsForAnswer(
+  caveats: Array<string | undefined | null>,
+  maxItems = 2,
+): string[] {
+  const rows = caveats
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+  if (rows.length <= maxItems) return rows;
+
+  const scored = rows.map((item, index) => {
+    const normalized = item.toLowerCase();
+    let score = 0;
+    if (/(incomplete|unresolved|missing|gap|insufficient)/.test(normalized)) score += 5;
+    if (/(conflict|contradict|discordant|inconsistent)/.test(normalized)) score += 4;
+    if (/(degraded|failed|timeout|limited)/.test(normalized)) score += 3;
+    return { item, score, index };
+  });
+
+  return scored
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, maxItems)
+    .sort((left, right) => left.index - right.index)
+    .map((item) => item.item);
+}
+
 function capUncertaintySection(
   text: string,
-  options?: { maxBullets?: number; maxWords?: number },
+  options?: { maxSentences?: number; maxWords?: number },
 ): string {
-  const maxBullets = Math.max(1, Math.min(5, options?.maxBullets ?? 2));
+  const maxSentences = Math.max(1, Math.min(2, options?.maxSentences ?? 2));
   const maxWords = Math.max(24, Math.min(200, options?.maxWords ?? 84));
-  const marker = /###\s*What remains uncertain/i;
+  const marker = /###\s*(Residual uncertainty|What remains uncertain)/i;
   const match = marker.exec(text);
   if (!match) return text;
 
@@ -855,17 +1305,23 @@ function capUncertaintySection(
     .filter(Boolean);
   if (lines.length === 0) return `${before}\n\n${heading}`;
 
-  const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line));
-  const selectedBullets = bulletLines.slice(0, maxBullets).map((line) => {
-    const bulletBody = line.replace(/^[-*]\s+/, "");
-    return `- ${truncateWords(bulletBody, 42)}`;
-  });
+  const normalized = lines
+    .map((line) => line.replace(/^[-*]\s+/, ""))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return `${before}\n\n${heading}`;
 
-  if (selectedBullets.length > 0) {
-    return `${before}\n\n${heading}\n${selectedBullets.join("\n")}`.trim();
-  }
+  const sentenceMatches =
+    normalized.match(/[^.!?]+[.!?](?:\s*\[\d+\])*/g)?.map((item) => item.trim()).filter(Boolean) ??
+    [];
 
-  return `${before}\n\n${heading}\n${truncateWords(lines.join(" "), maxWords)}`.trim();
+  const selected =
+    sentenceMatches.length > 0
+      ? sentenceMatches.slice(0, maxSentences)
+      : [truncateWords(normalized, maxWords)];
+
+  return `${before}\n\n${heading}\n${selected.join(" ")}`.trim();
 }
 
 function queryTokensForCitationRanking(query: string): string[] {
@@ -950,8 +1406,17 @@ function prioritizeCitationsForGrounding(
   return picked;
 }
 
-function ensureInlineCitations(text: string, citations: NonNullable<FinalBriefSnapshot["citations"]>): string {
-  const normalized = capUncertaintySection(normalizeAnswerEnding(text));
+function ensureInlineCitations(
+  text: string,
+  citations: NonNullable<FinalBriefSnapshot["citations"]>,
+  hints?: ScientificTemplateHints,
+): string {
+  const normalized = capUncertaintySection(
+    clampScientificTemplateWordBudget(
+      enforceScientificTemplate(normalizeAnswerEnding(text), hints),
+      700,
+    ),
+  );
   if (!normalized) return normalized;
   const scrubbed = scrubInternalNarrativeTokens(
     normalizeCitationMarkersAgainstLedger(normalized, citations),
@@ -1167,6 +1632,297 @@ function alignKeyFindingsToPath(
   };
 }
 
+type InternalCritiqueResult = {
+  requiresRevision: boolean;
+  templateCompliant: boolean;
+  graphAligned: boolean;
+  citationUse: "ok" | "weak" | "missing";
+  highPriorityFixes: string[];
+  revisionPlan: string;
+};
+
+function parseModelJsonObject(raw: string): Record<string, unknown> | null {
+  const text = raw.trim();
+  if (!text) return null;
+
+  const tryParse = (candidate: string): Record<string, unknown> | null => {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = tryParse(text);
+  if (direct) return direct;
+
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+  if (fenced) {
+    const parsedFenced = tryParse(fenced);
+    if (parsedFenced) return parsedFenced;
+  }
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return tryParse(text.slice(start, end + 1));
+  }
+
+  return null;
+}
+
+function parseInternalCritiqueResult(raw: string): InternalCritiqueResult | null {
+  const parsed = parseModelJsonObject(raw);
+  if (!parsed) return null;
+  const fixList = Array.isArray(parsed.highPriorityFixes)
+    ? parsed.highPriorityFixes.map((item) => clean(String(item ?? ""))).filter(Boolean).slice(0, 8)
+    : [];
+  const citationUseRaw = clean(String(parsed.citationUse ?? "")).toLowerCase();
+  const citationUse: InternalCritiqueResult["citationUse"] =
+    citationUseRaw === "ok" || citationUseRaw === "weak" || citationUseRaw === "missing"
+      ? citationUseRaw
+      : "weak";
+  return {
+    requiresRevision: Boolean(parsed.requiresRevision),
+    templateCompliant: Boolean(parsed.templateCompliant),
+    graphAligned: Boolean(parsed.graphAligned),
+    citationUse,
+    highPriorityFixes: fixList,
+    revisionPlan: clean(String(parsed.revisionPlan ?? "")),
+  };
+}
+
+function buildScientificTemplateHintsFromDraft(input: {
+  draft: DiscovererFinal;
+  activePathSummary: string | null;
+  pathFocus?: PathFocusSnapshot | null;
+}): ScientificTemplateHints {
+  const pathSummary =
+    sanitizePathSummaryForNarrative(input.activePathSummary) ||
+    sanitizePathSummaryForNarrative(input.pathFocus?.summary) ||
+    "";
+  const caveats = prioritizeCaveatsForAnswer(input.draft.caveats ?? [], 2);
+  const workingHintParts = [
+    input.draft.answer,
+    pathSummary ? `Strongest supported path: ${pathSummary}.` : "",
+  ]
+    .map((row) => clean(String(row ?? "")))
+    .filter(Boolean);
+  const interpretationParts = [
+    input.draft.focusThread?.target ? `Priority mechanism node: ${input.draft.focusThread.target}.` : "",
+    input.draft.focusThread?.pathway ? `Leading pathway thread: ${input.draft.focusThread.pathway}.` : "",
+    pathSummary ? `Cross-anchor trajectory: ${pathSummary}.` : "",
+  ]
+    .map((row) => clean(String(row ?? "")))
+    .filter(Boolean);
+
+  return {
+    workingConclusion: truncateWords(workingHintParts.join(" "), 150),
+    evidenceItems: (input.draft.keyFindings ?? []).map((item) => clean(String(item ?? ""))).filter(Boolean),
+    interpretation: interpretationParts.join(" "),
+    nextActions: (input.draft.nextActions ?? []).map((item) => clean(String(item ?? ""))).filter(Boolean),
+    residualUncertainty: caveats,
+  };
+}
+
+async function internallyCritiqueAndReviseScientificAnswer(input: {
+  query: string;
+  answer: string;
+  draft: DiscovererFinal;
+  pathFocus?: PathFocusSnapshot | null;
+  graphPathContext?: ReturnType<typeof buildGraphPathContext> | null;
+  queryPlan?: ResolvedQueryPlan | null;
+  allowedEntityLabels?: string[];
+  citations: NonNullable<FinalBriefSnapshot["citations"]>;
+  timeoutMs: number;
+}): Promise<string> {
+  const synthesisClient = createTrackedOpenAIClient();
+  const normalizedAnswer = clampScientificTemplateWordBudget(
+    enforceScientificTemplate(
+      normalizeAnswerEnding(input.answer),
+      buildScientificTemplateHintsFromDraft({
+        draft: input.draft,
+        activePathSummary: input.pathFocus?.summary ?? null,
+        pathFocus: input.pathFocus,
+      }),
+    ),
+    700,
+  );
+  if (!synthesisClient) return normalizedAnswer;
+  const totalBudgetMs = Math.max(10_000, Math.min(55_000, input.timeoutMs));
+  if (totalBudgetMs < 12_000) return normalizedAnswer;
+  const startedAt = Date.now();
+  const critiqueBudgetMs = Math.max(8_000, Math.min(22_000, Math.floor(totalBudgetMs * 0.4)));
+
+  const critiqueResponse = await withOpenAiOperationContext(
+    "run_case.internal_answer_critique",
+    () =>
+      withTimeout(
+        synthesisClient.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 900,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Evaluate whether the answer is ready for scientific delivery.",
+                    "Critique must remain internal and not be included in final user output.",
+                    "Validate strict section template and evidence alignment.",
+                    "Required headings, exactly once and in order:",
+                    "### Working conclusion",
+                    "### Evidence synthesis",
+                    "### Biological interpretation",
+                    "### What to test next",
+                    "### Residual uncertainty",
+                    "Check that uncertainty is mostly confined to the final section.",
+                    "Check that claims match graph-supported entities and no new unsupported entities are introduced.",
+                    "Check inline numeric citations are present and use only ledger indices.",
+                    "Return JSON only with keys:",
+                    "requiresRevision (boolean), templateCompliant (boolean), graphAligned (boolean), citationUse ('ok'|'weak'|'missing'), highPriorityFixes (string[]), revisionPlan (string).",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify(
+                    {
+                      query: input.query,
+                      answer: normalizedAnswer,
+                      pathFocus: input.pathFocus ?? null,
+                      graphPathContext: input.graphPathContext ?? null,
+                      queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
+                        mention: anchor.mention,
+                        entityType: anchor.entityType,
+                        id: anchor.id,
+                        name: anchor.name,
+                      })),
+                      allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
+                      citationLedger: input.citations.map((row) => ({
+                        index: row.index,
+                        kind: row.kind,
+                        label: compactText(row.label, 140),
+                        source: row.source,
+                      })),
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            },
+          ],
+        }),
+        critiqueBudgetMs,
+      ),
+  ).catch(() => null);
+
+  const critique = parseInternalCritiqueResult(String(critiqueResponse?.output_text ?? ""));
+  const needsRevision =
+    !critique ||
+    critique.requiresRevision ||
+    !critique.templateCompliant ||
+    !critique.graphAligned ||
+    critique.citationUse !== "ok";
+  if (!needsRevision) return normalizedAnswer;
+
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  const reviseBudgetMs = Math.max(6_000, totalBudgetMs - elapsedMs);
+  if (reviseBudgetMs < 8_000) return normalizedAnswer;
+
+  const revisionResponse = await withOpenAiOperationContext(
+    "run_case.internal_answer_revision",
+    () =>
+      withTimeout(
+        synthesisClient.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 10000,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Revise the biomedical answer using the internal critique.",
+                    "Do not reveal critique process in the output.",
+                    "Return final user-facing markdown only with these headings exactly once and in this exact order:",
+                    "### Working conclusion",
+                    "### Evidence synthesis",
+                    "### Biological interpretation",
+                    "### What to test next",
+                    "### Residual uncertainty",
+                    "Keep the answer evidence-grounded and aligned to graph-supported entities.",
+                    "Use only allowed entities and provided citation indices.",
+                    "Use inline numeric citations [n] after factual claims.",
+                    "Keep uncertainty concise and mostly in the final section.",
+                    "End with a complete sentence.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify(
+                    {
+                      query: input.query,
+                      draftAnswer: normalizedAnswer,
+                      critique: critique ?? {
+                        requiresRevision: true,
+                        templateCompliant: false,
+                        graphAligned: false,
+                        citationUse: "weak",
+                        highPriorityFixes: [],
+                        revisionPlan: "Repair template and align claims to evidence.",
+                      },
+                      pathFocus: input.pathFocus ?? null,
+                      graphPathContext: input.graphPathContext ?? null,
+                      allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
+                      queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
+                        mention: anchor.mention,
+                        entityType: anchor.entityType,
+                        id: anchor.id,
+                        name: anchor.name,
+                      })),
+                      citationLedger: input.citations.map((row) => ({
+                        index: row.index,
+                        kind: row.kind,
+                        label: compactText(row.label, 140),
+                        source: row.source,
+                      })),
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            },
+          ],
+        }),
+        reviseBudgetMs,
+      ),
+  ).catch(() => null);
+
+  const revised = normalizeAnswerEnding(String(revisionResponse?.output_text ?? ""));
+  if (!revised) return normalizedAnswer;
+  return revised;
+}
+
 async function groundFinalAnswerWithInlineCitations(input: {
   query: string;
   draft: DiscovererFinal;
@@ -1180,11 +1936,17 @@ async function groundFinalAnswerWithInlineCitations(input: {
 }): Promise<DiscovererFinal> {
   const synthesisClient = createTrackedOpenAIClient();
   const citations = prioritizeCitationsForGrounding(input.brief.citations ?? [], input.query, 32);
+  const templateHints = buildScientificTemplateHintsFromDraft({
+    draft: input.draft,
+    activePathSummary: input.activePathSummary,
+    pathFocus: input.pathFocus,
+  });
   if (!synthesisClient || citations.length === 0) {
     const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+    const templated = enforceScientificTemplate(alignedDraft.answer, templateHints);
     return {
       ...alignedDraft,
-      answer: ensureInlineCitations(alignedDraft.answer, citations),
+      answer: ensureInlineCitations(templated, citations, templateHints),
     };
   }
 
@@ -1192,6 +1954,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
     8_000,
     Math.min(FINAL_GROUNDING_TIMEOUT_MS, input.timeoutMs ?? FINAL_GROUNDING_TIMEOUT_MS),
   );
+  const stageStartedAt = Date.now();
 
   try {
     const response = await withOpenAiOperationContext(
@@ -1201,7 +1964,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 1800,
+            max_output_tokens: 10000,
             input: [
               {
                 role: "system",
@@ -1211,30 +1974,40 @@ async function groundFinalAnswerWithInlineCitations(input: {
                     text: [
                       "Rewrite the biomedical answer to be strictly evidence-grounded.",
                       "Use only claims supported by the provided evidence snapshot and citation ledger.",
-                      "The first paragraph must answer the user question directly in concrete biomedical terms.",
+                      "Write in a scientist-facing style: working conclusion, evidence synthesis, biological interpretation, and prioritized next experiments.",
+                      "Use this exact markdown section template (exactly once, in order):",
+                      "### Working conclusion",
+                      "### Evidence synthesis",
+                      "### Biological interpretation",
+                      "### What to test next",
+                      "### Residual uncertainty",
+                      "The first paragraph must answer the user question directly in concrete biomedical terms and include a practical next step.",
                       "Prioritize the graph-supported mechanism path as the primary answer thread when a path context is provided.",
                       "If the path focus is connected across query anchors, the first paragraph must center on the path focus target/pathway and stay consistent with that trail.",
                       "Do not assert a primary mechanism hop that is absent from the provided graph path edge trail.",
-                      "Keep the direct answer and mechanism bullets focused on entities present in the allowed graph entity labels.",
+                      "Keep conclusions and mechanism discussion focused on entities present in the allowed graph entity labels.",
                       "Do not introduce additional molecular entities outside the allowed graph entity labels.",
                       "Do not treat association scores, pathway annotations, or druggability hooks alone as causal evidence.",
                       "If the mapped evidence does not provide a complete end-to-end path between the query entities, state that the link remains incomplete.",
-                      "Keep uncertainty statements mostly in the '### What remains uncertain' section instead of the direct answer.",
+                      "Keep uncertainty statements mostly in the final 1-2 closing sentences instead of the opening paragraphs.",
                       "Insert inline numeric citation markers like [12] directly after factual claims.",
                       "Use square brackets only for numeric citations (for example [12]); never emit bracketed labels such as [query_bridge] or [OpenTargets evidence].",
                       "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
                       "Use only citation indices present in the ledger; do not invent citation numbers.",
-                      "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
-                      "Target a final length of roughly 200-300 words.",
-                      "Under '### Mechanistic support' include concrete mechanism bullets tied to evidence with citations.",
-                      "Under '### What remains uncertain' list unresolved links, missing data, and contradictory signals, but keep this concise.",
+                      "Do not output section headings outside the required template.",
+                      "Open with a recommendation/interpretation in at most 130 words, including 2-3 concrete next-step actions.",
+                      "Target a final length of roughly 500-700 words.",
+                      "Include evidence-supported mechanism bullets only where they change interpretation or action, with citations.",
+                      "Include a short 'what to test next' subsection with 2-3 prioritized experiments (or analyses), expected readouts, and what result would strengthen/weaken the hypothesis.",
+                      "End with exactly 1-2 closing sentences on unresolved links, missing data, or contradictions.",
                       "Allocate uncertainty to at most 10% of total answer length.",
                       "If uncertainty remains, state it explicitly and specifically.",
                       "End with a complete sentence; do not stop mid-sentence.",
                       "Do not expose internal field names in prose (for example connectedAcrossAnchors or graphPathContext).",
                       "Do not mention internal workflow words (bridge, branch, planner, pipeline, run status).",
                       "Avoid meta phrasing such as 'this dataset' or 'provided evidence snapshot'; answer directly in biomedical language.",
-                      "Keep the answer substantive, scientifically rigorous, and mechanistic (target/pathway/intermediate hops).",
+                      "Keep the answer substantive, scientifically rigorous, and directly useful for experimental decision-making.",
+                      "Critique/correction reasoning must remain internal and never be shown in the output text.",
                       "Return markdown text only.",
                     ].join(" "),
                   },
@@ -1251,7 +2024,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
                         draftAnswer: input.draft.answer,
                         focusThread: input.draft.focusThread,
                         keyFindings: input.draft.keyFindings.slice(0, 6),
-                        caveats: input.draft.caveats.slice(0, 4),
+                        caveats: prioritizeCaveatsForAnswer(input.draft.caveats, 2),
                         activePathSummary: input.activePathSummary,
                         graphPathContext: input.graphPathContext ?? null,
                         pathFocus: input.pathFocus ?? null,
@@ -1285,9 +2058,11 @@ async function groundFinalAnswerWithInlineCitations(input: {
 
     let grounded = normalizeAnswerEnding(String(response.output_text ?? ""));
     if (!grounded) {
+      const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+      const templated = enforceScientificTemplate(alignedDraft.answer, templateHints);
       return {
-        ...input.draft,
-        answer: ensureInlineCitations(input.draft.answer, citations),
+        ...alignedDraft,
+        answer: ensureInlineCitations(templated, citations, templateHints),
       };
     }
 
@@ -1343,7 +2118,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
             synthesisClient.responses.create({
               model: appConfig.openai.smallModel,
               reasoning: { effort: "minimal" },
-              max_output_tokens: 1200,
+              max_output_tokens: 10000,
               input: [
                 {
                   role: "system",
@@ -1352,8 +2127,13 @@ async function groundFinalAnswerWithInlineCitations(input: {
                       type: "input_text",
                       text: [
                         "Rewrite this biomedical answer so it remains fully evidence-grounded and citation-based.",
-                        "Keep markdown headings unchanged: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
-                        "The direct answer and mechanism bullets must center on the required graph-supported path focus target/pathway.",
+                        "Preserve readable markdown formatting with this exact heading template and order:",
+                        "### Working conclusion",
+                        "### Evidence synthesis",
+                        "### Biological interpretation",
+                        "### What to test next",
+                        "### Residual uncertainty",
+                        "The working conclusion and supporting mechanism bullets must center on the required graph-supported path focus target/pathway.",
                         "Do not add unsupported claims.",
                         "Keep uncertainty concise (<=10%).",
                         "Keep inline numeric citation markers.",
@@ -1372,6 +2152,8 @@ async function groundFinalAnswerWithInlineCitations(input: {
                           query: input.query,
                           currentAnswer: grounded,
                           requiredPathFocus: input.pathFocus,
+                          graphPathContext: input.graphPathContext ?? null,
+                          allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                           recommendation: input.brief.recommendation ?? null,
                           citations: citations.map((item) => ({
                             index: item.index,
@@ -1398,16 +2180,45 @@ async function groundFinalAnswerWithInlineCitations(input: {
       }
     }
 
+    grounded = enforceScientificTemplate(grounded, templateHints);
+    const elapsedMs = Math.max(0, Date.now() - stageStartedAt);
+    const critiqueBudgetMs = Math.max(
+      0,
+      Math.min(
+        Math.max(12_000, Math.floor(groundingTimeoutMs * 0.45)),
+        groundingTimeoutMs - elapsedMs,
+      ),
+    );
+    if (critiqueBudgetMs >= 12_000) {
+      grounded = await internallyCritiqueAndReviseScientificAnswer({
+        query: input.query,
+        answer: grounded,
+        draft: input.draft,
+        pathFocus: input.pathFocus ?? null,
+        graphPathContext: input.graphPathContext ?? null,
+        queryPlan: input.queryPlan ?? null,
+        allowedEntityLabels: input.allowedEntityLabels ?? [],
+        citations,
+        timeoutMs: critiqueBudgetMs,
+      }).catch(() => grounded);
+    }
+
+    grounded = capUncertaintySection(enforceScientificTemplate(grounded, templateHints));
+    if (!isScientificTemplateCompliant(grounded)) {
+      grounded = enforceScientificTemplate(grounded, templateHints);
+    }
     const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+    const templated = enforceScientificTemplate(grounded, templateHints);
     return {
       ...alignedDraft,
-      answer: ensureInlineCitations(grounded, citations),
+      answer: ensureInlineCitations(templated, citations, templateHints),
     };
   } catch {
     const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+    const templated = enforceScientificTemplate(alignedDraft.answer, templateHints);
     return {
       ...alignedDraft,
-      answer: ensureInlineCitations(alignedDraft.answer, citations),
+      answer: ensureInlineCitations(templated, citations, templateHints),
     };
   }
 }
@@ -1461,7 +2272,7 @@ async function synthesizeFallbackFinalAnswer(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 1600,
+            max_output_tokens: 10000,
             input: [
               {
                 role: "system",
@@ -1471,17 +2282,24 @@ async function synthesizeFallbackFinalAnswer(input: {
                     text: [
                       "You are a biomedical synthesis assistant.",
                       "Write the final user-facing scientific answer from the evidence snapshot.",
-                      "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
-                      "Start with a direct answer sentence to the query under '### Direct answer'.",
+                      "Write in a scientist-facing style: working conclusion, evidence synthesis, biological interpretation, and prioritized next experiments.",
+                      "Use this exact markdown section template (exactly once, in order):",
+                      "### Working conclusion",
+                      "### Evidence synthesis",
+                      "### Biological interpretation",
+                      "### What to test next",
+                      "### Residual uncertainty",
+                      "Start with a direct answer sentence to the query and include a practical next step.",
                       "When path focus is connected across anchors, center the answer on that target/pathway thread.",
-                      "Write a substantive summary (~180-280 words), not a one-liner.",
-                      "Use concrete biomedical entities and mechanism hops when available.",
+                      "Write a substantive summary (~500-700 words), not a one-liner.",
+                      "Use concrete biomedical entities and keep mechanism detail proportional to its decision value.",
+                      "Balance mechanism with directly useful interpretation; include 2-3 concrete experimental or translational next actions with expected readouts.",
                       "Keep mechanism entities constrained to the allowed graph entity labels.",
                       "Do not introduce additional molecular entities outside the allowed graph entity labels.",
-                      "Under '### Mechanistic support', include evidence-grounded bullets with entities and intermediates.",
+                      "Include evidence-grounded mechanism bullets that directly support the recommendation and decision impact.",
                       "Do not present association scores, pathway hooks, or druggability hooks as causal proof on their own.",
-                      "Under '### What remains uncertain', include unresolved links and missing evidence; keep this section concise (at most 10% of the answer).",
-                      "Keep uncertainty language primarily in the uncertainty section, not in the direct answer.",
+                      "End with exactly 1-2 sentences covering unresolved links and missing evidence.",
+                      "Keep uncertainty language primarily in the closing sentences, not in the opening recommendation.",
                       "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
                       "Use square brackets only for numeric citations (for example [12]); never emit bracketed labels such as [query_bridge] or [OpenTargets evidence].",
                       "End with a complete sentence.",
@@ -1489,6 +2307,7 @@ async function synthesizeFallbackFinalAnswer(input: {
                       "Do not echo JSON field names (for example activePathSummary or recommendation).",
                       "Do not mention workflow internals (bridge, branch, planner, pipeline, run status).",
                       "Avoid meta phrasing such as 'this dataset' or 'provided evidence snapshot'; answer directly in biomedical language.",
+                      "Critique/correction reasoning must remain internal and never be shown in the output text.",
                       "Do not fabricate claims.",
                     ].join(" "),
                   },
@@ -1508,7 +2327,7 @@ async function synthesizeFallbackFinalAnswer(input: {
                         allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                         recommendation,
                         alternatives: (input.brief.alternatives ?? []).slice(0, 3),
-                        caveats: (input.brief.caveats ?? []).slice(0, 4),
+                        caveats: prioritizeCaveatsForAnswer(input.brief.caveats ?? [], 2),
                         evidenceSummary: {
                           targetsWithEvidence: evidenceSummary.targetsWithEvidence ?? null,
                           articleSnippets: evidenceSummary.articleSnippets ?? null,
@@ -1534,22 +2353,38 @@ async function synthesizeFallbackFinalAnswer(input: {
         ),
     );
 
-    const answer = capUncertaintySection(normalizeAnswerEnding(String(response.output_text ?? "")));
-    if (!answer) return null;
     const keyFindings = [
       recommendation?.why?.trim() || "",
       recommendation?.interactionHook?.trim() || "",
       `Citations mapped: ${citationCount}`,
     ].filter(Boolean).slice(0, 6);
-    const caveats = (input.brief.caveats ?? [])
-      .map((row) => String(row ?? "").trim())
-      .filter(Boolean)
-      .slice(0, 4);
+    const caveats = prioritizeCaveatsForAnswer(input.brief.caveats ?? [], 2);
     const nextActions = [
       "Prioritize validation experiments on the strongest thread.",
       "Test whether the proposed mechanism is reproduced across independent cohorts.",
       "Review high-confidence citations and contradictory signals before actioning.",
     ];
+    const templateHints: ScientificTemplateHints = {
+      workingConclusion: recommendation?.why ?? input.activePathSummary ?? input.query,
+      evidenceItems: keyFindings,
+      interpretation: recommendation?.interactionHook ?? input.activePathSummary ?? "",
+      nextActions,
+      residualUncertainty: caveats,
+    };
+    const answer = ensureInlineCitations(
+      capUncertaintySection(
+        clampScientificTemplateWordBudget(
+          enforceScientificTemplate(
+            normalizeAnswerEnding(String(response.output_text ?? "")),
+            templateHints,
+          ),
+          700,
+        ),
+      ),
+      input.brief.citations ?? [],
+      templateHints,
+    );
+    if (!answer) return null;
 
     return {
       answer,
@@ -3103,6 +3938,7 @@ function generateBriefSections(options: {
   queryAnchorCount?: number;
   pathFocusTargetSymbols?: string[];
   pathConnectedAcrossAnchors?: boolean;
+  unresolvedAnchorPairCount?: number;
   enrichmentLinksByNodeId: EnrichmentLinksByNodeId;
 }) {
   const {
@@ -3116,6 +3952,7 @@ function generateBriefSections(options: {
     queryAnchorCount,
     pathFocusTargetSymbols,
     pathConnectedAcrossAnchors,
+    unresolvedAnchorPairCount,
     enrichmentLinksByNodeId,
   } = options;
   const nodes = [...nodeMap.values()];
@@ -3161,12 +3998,25 @@ function generateBriefSections(options: {
     (pathFocusTargetSymbols ?? []).map((value) => value.trim().toUpperCase()),
   );
   const normalizedQueryAnchorCount = Math.max(1, queryAnchorCount ?? 1);
+  const expectedAnchorPairCount = Math.max(1, normalizedQueryAnchorCount - 1);
+  const unresolvedPairCount = Math.max(0, unresolvedAnchorPairCount ?? 0);
+  const multiAnchorQuery = normalizedQueryAnchorCount >= 2;
+  const anchorCoverageScore = multiAnchorQuery
+    ? pathConnectedAcrossAnchors
+      ? 1
+      : Math.max(0, 1 - unresolvedPairCount / expectedAnchorPairCount)
+    : 1;
+  const pathFocusConfidence = pathConnectedAcrossAnchors
+    ? 1
+    : Math.max(0.2, anchorCoverageScore * 0.65);
   const boostedRanking = [...resolvedRanking.rankedTargets]
     .map((item) => ({
       item,
       boost:
-        (semanticTargetSet.has(item.symbol.toUpperCase()) ? 0.06 : 0) +
-        (pathFocusSet.has(item.symbol.toUpperCase()) ? 0.12 : 0),
+        (semanticTargetSet.has(item.symbol.toUpperCase())
+          ? 0.06 * Math.max(0.6, anchorCoverageScore)
+          : 0) +
+        (pathFocusSet.has(item.symbol.toUpperCase()) ? 0.12 * pathFocusConfidence : 0),
     }))
     .sort((a, b) => b.item.score + b.boost - (a.item.score + a.boost))
     .map((row, index) => ({
@@ -3185,6 +4035,7 @@ function generateBriefSections(options: {
   const shouldAnchorToQuery =
     hasInterventionConcept &&
     !!matchedQueryTarget &&
+    anchorCoverageScore >= 0.45 &&
     (matchedQueryTarget.score >= 0.32 || matchedQueryTarget.rank <= 12) &&
     (baselineTop?.score ?? 0) - matchedQueryTarget.score <= 0.26;
   const hasConnectedAnchorPath = Boolean(
@@ -3193,7 +4044,8 @@ function generateBriefSections(options: {
   const shouldPreferPathFocused =
     !!pathFocusedTarget &&
     (hasConnectedAnchorPath ||
-      (normalizedQueryAnchorCount >= 2 &&
+      (multiAnchorQuery &&
+        anchorCoverageScore >= 0.55 &&
         !shouldAnchorToQuery &&
         (pathFocusedTarget.score >= 0.28 || pathFocusedTarget.rank <= 12)));
 
@@ -3267,6 +4119,14 @@ function generateBriefSections(options: {
         ]
       : []),
     ...dataGaps.slice(0, 2),
+    ...(multiAnchorQuery && unresolvedPairCount > 0
+      ? [
+          `Only ${Math.max(
+            0,
+            expectedAnchorPairCount - unresolvedPairCount,
+          )}/${expectedAnchorPairCount} anchor links were resolved in this run.`,
+        ]
+      : []),
     ...(degradedSources.length > 0
       ? [`Degraded inputs during this run: ${degradedSources.join(", ")}.`] 
       : []),
@@ -3856,11 +4716,35 @@ export async function GET(request: NextRequest) {
         const planOntologyDiseaseAnchors = planDiseaseAnchors.filter(
           (anchor) => !/^HP_/i.test(anchor.id),
         );
-        const topPlanDiseaseAnchor =
-          (planOntologyDiseaseAnchors.length > 0
-            ? planOntologyDiseaseAnchors
-            : planDiseaseAnchors
-          ).sort((a, b) => b.confidence - a.confidence)[0] ?? null;
+        const topPlanDiseaseAnchor = (() => {
+          const pool =
+            planOntologyDiseaseAnchors.length > 0
+              ? planOntologyDiseaseAnchors
+              : planDiseaseAnchors;
+          if (pool.length === 0) return null;
+          const ranked = [...pool].sort((a, b) => b.confidence - a.confidence);
+          if (!(relationQuery && pool.length > 1)) {
+            return ranked[0] ?? null;
+          }
+          const queryLower = query.toLowerCase();
+          const byQueryOrder = pool
+            .map((anchor) => {
+              const mention = trimDiseaseNoise(anchor.mention || anchor.name).toLowerCase();
+              const index = mention ? queryLower.indexOf(mention) : -1;
+              return {
+                anchor,
+                index: index >= 0 ? index : Number.POSITIVE_INFINITY,
+              };
+            })
+            .sort((left, right) => {
+              if (left.index !== right.index) return left.index - right.index;
+              return right.anchor.confidence - left.anchor.confidence;
+            });
+          const firstMentioned = byQueryOrder.find(
+            (row) => Number.isFinite(row.index) && row.anchor.confidence >= 0.42,
+          );
+          return firstMentioned?.anchor ?? ranked[0] ?? null;
+        })();
         const topPlanDiseaseCandidate =
           (topPlanDiseaseAnchor
             ? candidates.find((candidate) => candidate.id === topPlanDiseaseAnchor.id) ?? null
@@ -4212,6 +5096,9 @@ export async function GET(request: NextRequest) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        let internalDoneReceived = false;
+        let internalDonePayload: Record<string, unknown> = {};
+        let completionEmitted = false;
 
         const emitRecommendationFromCurrentState = (
           currentRanking: RankingResponse | null,
@@ -4234,6 +5121,7 @@ export async function GET(request: NextRequest) {
             queryAnchorCount: (resolvedQueryPlan?.anchors ?? []).length,
             pathFocusTargetSymbols: extractPathFocusTargetSymbols(livePathUpdate, nodeMap),
             pathConnectedAcrossAnchors: Boolean(livePathUpdate?.connectedAcrossAnchors),
+            unresolvedAnchorPairCount: livePathUpdate?.unresolvedAnchorPairs?.length ?? 0,
             enrichmentLinksByNodeId,
           });
           const pathAlignedBrief = mergePathFocusIntoBrief(brief, pathFocus);
@@ -4419,6 +5307,11 @@ export async function GET(request: NextRequest) {
                   message: errorPayload.message,
                 });
               } else if (parsed.event === "done") {
+                internalDoneReceived = true;
+                internalDonePayload =
+                  payload && typeof payload === "object"
+                    ? (payload as Record<string, unknown>)
+                    : {};
                 if (secondaryDiseaseCandidates.length > 0) {
                   const primaryNodeId = makeNodeId("disease", chosen.selected.id);
                   const primaryTargetSymbols = [...nodeMap.values()]
@@ -4932,22 +5825,71 @@ export async function GET(request: NextRequest) {
                       if (edgeDelta !== 0) return edgeDelta;
                       return b.score - a.score;
                     })[0];
+                    const requiredPrimaryAnchors = (resolvedQueryPlan?.anchors ?? [])
+                      .filter(
+                        (anchor) =>
+                          (anchor.entityType === "disease" || anchor.entityType === "target") &&
+                          anchor.confidence >= 0.45,
+                      )
+                      .slice(0, 6)
+                      .map((anchor) => {
+                        const anchorName = anchor.name.trim().toLowerCase();
+                        const anchorMention = anchor.mention.trim().toLowerCase();
+                        const anchorId = anchor.id.trim().toLowerCase();
+                        const expectedNodeType =
+                          anchor.entityType === "disease" ? "disease" : "target";
+                        const matchedNode = [...nodeMap.values()].find((node) => {
+                          if (node.type !== expectedNodeType) return false;
+                          const nodeLabel = node.label.trim().toLowerCase();
+                          const nodeId = node.primaryId.trim().toLowerCase();
+                          return (
+                            nodeId === anchorId ||
+                            nodeLabel === anchorName ||
+                            nodeLabel === anchorMention
+                          );
+                        });
+                        return {
+                          name: anchor.name,
+                          nodeId: matchedNode?.id,
+                        };
+                      });
+                    const missingPrimaryAnchors = requiredPrimaryAnchors
+                      .filter(
+                        (anchor) =>
+                          !anchor.nodeId ||
+                          !strongestSegment?.nodeIds.includes(anchor.nodeId),
+                      )
+                      .map((anchor) => anchor.name);
+                    const unresolvedOutcomePairs = strongestSegment
+                      ? []
+                      : outcomes
+                          .filter((item) => !item.connected)
+                          .map((item) => `${chosen.selected.name} -> ${item.disease.name}`);
+                    const unresolvedAnchorPairs = [
+                      ...unresolvedOutcomePairs,
+                      ...missingPrimaryAnchors.map(
+                        (anchorName) => `missing primary anchor: ${anchorName}`,
+                      ),
+                    ].filter((value, index, all) => all.indexOf(value) === index);
+                    const hasFullAnchorCoverage =
+                      Boolean(strongestSegment) && missingPrimaryAnchors.length === 0;
                     const bridgePathUpdate: DerivedPathUpdate = {
                       nodeIds: strongestSegment?.nodeIds ?? [primaryNodeId, ...bridgePatch.secondaryNodeIds],
                       edgeIds: strongestSegment?.edgeIds ?? [...bridgeEdges.values()].map((edge) => edge.id),
                       summary:
-                        strongestSegment
+                        strongestSegment && missingPrimaryAnchors.length === 0
                           ? `Mechanism path confirmed: ${strongestSegment.summary}. ${Math.max(
                               0,
                               connectedOutcomes.length - 1,
                             )} additional connected anchor pair(s) retained in graph context.`
+                          : strongestSegment
+                            ? `Mechanism path found with partial anchor coverage: ${strongestSegment.summary}. Missing primary anchors: ${missingPrimaryAnchors.slice(
+                                0,
+                                3,
+                              ).join(", ")}.`
                           : `No strong multihop mechanism path found between ${chosen.selected.name} and ${secondaryNames} in this run.`,
-                      connectedAcrossAnchors: Boolean(strongestSegment),
-                      unresolvedAnchorPairs: strongestSegment
-                        ? []
-                        : outcomes
-                            .filter((item) => !item.connected)
-                            .map((item) => `${chosen.selected.name} -> ${item.disease.name}`),
+                      connectedAcrossAnchors: hasFullAnchorCoverage,
+                      unresolvedAnchorPairs,
                     };
                     latestPathUpdate = bridgePathUpdate;
                     lastPathSignature = `${bridgePathUpdate.nodeIds.join("|")}::${bridgePathUpdate.edgeIds.join("|")}`;
@@ -4995,6 +5937,7 @@ export async function GET(request: NextRequest) {
                       nodeMap,
                     ),
                     pathConnectedAcrossAnchors: Boolean(initialPathUpdate?.connectedAcrossAnchors),
+                    unresolvedAnchorPairCount: initialPathUpdate?.unresolvedAnchorPairs?.length ?? 0,
                     enrichmentLinksByNodeId,
                   }),
                   supplementalEvidence,
@@ -5067,15 +6010,15 @@ export async function GET(request: NextRequest) {
                   const synthesisStartedAt = Date.now();
                   const synthesisBudgetMs = boundedStageTimeoutMs(
                     startedAt,
-                    DISCOVERER_TIMEOUT_MS,
+                    MAX_DISCOVERER_FINAL_WAIT_MS,
                     {
                       reserveMs: 22_000,
-                      minMs: 60_000,
+                      minMs: 30_000,
                     },
                   );
                   const synthesisProgressWindowMs = Math.max(
-                    90_000,
-                    Math.min(6 * 60 * 1000, synthesisBudgetMs || 90_000),
+                    45_000,
+                    Math.min(3 * 60 * 1000, synthesisBudgetMs || 45_000),
                   );
                   const synthesisHeartbeat = setInterval(() => {
                     if (streamState.closed || streamAbort.signal.aborted) return;
@@ -5107,13 +6050,17 @@ export async function GET(request: NextRequest) {
                   }, 5000);
 
                   try {
-                    const discovererWaitMs = boundedStageTimeoutMs(
+                    const discovererWaitBudgetMs = boundedStageTimeoutMs(
                       startedAt,
                       DISCOVERER_TIMEOUT_MS - 5_000,
                       {
                         reserveMs: 24_000,
-                        minMs: 45_000,
+                        minMs: 25_000,
                       },
+                    );
+                    const discovererWaitMs = Math.min(
+                      MAX_DISCOVERER_FINAL_WAIT_MS,
+                      discovererWaitBudgetMs,
                     );
                     const final =
                       discovererWaitMs > 0
@@ -5156,6 +6103,7 @@ export async function GET(request: NextRequest) {
                           nodeMap,
                         ),
                         pathConnectedAcrossAnchors: Boolean(finalPathUpdate?.connectedAcrossAnchors),
+                        unresolvedAnchorPairCount: finalPathUpdate?.unresolvedAnchorPairs?.length ?? 0,
                         enrichmentLinksByNodeId,
                       }),
                       supplementalEvidence,
@@ -5194,6 +6142,13 @@ export async function GET(request: NextRequest) {
                           finalPathFocus,
                           sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
                         );
+                        discovererFinal = {
+                          ...discovererFinal,
+                          answer: ensureInlineCitations(
+                            discovererFinal.answer,
+                            brief.citations ?? [],
+                          ),
+                        };
                         if (!discovererAnswerEmitted) {
                           emit("answer_delta", {
                             text: discovererFinal.answer.trim(),
@@ -5264,6 +6219,13 @@ export async function GET(request: NextRequest) {
                         finalPathFocus,
                         sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
                       );
+                      discovererFinal = {
+                        ...discovererFinal,
+                        answer: ensureInlineCitations(
+                          discovererFinal.answer,
+                          brief.citations ?? [],
+                        ),
+                      };
                       if (!discovererAnswerEmitted && groundedFinal.answer.trim().length > 0) {
                         emit("answer_delta", {
                           text: discovererFinal.answer.trim(),
@@ -5319,10 +6281,7 @@ export async function GET(request: NextRequest) {
                   finalAnswer: discovererFinal,
                   llmCost,
                 });
-                const donePayload =
-                  payload && typeof payload === "object"
-                    ? (payload as Record<string, unknown>)
-                    : {};
+                const donePayload = internalDonePayload;
                 emit("done", {
                   ...donePayload,
                   elapsedMs: Date.now() - startedAt,
@@ -5348,11 +6307,271 @@ export async function GET(request: NextRequest) {
                   llmTokens: llmCost?.totals.totalTokens ?? 0,
                   llmCostUsd: llmCost?.totals.estimatedCostUsd,
                 });
+                completionEmitted = true;
               }
             } catch {
               // ignore malformed internal event payloads
             }
           }
+        }
+
+        if (
+          !streamState.closed &&
+          !streamAbort.signal.aborted &&
+          !completionEmitted
+        ) {
+          if (!internalDoneReceived) {
+            emit("run_error", {
+              phase: "stream_graph",
+              message:
+                "Baseline stream ended before terminal done event; finalizing from accumulated evidence.",
+              recoverable: true,
+            });
+            warnRequestLog(log, "run_case.done_missing", {
+              nodeCount: nodeMap.size,
+              edgeCount: edgeMap.size,
+            });
+          }
+
+          const semanticTargetSymbols = (resolvedQueryPlan?.anchors ?? [])
+            .filter((anchor) => anchor.entityType === "target")
+            .map((anchor) => anchor.name);
+          const semanticConceptMentions = [
+            ...(resolvedQueryPlan?.anchors ?? []).map((anchor) => anchor.mention),
+            ...llmRelationMentions,
+          ]
+            .map((value) => value.trim())
+            .filter((value) => value.length >= 2)
+            .filter((value, index, all) => all.indexOf(value) === index);
+          const hasInterventionConcept = (resolvedQueryPlan?.anchors ?? []).some(
+            (anchor) => anchor.requestedType === "intervention" || anchor.entityType === "drug",
+          );
+          const finalPathUpdate =
+            latestPathUpdate ??
+            derivePathUpdate(
+              nodeMap,
+              edgeMap,
+              resolvedQueryPlan,
+            );
+          const finalPathFocus = derivePathFocusSnapshot({
+            pathUpdate: finalPathUpdate,
+            nodeMap,
+          });
+
+          let brief = mergeSupplementalEvidenceIntoBrief(
+            generateBriefSections({
+              ranking,
+              nodeMap,
+              edgeMap,
+              sourceHealth,
+              semanticConceptMentions,
+              semanticTargetSymbols,
+              hasInterventionConcept,
+              queryAnchorCount: (resolvedQueryPlan?.anchors ?? []).length,
+              pathFocusTargetSymbols: extractPathFocusTargetSymbols(
+                finalPathUpdate,
+                nodeMap,
+              ),
+              pathConnectedAcrossAnchors: Boolean(finalPathUpdate?.connectedAcrossAnchors),
+              unresolvedAnchorPairCount: finalPathUpdate?.unresolvedAnchorPairs?.length ?? 0,
+              enrichmentLinksByNodeId,
+            }),
+            supplementalEvidence,
+          );
+          brief = mergePathFocusIntoBrief(brief, finalPathFocus);
+
+          emit("brief_section", {
+            section: "final_brief",
+            data: brief,
+          });
+          emit("citation_bundle", {
+            sections: [
+              {
+                section: "final_scientific_answer",
+                citationIndices: (brief.citations ?? []).map((citation) => citation.index),
+              },
+            ],
+            citations: brief.citations ?? [],
+          });
+
+          if (!discovererFinal && discovererPromise) {
+            const lateDiscovererWaitMs = boundedStageTimeoutMs(
+              startedAt,
+              MAX_DISCOVERER_FINAL_WAIT_MS,
+              {
+                reserveMs: 18_000,
+                minMs: 20_000,
+              },
+            );
+            if (lateDiscovererWaitMs > 0) {
+              const lateFinal = await withTimeout(
+                discovererPromise,
+                lateDiscovererWaitMs,
+              ).catch(() => null);
+              if (lateFinal) {
+                discovererFinal = lateFinal;
+                ingestDiscovererFinalEvidenceBundle(
+                  lateFinal.evidenceBundle,
+                  supplementalEvidence,
+                );
+              }
+            }
+          }
+
+          if (!discovererFinal) {
+            const fallbackTimeoutMs = boundedStageTimeoutMs(
+              startedAt,
+              FALLBACK_SYNTHESIS_TIMEOUT_MS,
+              {
+                reserveMs: 10_000,
+                minMs: 15_000,
+              },
+            );
+            if (fallbackTimeoutMs > 0) {
+              const fallbackFinal = await synthesizeFallbackFinalAnswer({
+                query,
+                selectedDiseaseName: chosen.selected.name,
+                activePathSummary:
+                  sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                brief,
+                pathFocus: finalPathFocus,
+                allowedEntityLabels: collectAllowedEntityLabels(nodeMap, 220),
+                timeoutMs: fallbackTimeoutMs,
+              }).catch(() => null);
+              if (fallbackFinal?.answer?.trim()) {
+                discovererFinal = alignKeyFindingsToPath(
+                  alignFinalFocusThreadToPath(
+                    fallbackFinal,
+                    finalPathFocus,
+                  ),
+                  finalPathFocus,
+                  sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                );
+              }
+            }
+          }
+
+          if (discovererFinal?.answer?.trim()) {
+            const alignedDraft = alignKeyFindingsToPath(
+              alignFinalFocusThreadToPath(
+                discovererFinal,
+                finalPathFocus,
+              ),
+              finalPathFocus,
+              sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+            );
+            const groundingTimeoutMs = boundedStageTimeoutMs(
+              startedAt,
+              FINAL_GROUNDING_TIMEOUT_MS,
+              {
+                reserveMs: 4_000,
+                minMs: 10_000,
+              },
+            );
+            discovererFinal =
+              groundingTimeoutMs > 0
+                ? (await groundFinalAnswerWithInlineCitations({
+                    query,
+                    draft: alignedDraft,
+                    brief,
+                    activePathSummary:
+                      sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                    graphPathContext: buildGraphPathContext({
+                      pathUpdate: finalPathUpdate,
+                      nodeMap,
+                      edgeMap,
+                    }),
+                    pathFocus: finalPathFocus,
+                    queryPlan: resolvedQueryPlan,
+                    allowedEntityLabels: collectAllowedEntityLabels(nodeMap, 220),
+                    timeoutMs: groundingTimeoutMs,
+                  }).catch(() => alignedDraft)) ?? alignedDraft
+                : alignedDraft;
+            discovererFinal = {
+              ...discovererFinal,
+              answer: ensureInlineCitations(
+                discovererFinal.answer,
+                brief.citations ?? [],
+              ),
+            };
+
+            if (!discovererAnswerEmitted) {
+              emit("answer_delta", {
+                text: discovererFinal.answer.trim(),
+                final: true,
+              });
+              emit("final_answer", discovererFinal);
+              discovererAnswerEmitted = true;
+            }
+          }
+
+          emit("status", {
+            phase: "P6",
+            message: "Final scientific answer ready; closing run",
+            pct: 99,
+            elapsedMs: Date.now() - startedAt,
+            partial: true,
+            counts: {
+              nodes: nodeMap.size,
+              edges: edgeMap.size,
+            },
+            sourceHealth,
+          });
+
+          const llmCost = getOpenAiRunSummary(runId);
+          if (llmCost) {
+            emit("llm_cost", llmCost);
+          }
+
+          emit("status", {
+            phase: "P6",
+            message: "Build complete",
+            pct: 100,
+            elapsedMs: Date.now() - startedAt,
+            partial: false,
+            counts: {
+              nodes: nodeMap.size,
+              edges: edgeMap.size,
+            },
+            sourceHealth,
+          });
+
+          emit("run_completed", {
+            runId,
+            elapsedMs: Date.now() - startedAt,
+            stats: {
+              nodes: nodeMap.size,
+              edges: edgeMap.size,
+            },
+            finalAnswer: discovererFinal,
+            llmCost,
+          });
+          emit("done", {
+            ...internalDonePayload,
+            elapsedMs: Date.now() - startedAt,
+            streamStats:
+              internalDonePayload.stats && typeof internalDonePayload.stats === "object"
+                ? internalDonePayload.stats
+                : null,
+            stats: {
+              totalNodes: nodeMap.size,
+              totalEdges: edgeMap.size,
+            },
+            counts: {
+              nodes: nodeMap.size,
+              edges: edgeMap.size,
+            },
+            finalAnswer: discovererFinal,
+            llmCost,
+          });
+          stepRequestLog(log, "run_case.done", {
+            nodeCount: nodeMap.size,
+            edgeCount: edgeMap.size,
+            llmCalls: llmCost?.totalCalls ?? 0,
+            llmTokens: llmCost?.totals.totalTokens ?? 0,
+            llmCostUsd: llmCost?.totals.estimatedCostUsd,
+          });
+          completionEmitted = true;
         }
 
         if (preStreamHeartbeat) {

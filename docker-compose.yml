@@ -104,6 +104,27 @@ services:
       timeout: 5s
       retries: 5
 
+  mcp-medical:
+    image: node:20-bullseye
+    working_dir: /app
+    command: >-
+      bash -lc "apt-get update && apt-get install -y --no-install-recommends ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 libfontconfig1 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 xdg-utils && rm -rf /var/lib/apt/lists/* && npm install && npx puppeteer browsers install chrome && npm run build && PORT=7060 npm run start:http"
+    volumes:
+      - ./services/mcp-medical:/app
+    ports:
+      - "7060:7060"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const s=require('net').createConnection(7060,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),2000);",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
   biomcp:
     image: python:3.11-slim
     command: >-

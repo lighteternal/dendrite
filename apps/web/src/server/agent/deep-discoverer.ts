@@ -26,6 +26,7 @@ import {
 } from "@/server/mcp/opentargets";
 import { findPathwaysByGene } from "@/server/mcp/reactome";
 import { getInteractionNetwork } from "@/server/mcp/stringdb";
+import { collectMedicalEvidence } from "@/server/mcp/medical";
 import { appConfig } from "@/server/config";
 import { getOpenAiApiKeyFromContext } from "@/server/openai/client";
 import {
@@ -78,6 +79,7 @@ export type DiscoverJourneyEntry = {
     | "chembl"
     | "string"
     | "biomcp"
+    | "medical"
     | "pubmed"
     | "evidence";
   pathState?: "active" | "candidate" | "discarded";
@@ -170,6 +172,7 @@ type DiscoveryEdge = {
     | "chembl"
     | "string"
     | "biomcp"
+    | "medical"
     | "pubmed"
     | "evidence";
   score: number;
@@ -198,6 +201,15 @@ type DiscoveryState = {
   bioMcpCounts: { articles: number; trials: number };
   bioMcpArticles: Array<{ id: string; title: string; source: string; url: string }>;
   bioMcpTrials: Array<{ id: string; title: string; source: string; url: string; status?: string }>;
+  medicalCounts: { literature: number; drugs: number; stats: number };
+  medicalSnippets: Array<{
+    id: string;
+    kind: "literature" | "drug" | "statistic";
+    title: string;
+    source: string;
+    url?: string;
+    summary?: string;
+  }>;
 };
 
 type CoordinatorTask = {
@@ -214,15 +226,21 @@ type SubagentReport = {
 };
 
 const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
-const AGENT_TIMEOUT_MS = Math.max(
-  10 * 60 * 1000,
-  appConfig.deepDiscover.agentTimeoutMs,
+const clampTimeout = (value: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, value));
+const DISCOVERER_MAX_RUN_MS = clampTimeout(
+  appConfig.deepDiscover.maxRunMs,
+  150_000,
+  300_000,
 );
-const TOOL_TIMEOUT_MS = Math.max(45_000, appConfig.deepDiscover.toolTimeoutMs);
+const AGENT_TIMEOUT_MS = Math.min(
+  clampTimeout(appConfig.deepDiscover.agentTimeoutMs, 60_000, 180_000),
+  Math.max(60_000, DISCOVERER_MAX_RUN_MS - 30_000),
+);
+const TOOL_TIMEOUT_MS = clampTimeout(appConfig.deepDiscover.toolTimeoutMs, 15_000, 90_000);
 const MAX_PUBMED_SUBQUERIES = appConfig.deepDiscover.maxPubmedSubqueries;
-const DISCOVERER_MAX_RUN_MS = Math.max(90_000, appConfig.deepDiscover.maxRunMs);
-const COORDINATOR_TIMEOUT_MS = Math.max(120_000, AGENT_TIMEOUT_MS);
-const SUBAGENT_TIMEOUT_MS = Math.max(120_000, AGENT_TIMEOUT_MS);
+const COORDINATOR_TIMEOUT_MS = clampTimeout(Math.min(AGENT_TIMEOUT_MS, 90_000), 25_000, 90_000);
+const SUBAGENT_TIMEOUT_MS = clampTimeout(Math.min(AGENT_TIMEOUT_MS, 120_000), 30_000, 120_000);
 
 const coordinatorPlanSchema = z.object({
   strategy: z.string().max(320),
@@ -287,6 +305,17 @@ const synthesisSchema = z.object({
   nextActions: z.array(z.string()).max(6),
 });
 
+const SCIENTIFIC_TEMPLATE_HEADINGS = [
+  "Working conclusion",
+  "Evidence synthesis",
+  "Biological interpretation",
+  "What to test next",
+  "Residual uncertainty",
+] as const;
+
+type ScientificTemplateHeading = (typeof SCIENTIFIC_TEMPLATE_HEADINGS)[number];
+type RecognizedScientificHeading = ScientificTemplateHeading | "Internal critique";
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -295,23 +324,314 @@ function clean(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function canonicalScientificSectionHeading(label: string): RecognizedScientificHeading | null {
+  const normalized = label
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+  if (
+    normalized.startsWith("working conclusion") ||
+    normalized.startsWith("direct answer") ||
+    normalized.startsWith("conclusion")
+  ) {
+    return "Working conclusion";
+  }
+  if (
+    normalized.startsWith("evidence synthesis") ||
+    normalized.startsWith("evidence summary") ||
+    normalized.startsWith("mechanistic support")
+  ) {
+    return "Evidence synthesis";
+  }
+  if (normalized.startsWith("biological interpretation") || normalized === "interpretation") {
+    return "Biological interpretation";
+  }
+  if (
+    normalized.startsWith("self critique") ||
+    normalized.startsWith("self-critique") ||
+    normalized.startsWith("critique and correction") ||
+    normalized.startsWith("alignment check")
+  ) {
+    return "Internal critique";
+  }
+  if (
+    normalized.startsWith("what to test next") ||
+    normalized.startsWith("next experiments") ||
+    normalized.startsWith("next actions") ||
+    normalized.startsWith("experiment plan")
+  ) {
+    return "What to test next";
+  }
+  if (
+    normalized.startsWith("residual uncertainty") ||
+    normalized.startsWith("what remains uncertain") ||
+    normalized.startsWith("uncertainty")
+  ) {
+    return "Residual uncertainty";
+  }
+  return null;
+}
+
+function isScientificTemplateHeading(
+  value: RecognizedScientificHeading | null,
+): value is ScientificTemplateHeading {
+  return value !== null && value !== "Internal critique";
+}
+
 function normalizeAnswerMarkdown(value: string): string {
-  return value
-    .replace(/\r/g, "")
+  const normalizedEscapes = (() => {
+    const base = value.replace(/\r/g, "");
+    const escapedNewlineCount = (base.match(/\\n/g) ?? []).length;
+    const realNewlineCount = (base.match(/\n/g) ?? []).length;
+    if (escapedNewlineCount >= 2 && realNewlineCount <= 1) {
+      return base
+        .replace(/\\r\\n/g, "\n")
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "  ");
+    }
+    return base;
+  })();
+
+  const sectionPattern =
+    /^(?:[-*]\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?\s*((?:working\s+conclusion(?:\s+and\s+practical\s+next\s+step)?|direct\s+answer|conclusion|evidence\s+synthesis|evidence\s+summary|mechanistic\s+support|biological\s+interpretation|interpretation|self[-\s]*critique(?:\s+and\s+correction)?|critique\s+and\s+correction|alignment\s+check|what\s+to\s+test\s+next|next\s+experiments?|next\s+actions?|experiment\s+plan|residual\s+uncertainty|what\s+remains\s+uncertain|uncertainty))[^:]*\s*(?:\*\*|__)?\s*:?\s*(.*)$/i;
+  const lines = normalizedEscapes
+    .replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n\n$2")
+    .split("\n");
+  const rebuilt: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const match = trimmed.match(sectionPattern);
+    if (!match) {
+      rebuilt.push(line);
+      continue;
+    }
+    const heading = canonicalScientificSectionHeading(match[1] ?? "");
+    if (!heading) {
+      rebuilt.push(line);
+      continue;
+    }
+    const inlineContent = (match[2] ?? "").trim();
+    if (heading === "Internal critique") {
+      rebuilt.push("### Internal critique");
+      if (inlineContent.length > 0) rebuilt.push(inlineContent);
+      continue;
+    }
+    rebuilt.push(`### ${heading}`);
+    if (inlineContent.length > 0) rebuilt.push(inlineContent);
+  }
+
+  const normalized = rebuilt
+    .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+  return normalized;
+}
+
+function stripInternalCritiqueSection(text: string): string {
+  if (!text) return text;
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  let skipping = false;
+  for (const line of lines) {
+    const headingMatch = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const canonical = canonicalScientificSectionHeading(headingMatch[1] ?? "");
+      if (canonical === "Internal critique") {
+        skipping = true;
+        continue;
+      }
+      if (skipping) skipping = false;
+    }
+    if (!skipping) kept.push(line);
+  }
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function countWords(value: string): number {
-  return normalizeAnswerMarkdown(value)
+  return stripInternalCritiqueSection(normalizeAnswerMarkdown(value))
     .split(/\s+/)
     .filter(Boolean).length;
 }
 
-function enrichIfTooBrief(answer: string, keyFindings: string[], caveats: string[] = []): string {
-  const normalized = normalizeAnswerMarkdown(answer);
+function trimSectionToWordBudget(section: string, maxWords: number): string {
+  const lines = section
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return "";
+  const budget = Math.max(1, maxWords);
+  const selected: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    const stripped = line.replace(/^[-*]\s+/, "").trim();
+    const words = stripped.split(/\s+/).filter(Boolean).length;
+    if (words === 0) continue;
+    if (used + words <= budget) {
+      selected.push(line);
+      used += words;
+      continue;
+    }
+    const remaining = budget - used;
+    if (remaining <= 0) break;
+    const tokens = stripped.split(/\s+/).filter(Boolean).slice(0, remaining);
+    if (tokens.length === 0) break;
+    const prefix = /^[-*]\s+/.test(line) ? "- " : "";
+    let truncated = tokens.join(" ").trim();
+    if (!/[.!?]$/.test(truncated)) truncated = `${truncated}.`;
+    selected.push(`${prefix}${truncated}`);
+    break;
+  }
+  return selected.join("\n").trim();
+}
+
+function clampScientificTemplateWordBudget(answer: string, maxWords = 700): string {
+  const maxBudget = Math.max(320, maxWords);
+  const templated = ensureScientificTemplate(answer, [], [], []);
+  if (!templated || countWords(templated) <= maxBudget) return templated;
+
+  const sections: Record<ScientificTemplateHeading, string[]> = {
+    "Working conclusion": [],
+    "Evidence synthesis": [],
+    "Biological interpretation": [],
+    "What to test next": [],
+    "Residual uncertainty": [],
+  };
+  let current: ScientificTemplateHeading | null = null;
+  for (const line of templated.split("\n")) {
+    const headingMatch = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const canonical = canonicalScientificSectionHeading(headingMatch[1] ?? "");
+      current = isScientificTemplateHeading(canonical) ? canonical : null;
+      continue;
+    }
+    if (current) sections[current].push(line);
+  }
+
+  const budgets: Record<ScientificTemplateHeading, number> = {
+    "Working conclusion": 130,
+    "Evidence synthesis": 250,
+    "Biological interpretation": 170,
+    "What to test next": 110,
+    "Residual uncertainty": 40,
+  };
+  const minBudgets: Record<ScientificTemplateHeading, number> = {
+    "Working conclusion": 95,
+    "Evidence synthesis": 180,
+    "Biological interpretation": 120,
+    "What to test next": 70,
+    "Residual uncertainty": 28,
+  };
+
+  const compose = () =>
+    SCIENTIFIC_TEMPLATE_HEADINGS.map((heading) => {
+      const body = trimSectionToWordBudget(sections[heading].join("\n"), budgets[heading]);
+      return `### ${heading}\n${body}`.trim();
+    })
+      .join("\n\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+  let rebuilt = compose();
+  for (let iteration = 0; iteration < 5 && countWords(rebuilt) > maxBudget; iteration += 1) {
+    for (const heading of SCIENTIFIC_TEMPLATE_HEADINGS) {
+      budgets[heading] = Math.max(minBudgets[heading], Math.floor(budgets[heading] * 0.9));
+    }
+    rebuilt = compose();
+  }
+  return rebuilt;
+}
+
+function ensureScientificTemplate(
+  answer: string,
+  keyFindings: string[],
+  caveats: string[] = [],
+  nextActions: string[] = [],
+): string {
+  const normalized = stripInternalCritiqueSection(normalizeAnswerMarkdown(answer));
   if (!normalized) return normalized;
-  if (countWords(normalized) >= 120) return normalized;
+  const sections: Record<ScientificTemplateHeading, string[]> = {
+    "Working conclusion": [],
+    "Evidence synthesis": [],
+    "Biological interpretation": [],
+    "What to test next": [],
+    "Residual uncertainty": [],
+  };
+  let current: ScientificTemplateHeading | null = null;
+  const preamble: string[] = [];
+  for (const line of normalized.split("\n")) {
+    const headingMatch = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const canonical = canonicalScientificSectionHeading(headingMatch[1] ?? "");
+      current = isScientificTemplateHeading(canonical) ? canonical : null;
+      continue;
+    }
+    if (current) {
+      sections[current].push(line);
+    } else {
+      preamble.push(line);
+    }
+  }
+
+  const preambleText = clean(preamble.join(" "));
+  if (preambleText) sections["Working conclusion"].unshift(preambleText);
+
+  const findings = keyFindings
+    .map((item) => clean(item))
+    .filter(Boolean)
+    .slice(0, 5);
+  const uncertainty = caveats
+    .map((item) => clean(item))
+    .filter(Boolean)
+    .slice(0, 2);
+  const actions = nextActions
+    .map((item) => clean(item))
+    .filter(Boolean)
+    .slice(0, 4);
+
+  const flatten = (rows: string[]) => rows.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const asBullets = (rows: string[]) => rows.map((row) => `- ${row}`).join("\n");
+  const working = flatten(sections["Working conclusion"]) || clean(answer);
+  const evidence = flatten(sections["Evidence synthesis"]) || asBullets(findings.slice(0, 4)) || working;
+  const interpretation =
+    flatten(sections["Biological interpretation"]) ||
+    clean(findings[0] ?? "") ||
+    working;
+  const tests =
+    flatten(sections["What to test next"]) ||
+    asBullets(actions.length > 0 ? actions : findings.slice(0, 3)) ||
+    working;
+  const residual =
+    flatten(sections["Residual uncertainty"]) ||
+    uncertainty.join(" ") ||
+    clean(findings[findings.length - 1] ?? working);
+
+  const byHeading: Record<ScientificTemplateHeading, string> = {
+    "Working conclusion": working,
+    "Evidence synthesis": evidence,
+    "Biological interpretation": interpretation,
+    "What to test next": tests,
+    "Residual uncertainty": residual,
+  };
+
+  return SCIENTIFIC_TEMPLATE_HEADINGS.map((heading) => `### ${heading}\n${byHeading[heading]}`)
+    .join("\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function enrichIfTooBrief(
+  answer: string,
+  keyFindings: string[],
+  caveats: string[] = [],
+  nextActions: string[] = [],
+): string {
+  const templated = ensureScientificTemplate(answer, keyFindings, caveats, nextActions);
+  const normalized = stripInternalCritiqueSection(normalizeAnswerMarkdown(templated));
+  if (!normalized) return normalized;
+  if (countWords(normalized) >= 420) return normalized;
   const findings = keyFindings
     .map((item) => clean(item))
     .filter(Boolean)
@@ -323,12 +643,43 @@ function enrichIfTooBrief(answer: string, keyFindings: string[], caveats: string
 
   const sections: string[] = [normalized];
   if (findings.length > 0) {
-    sections.push("", "### Mechanistic support", ...findings.map((item) => `- ${item}`));
+    sections.push("", "### Evidence synthesis", ...findings.map((item) => `- ${item}`));
+  }
+  if (nextActions.length > 0) {
+    sections.push(
+      "",
+      "### What to test next",
+      ...nextActions.map((item) => `- ${clean(item)}`).filter(Boolean).slice(0, 4),
+    );
   }
   if (uncertainty.length > 0) {
-    sections.push("", "### What remains uncertain", ...uncertainty.map((item) => `- ${item}`));
+    sections.push("", "### Residual uncertainty", ...uncertainty.map((item) => `- ${item}`));
   }
-  return sections.join("\n");
+  return ensureScientificTemplate(sections.join("\n"), keyFindings, caveats, nextActions);
+}
+
+function capUncertaintyTail(answer: string): string {
+  const normalized = ensureScientificTemplate(answer, [], []);
+  if (!normalized) return normalized;
+  const marker = /###\s*(Residual uncertainty|What remains uncertain)/i;
+  const match = marker.exec(normalized);
+  if (!match) return normalized;
+
+  const before = normalized.slice(0, match.index).trimEnd();
+  const heading = normalized.slice(match.index, match.index + match[0].length);
+  const after = normalized
+    .slice(match.index + match[0].length)
+    .split("\n")
+    .map((line) => clean(line.replace(/^[-*]\s+/, "")))
+    .filter(Boolean)
+    .join(" ");
+  if (!after) return `${before}\n\n${heading}`;
+
+  const sentences =
+    after.match(/[^.!?]+[.!?](?:\s*\[\d+\])*/g)?.map((item) => clean(item)).filter(Boolean) ??
+    [];
+  const tail = (sentences.length > 0 ? sentences.slice(0, 2).join(" ") : after).trim();
+  return `${before}\n\n${heading}\n${tail}`.trim();
 }
 
 function normalizePubmedQuery(value: string): string {
@@ -436,7 +787,7 @@ function inferBiomedicalCase(query: string): {
   return {
     title: `${compact(query, 86)}: multihop mechanistic discovery`,
     whyAgentic:
-      "Coordinator-guided subagents retrieve evidence across OpenTargets, Reactome, STRING, ChEMBL, BioMCP, and PubMed, then test competing mechanism hypotheses with query-specific follow-ups.",
+      "Coordinator-guided subagents retrieve evidence across OpenTargets, Reactome, STRING, ChEMBL, BioMCP, Medical MCP, and PubMed, then test competing mechanism hypotheses with query-specific follow-ups.",
   };
 }
 
@@ -765,6 +1116,25 @@ function chooseBridgePath(state: DiscoveryState): {
   };
 }
 
+function summarizeAnchorCoverage(state: DiscoveryState): {
+  totalPairCount: number;
+  resolvedPairCount: number;
+  unresolvedPairs: string[];
+  coverageScore: number;
+} {
+  const bridge = chooseBridgePath(state);
+  const totalPairCount = Math.max(0, bridge.anchorLabels.length - 1);
+  const unresolvedPairCount = Math.min(totalPairCount, bridge.unresolvedPairs.length);
+  const resolvedPairCount = Math.max(0, totalPairCount - unresolvedPairCount);
+  return {
+    totalPairCount,
+    resolvedPairCount,
+    unresolvedPairs: bridge.unresolvedPairs.slice(0, 6),
+    coverageScore:
+      totalPairCount === 0 ? 1 : resolvedPairCount / Math.max(1, totalPairCount),
+  };
+}
+
 function bridgePathToSummary(state: DiscoveryState, path: BridgePath | null): string {
   if (!path || path.nodeKeys.length === 0) return "not provided";
   return path.nodeKeys
@@ -782,7 +1152,7 @@ function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererF
       ? bridge.anchorLabels.join(" and ")
       : bridge.anchorLabels[0] ?? query;
 
-  const answer = bridge.connectedPath
+  const baseAnswer = bridge.connectedPath
     ? `For ${anchorScope}, current evidence supports the multihop mechanism path ${bridgeSummary}.`
     : `For ${anchorScope}, a complete multihop mechanism path is not yet resolved; the strongest partial thread is ${thread.pathway} -> ${thread.target} -> ${thread.drug}.`;
 
@@ -809,7 +1179,19 @@ function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererF
     `Edges discovered: ${state.edges.size}`,
     `PubMed subqueries executed: ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}`,
     `BioMCP snippets: ${state.bioMcpCounts.articles} articles / ${state.bioMcpCounts.trials} trials`,
+    `Medical MCP snippets: ${state.medicalCounts.literature} literature / ${state.medicalCounts.drugs} drug / ${state.medicalCounts.stats} stats`,
   ];
+  const nextActions = [
+    "Run follow-up assay design on the strongest target-pathway segment.",
+    "Expand interaction neighborhood around the top mechanistic targets.",
+    "Increase PubMed depth on unresolved anchor pairs with narrower subqueries.",
+  ];
+  const answer = capUncertaintyTail(
+    clampScientificTemplateWordBudget(
+      ensureScientificTemplate(baseAnswer, keyFindings, caveats, nextActions),
+      700,
+    ),
+  );
 
   return {
     answer,
@@ -817,11 +1199,7 @@ function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererF
     focusThread: thread,
     keyFindings,
     caveats: caveats.length > 0 ? caveats : ["No major gaps were flagged."],
-    nextActions: [
-      "Run follow-up assay design on the strongest target-pathway segment.",
-      "Expand interaction neighborhood around the top mechanistic targets.",
-      "Increase PubMed depth on unresolved anchor pairs with narrower subqueries.",
-    ],
+    nextActions,
     evidenceBundle: buildEvidenceBundle(state),
   };
 }
@@ -882,12 +1260,23 @@ function buildEvidenceBundle(state: DiscoveryState): NonNullable<DiscovererFinal
     if (citations.length >= 40) break;
   }
 
+  for (const snippet of state.medicalSnippets.slice(0, 10)) {
+    pushCitation({
+      kind: snippet.kind === "statistic" ? "trial" : "article",
+      label: snippet.summary ? `${snippet.title} — ${snippet.summary}` : snippet.title,
+      source: snippet.source || "Medical MCP",
+      url: snippet.url,
+    });
+    if (citations.length >= 46) break;
+  }
+
   return {
     articleSnippets: Math.max(
       state.bioMcpCounts.articles,
       state.pubmedSubqueryHits.reduce((acc, row) => acc + row.articles.length, 0),
+      state.medicalCounts.literature + state.medicalCounts.drugs,
     ),
-    trialSnippets: state.bioMcpCounts.trials,
+    trialSnippets: state.bioMcpCounts.trials + state.medicalCounts.stats,
     citations,
   };
 }
@@ -961,20 +1350,29 @@ async function synthesizeFreeformNarrative(
             content: [
               "You are a biomedical scientist writing the final run answer.",
               "Write a rigorous free-form scientific summary tailored to the exact query.",
-              "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
-              "Open with a direct answer sentence that names the main mechanism relation.",
-              "Write a substantive answer (roughly 180-280 words), not a one-liner.",
-              "Mention the key entities from the query and at least one intermediate mechanistic hop if available.",
+              "Write as a scientist-facing briefing: working conclusion, evidence synthesis, biological interpretation, and prioritized next experiments.",
+              "Use this exact markdown section template (exactly once, in order):",
+              "### Working conclusion",
+              "### Evidence synthesis",
+              "### Biological interpretation",
+              "### What to test next",
+              "### Residual uncertainty",
+              "Open with a direct answer sentence that names the main mechanism relation and a practical next step.",
+              "Write a substantive answer (roughly 500-700 words), not a one-liner.",
+              "Mention the key entities from the query and only the mechanism hops required to justify the recommendation.",
+              "Balance mechanism detail with practical interpretation and include 2-3 concrete next-step actions with expected readouts.",
               "Never use generic templates or boilerplate prefixes.",
               "If no complete cross-anchor mechanism path is found, explain what was tested and where the gap remains.",
-              "When evidence is available, mention the main intermediate hops explicitly.",
-              "Cover limitations/uncertainty clearly but concisely (at most 10% of total answer length).",
+              "Keep the direct answer section actionable and concise (<=130 words).",
+              "Include a short prioritized experiment plan that states what result would strengthen or weaken the lead hypothesis.",
+              "Cover limitations/uncertainty as exactly 1-2 closing sentences at the end (at most 10% of total answer length).",
               "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
               "End with a complete sentence; do not stop mid-sentence.",
               "Do not use internal workflow words such as bridge, branch, planner, or pipeline in the answer text.",
               "Do not discuss UI state, run progress, or internal orchestration.",
               "Do not write meta phrases like 'the provided evidence summary' or 'this dataset'.",
               "Write the biomedical conclusion directly.",
+              "Critique and correction must happen internally; do not expose self-critique text.",
               "Ignore placeholder values like 'not provided'; never surface them in findings or caveats.",
               "Do not add caveats about unrelated focus targets unless directly supported by mechanism evidence.",
               "If citation markers are provided, cite only using [1], [2], etc.",
@@ -1001,6 +1399,9 @@ async function synthesizeFreeformNarrative(
                   ),
                   biomcpArticles: payload.state.bioMcpCounts.articles,
                   biomcpTrials: payload.state.bioMcpCounts.trials,
+                  medicalLiterature: payload.state.medicalCounts.literature,
+                  medicalDrugs: payload.state.medicalCounts.drugs,
+                  medicalStats: payload.state.medicalCounts.stats,
                 },
                 subagentSummaries: payload.subagentSummaries.slice(0, 8),
                 citationPreview: payload.citationPreview,
@@ -1020,8 +1421,20 @@ async function synthesizeFreeformNarrative(
 
 function routeFollowupToSubagent(
   followup: string,
+  coverage?: {
+    coverageScore: number;
+    unresolvedPairs: string[];
+  },
 ): CoordinatorTask["subagent"] {
   const text = followup.toLowerCase();
+  if (
+    coverage &&
+    coverage.coverageScore < 1 &&
+    coverage.unresolvedPairs.length > 0 &&
+    /connect|bridge|between|overlap|relationship|common|shared|mechanism/.test(text)
+  ) {
+    return "bridge_hunter";
+  }
   if (/pubmed|paper|literature|trial|bibliography/.test(text)) return "literature_scout";
   if (/connect|bridge|between|overlap|relationship|common|shared/.test(text)) return "bridge_hunter";
   if (/drug|compound|tractability|moa|mechanism/.test(text)) return "translational_scout";
@@ -1081,6 +1494,8 @@ export async function runDeepDiscoverer({
     bioMcpCounts: { articles: 0, trials: 0 },
     bioMcpArticles: [],
     bioMcpTrials: [],
+    medicalCounts: { literature: 0, drugs: 0, stats: 0 },
+    medicalSnippets: [],
   };
 
   let entryCounter = 0;
@@ -1232,7 +1647,7 @@ export async function runDeepDiscoverer({
   };
 
   const extractAndLinkEvidenceEntities = async (input: {
-    source: "pubmed" | "biomcp";
+    source: "pubmed" | "biomcp" | "medical";
     snippets: string[];
     diseaseName?: string;
     targetSymbol?: string;
@@ -2001,6 +2416,149 @@ export async function runDeepDiscoverer({
     },
   );
 
+  const collectMedicalMcpEvidenceTool = tool(
+    async ({
+      query,
+      diseaseName,
+      targetSymbol,
+      interventionHint,
+      maxLiterature,
+      maxDrug,
+      maxStats,
+    }) => {
+      const queryText = clean(query);
+      const disease = clean(diseaseName ?? "");
+      const target = clean(targetSymbol ?? "").toUpperCase();
+      const intervention = clean(interventionHint ?? "");
+      const resolvedQuery = queryText || [disease, target, intervention].filter(Boolean).join(" ");
+      if (!resolvedQuery) {
+        return JSON.stringify({ literatureCount: 0, drugCount: 0, statsCount: 0 });
+      }
+
+      push(
+        "tool_start",
+        "Collect Medical MCP evidence",
+        `Collecting literature/drug/statistics context for ${compact(resolvedQuery, 120)}.`,
+        "medical",
+        [
+          ...(disease ? [{ type: "disease" as const, label: disease }] : []),
+          ...(target ? [{ type: "target" as const, label: target }] : []),
+          ...(intervention ? [{ type: "drug" as const, label: intervention }] : []),
+        ],
+        "active",
+      );
+
+      const evidence = await collectMedicalEvidence({
+        query: resolvedQuery,
+        diseaseName: disease,
+        targetSymbol: target,
+        interventionHint: intervention,
+        maxLiterature,
+        maxDrug,
+        maxStats,
+      }).catch(() => ({ literature: [], drugs: [], stats: [] }));
+
+      state.medicalCounts.literature += evidence.literature.length;
+      state.medicalCounts.drugs += evidence.drugs.length;
+      state.medicalCounts.stats += evidence.stats.length;
+
+      const highSignalSnippets = [
+        ...evidence.literature,
+        ...evidence.drugs,
+        ...evidence.stats,
+      ]
+        .filter((item) => {
+          const material = `${item.title} ${item.summary ?? ""}`.toLowerCase();
+          return (
+            material.length > 12 &&
+            !/critical safety warning|dynamic data sources|no hardcoded data/.test(material)
+          );
+        })
+        .slice(0, 10);
+
+      for (const snippet of highSignalSnippets) {
+        if (
+          !state.medicalSnippets.some(
+            (row) => row.kind === snippet.kind && row.id === snippet.id,
+          )
+        ) {
+          state.medicalSnippets.push({
+            id: snippet.id,
+            kind: snippet.kind,
+            title: snippet.title,
+            source: snippet.source,
+            url: snippet.url,
+            summary: snippet.summary,
+          });
+        }
+      }
+
+      const extractedEntities = await extractAndLinkEvidenceEntities({
+        source: "medical",
+        snippets: highSignalSnippets.map((snippet) =>
+          [snippet.title, snippet.summary].filter(Boolean).join(" — "),
+        ),
+        diseaseName: disease || undefined,
+        targetSymbol: target || undefined,
+      });
+      if (extractedEntities.length > 0) {
+        push(
+          "insight",
+          "Medical MCP evidence mapped",
+          `${extractedEntities.length} exposure/mechanism/outcome entities extracted from Medical MCP snippets.`,
+          "evidence",
+          extractedEntities.slice(0, 6).map((entity) => ({
+            type: "effect",
+            label: entity.label,
+            evidenceCategory: entity.category,
+          })),
+          "active",
+        );
+      }
+
+      push(
+        "tool_result",
+        "Medical MCP evidence collected",
+        `${evidence.literature.length} literature, ${evidence.drugs.length} drug, and ${evidence.stats.length} health-stat snippets collected.${
+          extractedEntities.length > 0 ? ` ${extractedEntities.length} evidence entities mapped.` : ""
+        }`,
+        "medical",
+        highSignalSnippets.slice(0, 5).map((snippet) => ({
+          type: "effect",
+          label: snippet.title,
+          primaryId: snippet.id,
+        })),
+        highSignalSnippets.length > 0 ? "active" : "candidate",
+      );
+
+      return JSON.stringify({
+        literatureCount: evidence.literature.length,
+        drugCount: evidence.drugs.length,
+        statsCount: evidence.stats.length,
+        highSignalSnippets: highSignalSnippets.slice(0, 5).map((item) => ({
+          id: item.id,
+          kind: item.kind,
+          title: item.title,
+          source: item.source,
+        })),
+      });
+    },
+    {
+      name: "collect_medical_mcp_evidence",
+      description:
+        "Collect high-signal evidence from Medical MCP (literature, drug labels, and WHO-style health statistics) with noise filtering.",
+      schema: z.object({
+        query: z.string(),
+        diseaseName: z.string().optional().default(""),
+        targetSymbol: z.string().optional().default(""),
+        interventionHint: z.string().optional().default(""),
+        maxLiterature: z.number().int().min(1).max(6).optional().default(4),
+        maxDrug: z.number().int().min(1).max(4).optional().default(2),
+        maxStats: z.number().int().min(1).max(4).optional().default(2),
+      }),
+    },
+  );
+
   const collectPubmedPairTool = tool(
     async ({ diseaseName, targetSymbol, limit }) => {
       const disease = clean(diseaseName);
@@ -2344,6 +2902,7 @@ export async function runDeepDiscoverer({
     fetchDrugsTool,
     fetchInteractionsTool,
     collectBioMcpTool,
+    collectMedicalMcpEvidenceTool,
     recursiveExpandTool,
   ];
 
@@ -2383,6 +2942,7 @@ export async function runDeepDiscoverer({
     model: strategicModelName,
     apiKey: activeOpenAiApiKey,
     callbacks: [usageCallback],
+    maxTokens: 10000,
     ...getLangChainPromptCacheConfig(
       "deep_discover.strategic_model",
       strategicModelName,
@@ -2613,6 +3173,7 @@ export async function runDeepDiscoverer({
     "Use tools to gather real evidence. Do not invent data.",
     "Prioritize anchor-specific subqueries and follow-up retrievals.",
     "Treat PubMed calls as expensive; only use them to close clear evidence gaps.",
+    "Use Medical MCP evidence to add high-signal literature, drug-label, or population-stat context when it strengthens a branch.",
     "If evidence is weak, mark pathState as candidate or discarded with explicit gaps.",
     "Return concise findings with named entities and mechanistic steps.",
   ].join(" ");
@@ -2628,7 +3189,7 @@ export async function runDeepDiscoverer({
       systemPrompt: [
         "You are pathway_mapper.",
         "Goal: map target/pathway/interactions that answer the exact query.",
-        "Prefer fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
+        "Prefer fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery, collect_medical_mcp_evidence.",
         "Use resolve_entity_candidates when anchors are ambiguous.",
         subagentPromptCommon,
       ].join(" "),
@@ -2640,7 +3201,7 @@ export async function runDeepDiscoverer({
       systemPrompt: [
         "You are translational_scout.",
         "Goal: map target->drug/moa evidence and identify tractable mechanistic threads.",
-        "Prefer fetch_target_drugs, fetch_target_pathways, collect_biomcp_evidence, collect_pubmed_pair_evidence, search_pubmed_subquery.",
+        "Prefer fetch_target_drugs, fetch_target_pathways, collect_biomcp_evidence, collect_medical_mcp_evidence, collect_pubmed_pair_evidence, search_pubmed_subquery.",
         "Use recursive_expand_multihop when direct links are weak.",
         subagentPromptCommon,
       ].join(" "),
@@ -2653,7 +3214,7 @@ export async function runDeepDiscoverer({
         "You are bridge_hunter.",
         "Goal: connect multiple query anchors through explicit intermediate entities.",
         "Never claim direct bridge unless intermediate nodes are mapped.",
-        "Prefer resolve_entity_candidates, fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery.",
+        "Prefer resolve_entity_candidates, fetch_disease_targets, fetch_target_pathways, fetch_interaction_neighbors, recursive_expand_multihop, search_pubmed_subquery, collect_medical_mcp_evidence.",
         subagentPromptCommon,
       ].join(" "),
     }),
@@ -2665,7 +3226,7 @@ export async function runDeepDiscoverer({
         "You are literature_scout.",
         "Goal: generate focused PubMed/BioMCP evidence for active mechanistic branches.",
         "Use max-precision subqueries and tie each evidence pull to an active entity pair.",
-        "Prefer search_pubmed_subquery, collect_pubmed_pair_evidence, collect_biomcp_evidence.",
+        "Prefer search_pubmed_subquery, collect_pubmed_pair_evidence, collect_biomcp_evidence, collect_medical_mcp_evidence.",
         subagentPromptCommon,
       ].join(" "),
     }),
@@ -2673,6 +3234,43 @@ export async function runDeepDiscoverer({
 
   const subagentMapWithPubmed = createSubagentMap(toolsetWithPubmed);
   const subagentMapNoPubmed = createSubagentMap(toolsetNoPubmed);
+  const totalMedicalSnippets = (): number =>
+    state.medicalCounts.literature +
+    state.medicalCounts.drugs +
+    state.medicalCounts.stats;
+
+  const inferredDiseaseHint =
+    clean(
+      state.queryPlan?.anchors.find((anchor) => anchor.entityType === "disease")?.name ??
+        diseaseQuery,
+    ) || diseaseQuery;
+  const inferredDrugHint = clean(
+    state.queryPlan?.anchors.find((anchor) => anchor.entityType === "drug")?.name ?? "",
+  );
+  const inferTargetHint = (task: CoordinatorTask): string => {
+    const fromPlan = clean(
+      state.queryPlan?.anchors.find((anchor) => anchor.entityType === "target")?.name ?? "",
+    );
+    if (fromPlan) return fromPlan.toUpperCase();
+    for (const seed of task.seedEntities) {
+      const token = clean(seed);
+      if (!token) continue;
+      if (!/^[A-Za-z0-9-]{2,18}$/.test(token)) continue;
+      if (!/[A-Za-z]/.test(token)) continue;
+      return token.toUpperCase();
+    }
+    return "";
+  };
+  const shouldRequireMedicalEvidence = (task: CoordinatorTask): boolean => {
+    if (task.subagent === "translational_scout" || task.subagent === "literature_scout") {
+      return true;
+    }
+    const material = `${task.objective} ${normalizedQuestion}`;
+    return /\b(drug|intervention|therapy|trial|population|epidemi|incidence|prevalence|obesity|diabetes|metabolic)\b/i.test(
+      material,
+    );
+  };
+  let medicalEvidenceSatisfied = false;
 
   const runSubagentTask = async (task: CoordinatorTask): Promise<SubagentReport> => {
     if (!hasTimeBudget(12_000)) {
@@ -2697,6 +3295,10 @@ export async function runDeepDiscoverer({
     );
 
     const pubmedBudgetRemaining = Math.max(0, MAX_PUBMED_SUBQUERIES - state.pubmedSubqueriesUsed);
+    const anchorCoverage = summarizeAnchorCoverage(state);
+    const medicalCountBefore = totalMedicalSnippets();
+    const requireMedicalEvidence =
+      !medicalEvidenceSatisfied && shouldRequireMedicalEvidence(task);
     const activeSubagentMap =
       pubmedBudgetRemaining > 0 ? subagentMapWithPubmed : subagentMapNoPubmed;
     const subagent = activeSubagentMap[task.subagent];
@@ -2717,6 +3319,14 @@ export async function runDeepDiscoverer({
                       ? "Use PubMed tools only when a branch has unresolved mechanistic evidence."
                       : "Do not call search_pubmed_subquery or collect_pubmed_pair_evidence in this task."
                   }`,
+                  `Anchor coverage: ${anchorCoverage.resolvedPairCount}/${anchorCoverage.totalPairCount} resolved. Unresolved pairs: ${
+                    anchorCoverage.unresolvedPairs.length > 0
+                      ? anchorCoverage.unresolvedPairs.join(" | ")
+                      : "none"
+                  }.`,
+                  requireMedicalEvidence
+                    ? "Medical MCP requirement: call collect_medical_mcp_evidence at least once in this task and use only high-signal snippets in findings."
+                    : "Medical MCP guidance: call collect_medical_mcp_evidence only when it materially strengthens this branch.",
                   `Structured query plan: ${JSON.stringify(subagentContext.queryPlan)}`,
                 ].join("\n"),
               },
@@ -2726,6 +3336,27 @@ export async function runDeepDiscoverer({
           `${task.subagent} invoke`,
         ),
     );
+
+    if (
+      requireMedicalEvidence &&
+      totalMedicalSnippets() === medicalCountBefore &&
+      hasTimeBudget(20_000)
+    ) {
+      await collectMedicalMcpEvidenceTool
+        .invoke({
+          query: normalizedQuestion,
+          diseaseName: inferredDiseaseHint,
+          targetSymbol: inferTargetHint(task),
+          interventionHint: inferredDrugHint,
+          maxLiterature: 4,
+          maxDrug: 2,
+          maxStats: 2,
+        })
+        .catch(() => undefined);
+    }
+    if (totalMedicalSnippets() > medicalCountBefore) {
+      medicalEvidenceSatisfied = true;
+    }
 
     const structured = response.structuredResponse as SubagentReport | undefined;
     const report: SubagentReport = structured ?? {
@@ -2775,6 +3406,85 @@ export async function runDeepDiscoverer({
     }
 
     return normalizedReport;
+  };
+
+  const ensureCriticalMcpCoverage = async (): Promise<void> => {
+    if (!hasTimeBudget(14_000)) return;
+    const observedTargets = uniqueSymbols([...state.targetById.values()].map((row) => row.symbol));
+    const plannedTargets = (state.queryPlan?.anchors ?? [])
+      .filter((anchor) => anchor.entityType === "target")
+      .map((anchor) => clean(anchor.name).toUpperCase());
+    const candidateTargets = uniqueSymbols([...plannedTargets, ...observedTargets]).slice(0, 4);
+    const diseaseHintForCoverage = clean(
+      state.queryPlan?.anchors.find((anchor) => anchor.entityType === "disease")?.name ?? inferredDiseaseHint,
+    );
+    const primaryTarget = candidateTargets[0] ?? "";
+    const interventionHintForCoverage = clean(inferredDrugHint);
+
+    if (!diseaseHintForCoverage && candidateTargets.length === 0) return;
+
+    push(
+      "phase",
+      "MCP coverage backfill",
+      "Backfilling underused MCP sources so final synthesis has cross-tool evidence.",
+      "agent",
+      [],
+      "candidate",
+    );
+
+    if (candidateTargets.length > 0 && state.interactionSymbols.size === 0 && hasTimeBudget(10_000)) {
+      await fetchInteractionsTool
+        .invoke({
+          targetSymbolsCsv: candidateTargets.join(", "),
+          confidence: 0.68,
+          maxNeighbors: 24,
+        })
+        .catch(() => undefined);
+    }
+
+    if (
+      diseaseHintForCoverage &&
+      primaryTarget &&
+      state.bioMcpCounts.articles + state.bioMcpCounts.trials === 0 &&
+      hasTimeBudget(10_000)
+    ) {
+      await collectBioMcpTool
+        .invoke({
+          diseaseName: diseaseHintForCoverage,
+          targetSymbol: primaryTarget,
+          interventionHint: interventionHintForCoverage,
+        })
+        .catch(() => undefined);
+    }
+
+    if (totalMedicalSnippets() === 0 && hasTimeBudget(10_000)) {
+      await collectMedicalMcpEvidenceTool
+        .invoke({
+          query: normalizedQuestion,
+          diseaseName: diseaseHintForCoverage,
+          targetSymbol: primaryTarget,
+          interventionHint: interventionHintForCoverage,
+          maxLiterature: 4,
+          maxDrug: 2,
+          maxStats: 2,
+        })
+        .catch(() => undefined);
+    }
+
+    if (
+      state.pubmedSubqueryHits.length === 0 &&
+      state.pubmedSubqueriesUsed < MAX_PUBMED_SUBQUERIES &&
+      hasTimeBudget(8_000)
+    ) {
+      const fallbackSubquery =
+        [primaryTarget, diseaseHintForCoverage].filter(Boolean).join(" AND ") || normalizedQuestion;
+      await searchPubmedSubqueryTool
+        .invoke({
+          subquery: fallbackSubquery,
+          limit: 2,
+        })
+        .catch(() => undefined);
+    }
   };
 
   const buildDefaultTasks = (): CoordinatorTask[] => {
@@ -2835,7 +3545,9 @@ export async function runDeepDiscoverer({
                   `Return max ${MAX_PUBMED_SUBQUERIES} PubMed subqueries tailored to this question.`,
                   "Subqueries should be specific and mechanism-oriented, not boilerplate.",
                   "If the query has multiple anchors, include at least one bridge_hunter task.",
+                  "When multiple explicit entities are present, keep all principal anchors (including mediator molecules/cytokines) across seed entities for planned tasks.",
                   "If the query is mechanism/explain style, include at least one translational_scout or pathway_mapper task.",
+                  "If drug/intervention/public-health context appears, include at least one task that can use Medical MCP evidence.",
                 ].join(" "),
               },
               {
@@ -2887,6 +3599,87 @@ export async function runDeepDiscoverer({
 
   if (coordinatorTasks.length === 0) {
     coordinatorTasks = buildDefaultTasks();
+  }
+
+  const primaryAnchorSeeds = (state.queryPlan?.anchors ?? [])
+    .map((anchor) => clean(anchor.name))
+    .filter(Boolean)
+    .slice(0, 6);
+  const mergeTaskSeedsWithPrimaryAnchors = (task: CoordinatorTask): CoordinatorTask => {
+    const merged = [
+      ...task.seedEntities.map((item) => clean(item)).filter(Boolean),
+      ...primaryAnchorSeeds,
+    ];
+    const deduped = new Set<string>();
+    const seeds: string[] = [];
+    for (const seed of merged) {
+      const key = seed.toLowerCase();
+      if (deduped.has(key)) continue;
+      deduped.add(key);
+      seeds.push(seed);
+      if (seeds.length >= 8) break;
+    }
+    return {
+      ...task,
+      seedEntities: seeds,
+    };
+  };
+
+  const applySupervisorRouting = (tasks: CoordinatorTask[]): CoordinatorTask[] => {
+    const coverage = summarizeAnchorCoverage(state);
+    const deduped = tasks.filter((task, index, all) => {
+      const signature = `${task.subagent}::${clean(task.objective).toLowerCase()}`;
+      return (
+        all.findIndex(
+          (candidate) =>
+            `${candidate.subagent}::${clean(candidate.objective).toLowerCase()}` === signature,
+        ) === index
+      );
+    });
+
+    let routed = [...deduped];
+    if (
+      coverage.totalPairCount > 0 &&
+      coverage.unresolvedPairs.length > 0 &&
+      !routed.some((task) => task.subagent === "bridge_hunter")
+    ) {
+      routed.unshift({
+        subagent: "bridge_hunter",
+        objective: `Resolve unresolved anchor mechanism gaps: ${coverage.unresolvedPairs.slice(0, 2).join(" | ")}`,
+        seedEntities: (state.queryPlan?.anchors ?? []).map((anchor) => anchor.name).slice(0, 6),
+      });
+    }
+
+    if (coverage.totalPairCount > 0 && coverage.coverageScore < 1) {
+      const priority: Record<CoordinatorTask["subagent"], number> = {
+        bridge_hunter: 0,
+        pathway_mapper: 1,
+        translational_scout: 2,
+        literature_scout: 3,
+      };
+      routed = [...routed].sort(
+        (left, right) => priority[left.subagent] - priority[right.subagent],
+      );
+    }
+
+    return routed.slice(0, 6).map(mergeTaskSeedsWithPrimaryAnchors);
+  };
+
+  coordinatorTasks = applySupervisorRouting(coordinatorTasks);
+  const supervisorCoverage = summarizeAnchorCoverage(state);
+  if (supervisorCoverage.totalPairCount > 0) {
+    push(
+      "phase",
+      "Supervisor routing",
+      `Anchor coverage ${supervisorCoverage.resolvedPairCount}/${supervisorCoverage.totalPairCount}. ${
+        supervisorCoverage.unresolvedPairs.length > 0
+          ? `Prioritizing unresolved pairs: ${supervisorCoverage.unresolvedPairs.slice(0, 2).join(" | ")}.`
+          : "All planned anchor pairs currently connected."
+      }`,
+      "planner",
+      [],
+      supervisorCoverage.coverageScore >= 1 ? "active" : "candidate",
+    );
   }
 
   if (initialPubmedSubqueries.length === 0) {
@@ -2949,7 +3742,11 @@ export async function runDeepDiscoverer({
       );
       break;
     }
-    const routed = routeFollowupToSubagent(followup);
+    const coverage = summarizeAnchorCoverage(state);
+    const routed = routeFollowupToSubagent(followup, {
+      coverageScore: coverage.coverageScore,
+      unresolvedPairs: coverage.unresolvedPairs,
+    });
     const task: CoordinatorTask = {
       subagent: routed,
       objective: followup,
@@ -2968,6 +3765,8 @@ export async function runDeepDiscoverer({
       );
     }
   }
+
+  await ensureCriticalMcpCoverage().catch(() => undefined);
 
   if (state.targetById.size === 0 || state.edges.size === 0) {
     await deterministicBackfill("empty-agent-state");
@@ -3014,20 +3813,29 @@ export async function runDeepDiscoverer({
     systemPrompt: [
       "You are a biomedical multihop synthesis agent.",
       "Answer the exact user query using only provided evidence summary.",
-      "Use markdown headings in this order: '### Direct answer', '### Mechanistic support', '### What remains uncertain'.",
-      "The first sentence must be a direct biomedical answer to the query.",
-      "Write a substantive answer (roughly 180-280 words), not a one-liner.",
+      "Write as a scientist-facing briefing: working conclusion, evidence synthesis, biological interpretation, and prioritized next experiments.",
+      "Use this exact markdown section template (exactly once, in order):",
+      "### Working conclusion",
+      "### Evidence synthesis",
+      "### Biological interpretation",
+      "### What to test next",
+      "### Residual uncertainty",
+      "The first sentence must be a direct biomedical answer to the query and include a practical next step.",
+      "Write a substantive answer (roughly 500-700 words), not a one-liner.",
       "Name the query entities and the strongest supported mechanism path.",
       "Never return generic disease-centric text if query asks cross-anchor relations.",
       "If no complete mechanism path is found across the query entities, state that gap in plain biomedical language and list key intermediates that were tested.",
-      "Use concise scientific language and include mechanism thread with intermediate hops when available.",
-      "Cover unresolved evidence, contradictory findings, and missing links clearly but concisely (at most 10% of answer length).",
+      "Use concise scientific language and include only mechanism detail that supports the direct recommendation.",
+      "Balance mechanism detail with practical interpretation and include 2-3 concrete next-step actions with expected readouts.",
+      "Include a short prioritized experiment plan that states what result would strengthen or weaken the lead hypothesis.",
+      "Place unresolved evidence, contradictory findings, and missing links as 1-2 closing sentences at the end (at most 10% of answer length).",
       "Do not use citation ranges like [6-10] or [6–10]; cite each number explicitly as [6][7][8][9][10].",
       "End with a complete sentence; do not stop mid-sentence.",
       "Do not use internal workflow words such as bridge, branch, planner, pipeline, anchor pair, or query graph in the answer text.",
       "Do not discuss UI state, run progress, or internal orchestration.",
       "Do not write meta phrases like 'the provided evidence summary' or 'this dataset'.",
       "Write the biomedical conclusion directly.",
+      "Critique and correction must happen internally; do not expose self-critique text.",
       "Ignore placeholder values like 'not provided'; never surface them in findings or caveats.",
       "Do not add caveats about unrelated focus targets unless directly supported by mechanism evidence.",
       "Do not fabricate literature or confidence.",
@@ -3038,6 +3846,10 @@ export async function runDeepDiscoverer({
     .flatMap((row) => row.articles)
     .slice(0, 6)
     .map((article, index) => `[${index + 1}] ${article.title}`);
+  for (const snippet of state.medicalSnippets.slice(0, 4)) {
+    citationPreview.push(`Medical MCP: ${snippet.title}`);
+    if (citationPreview.length >= 10) break;
+  }
 
   const synthesisInput: FreeformSynthesisInput = {
     query: normalizedQuestion,
@@ -3099,6 +3911,9 @@ export async function runDeepDiscoverer({
                       ),
                       biomcpArticles: synthesisInput.state.bioMcpCounts.articles,
                       biomcpTrials: synthesisInput.state.bioMcpCounts.trials,
+                      medicalLiterature: synthesisInput.state.medicalCounts.literature,
+                      medicalDrugs: synthesisInput.state.medicalCounts.drugs,
+                      medicalStats: synthesisInput.state.medicalCounts.stats,
                     },
                     focusThread: synthesisInput.thread,
                     activePath: synthesisInput.bridge.summary,
@@ -3135,6 +3950,7 @@ export async function runDeepDiscoverer({
     const fallbackFindings = fallback.keyFindings.filter((item) => !/\bnot provided\b/i.test(item));
     const structuredFindings = (structured?.keyFindings ?? []).filter(Boolean).slice(0, 6);
     const structuredCaveats = (structured?.caveats ?? []).filter(Boolean).slice(0, 6);
+    const structuredNextActions = (structured?.nextActions ?? []).filter(Boolean).slice(0, 4);
     const selectedAnswerRaw =
       structuredAnswer ||
       rescueAnswer ||
@@ -3144,10 +3960,16 @@ export async function runDeepDiscoverer({
         ),
       ) ||
       fallback.answer;
-    const selectedAnswer = enrichIfTooBrief(
-      normalizeAnswerMarkdown(selectedAnswerRaw),
-      structuredFindings.length > 0 ? structuredFindings : fallbackFindings,
-      structuredCaveats.length > 0 ? structuredCaveats : fallback.caveats,
+    const selectedAnswer = capUncertaintyTail(
+      clampScientificTemplateWordBudget(
+        enrichIfTooBrief(
+          normalizeAnswerMarkdown(selectedAnswerRaw),
+          structuredFindings.length > 0 ? structuredFindings : fallbackFindings,
+          structuredCaveats.length > 0 ? structuredCaveats : fallback.caveats,
+          structuredNextActions.length > 0 ? structuredNextActions : fallback.nextActions,
+        ),
+        700,
+      ),
     );
 
     return {
@@ -3195,7 +4017,12 @@ export async function runDeepDiscoverer({
         const fallback = buildFallbackSummary(state, normalizedQuestion);
         return {
           ...fallback,
-          answer: enrichIfTooBrief(rescued, fallback.keyFindings, fallback.caveats),
+          answer: capUncertaintyTail(
+            clampScientificTemplateWordBudget(
+              enrichIfTooBrief(rescued, fallback.keyFindings, fallback.caveats, fallback.nextActions),
+              700,
+            ),
+          ),
           evidenceBundle: buildEvidenceBundle(state),
         };
       }

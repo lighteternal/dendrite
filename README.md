@@ -1,262 +1,172 @@
 # TargetGraph
 
-TargetGraph is a streamed systems graph application that answers:
+TargetGraph is a Next.js biomedical discovery app that builds a live mechanism graph and a citation-grounded answer for complex multihop questions.
 
-> "When I type a disease, what are the highest-evidence targets, what pathways connect them, what drugs/compounds already touch them, and what interaction neighborhood suggests mechanistic plausibility—shown as a live, explorable systems graph?"
+It is designed for research synthesis, not clinical decision-making.
 
-UI includes a non-clinical disclaimer: **"Research evidence summary — not clinical guidance."**
+## What It Does
 
-## Repository Layout
+- Resolves query anchors (diseases, targets, pathways, interventions).
+- Streams graph evidence from OpenTargets, Reactome, STRING, ChEMBL, PubMed/BioMCP, and Medical MCP.
+- Runs coordinator + specialist subagents (`pathway_mapper`, `translational_scout`, `bridge_hunter`, `literature_scout`).
+- Produces a final answer with explicit mechanism thread, supporting evidence, caveats, and next actions.
+- Marks partial anchor coverage when the active path does not include all primary anchors.
 
-- `apps/web` - Next.js App Router + TypeScript frontend/backend.
-- `services/mcp-opentargets` - OpenTargets MCP server (Augmented-Nature clone).
-- `services/mcp-reactome` - Reactome MCP server (Augmented-Nature clone).
-- `services/mcp-string` - STRING-db MCP server (Augmented-Nature clone).
-- `services/mcp-chembl` - ChEMBL MCP server (Augmented-Nature clone).
-- `services/biomcp` - BioMCP (GenomOncology clone).
-- `docker-compose.yml` - Local service orchestration for all MCP services.
+## Repo Layout
+
+- `apps/web` - Next.js app (UI + API routes).
+- `services/mcp-opentargets` - OpenTargets MCP server.
+- `services/mcp-reactome` - Reactome MCP server.
+- `services/mcp-string` - STRING MCP server.
+- `services/mcp-chembl` - ChEMBL MCP server.
+- `services/mcp-pubmed` - PubMed MCP server.
+- `services/mcp-medical` - Medical MCP server (`jamesanz/medical-mcp`).
+- `services/biomcp` - BioMCP.
+- `scripts/bootstrap-services.sh` - Clones missing service repos and builds Node MCP services.
+- `docker-compose.yml` - Local MCP orchestration.
+
+## Connected MCPs
+
+- OpenTargets MCP
+- Reactome MCP
+- STRING MCP
+- ChEMBL MCP
+- BioMCP
+- PubMed MCP
+- Medical MCP
+
+Landing page tool chips now show a green/red health indicator per source using live sample probes from:
+- `GET /api/mcpHealth`
+
+Note: `mcp-medical` first boot is slower because the container installs Chromium dependencies and browser binaries for scraping-capable tools.
 
 ## Prerequisites
 
 - Node.js 20+
 - npm 10+
 - Docker + Docker Compose
-- Python 3.10+ (only if running BioMCP outside Docker)
+- Python 3.10+ (optional if running BioMCP outside Docker)
 
-## Quick Start
+## Quick Start (Local)
 
-### Local (full MCP stack)
+1. Configure environment:
+```bash
+cp .env.example .env
+# set OPENAI_API_KEY
+```
 
-1. Copy env template and add your key:
-   - `cp .env.example .env`
-   - Set `OPENAI_API_KEY=...`
-2. Start MCP services:
-   - `docker compose up --build`
-3. In another terminal, run web app:
-   - `npm --prefix apps/web install`
-   - `npm --prefix apps/web run dev`
-4. Open `http://localhost:3000`
+2. Bootstrap local services (clones missing repos + builds Node MCP services):
+```bash
+./scripts/bootstrap-services.sh
+```
 
-### Vercel (out-of-the-box, no localhost MCP ports)
+3. Start MCP stack:
+```bash
+docker compose up --build
+```
 
-1. Deploy `apps/web` as the Vercel project root.
-2. Set environment variables:
-   - `OPENAI_API_KEY`
-   - `MCP_TRANSPORT_MODE=fallback_only`
-3. Deploy.
+4. Start web app:
+```bash
+npm --prefix apps/web install
+npm --prefix apps/web run dev
+```
 
-With `fallback_only`, the app uses direct provider APIs (OpenTargets, Reactome, STRING, ChEMBL, PubMed/Europe PMC/ClinicalTrials) and does not depend on localhost MCP ports.
+5. Open:
+- `http://localhost:3000`
 
-## Environment Variables
+## Core Env Vars
 
 ```bash
-OPENAI_API_KEY=...
+OPENAI_API_KEY=
 MCP_TRANSPORT_MODE=auto
 
 OPENTARGETS_MCP_URL=http://localhost:7010/mcp
 REACTOME_MCP_URL=http://localhost:7020/mcp
 STRING_MCP_URL=http://localhost:7030/mcp
 CHEMBL_MCP_URL=http://localhost:7040/mcp
+PUBMED_MCP_URL=http://localhost:7050/mcp
+MEDICAL_MCP_URL=http://localhost:7060/mcp
 BIOMCP_URL=http://localhost:8000/mcp
-PUBMED_MCP_URL=http://localhost:8000/mcp
-
-PHASE_TIMEOUT_MS=600000
-STRING_CONFIDENCE_DEFAULT=0.7
-STRING_MAX_ADDED_NODES=180
-STRING_MAX_ADDED_EDGES=500
-STRING_MAX_NEIGHBORS_PER_SEED=15
-CACHE_TTL_MS=300000
-OPENAI_MODEL=gpt-5.2
-OPENAI_SMALL_MODEL=gpt-5-mini
-OPENAI_NANO_MODEL=gpt-5-nano
-STREAM_RANKING_TIMEOUT_MS=180000
-STREAM_P5_BUDGET_MS=480000
-STREAM_P5_PER_TARGET_TIMEOUT_MS=45000
-STREAM_MAX_LITERATURE_TARGETS=5
-DEEP_DISCOVER_AGENT_TIMEOUT_MS=600000
-DEEP_DISCOVER_TOOL_TIMEOUT_MS=120000
-DEEP_DISCOVER_MAX_RUN_MS=600000
-DEEP_DISCOVER_MAX_PUBMED_SUBQUERIES=20
+MEDICAL_MCP_ENABLE_JOURNAL_SCRAPE=0
 ```
 
-`MCP_TRANSPORT_MODE` values:
-- `auto` (default): use MCP endpoints when reachable; on Vercel with localhost endpoints, auto-fallback to direct APIs.
-- `prefer_mcp`: always try MCP first.
-- `fallback_only`: skip MCP transport and use direct API fallbacks only.
+`MCP_TRANSPORT_MODE`:
+- `auto` (default)
+- `prefer_mcp`
+- `fallback_only` (recommended baseline for Vercel if MCP endpoints are not externally reachable)
 
-## Local Commands
+`MEDICAL_MCP_ENABLE_JOURNAL_SCRAPE`:
+- `0` (default): skips Google Scholar-style journal scraping calls from the app wrapper (more stable, fewer timeouts).
+- `1`: enables journal scraping calls (requires fuller Chromium runtime dependencies in the medical MCP environment).
 
-- `npm run dev:web` - start Next.js app.
-- `npm run lint:web` - lint web code.
-- `npm run build:web` - production build.
-- `npm run services:up` - start MCP services via Docker.
-- `npm run services:down` - stop MCP services.
-- `npm run test:ui-regression` - run Chromium live UX regression across challenge queries.
-- `./scripts/check-services.sh` - health checks on local ports.
+## Validation Commands
 
-## Brief-First API Surface
+- Build/lint:
+```bash
+npm --prefix apps/web run lint
+npm --prefix apps/web run build
+```
 
-### `GET /api/resolveDisease?query=...`
+- Service health:
+```bash
+./scripts/check-services.sh
+```
 
-Disease-only entity resolver used by landing and brief workspace:
+- API streaming audit (landing queries):
+```bash
+BASE_URL=http://localhost:3000 SSE_TIMEOUT_MS=420000 node scripts/audit-query-sse.mjs "What targets and pathways connect ALS to oxidative stress?"
+BASE_URL=http://localhost:3000 SSE_TIMEOUT_MS=420000 node scripts/audit-query-sse.mjs "How might obesity lead to type 2 diabetes through inflammatory signaling?"
+BASE_URL=http://localhost:3000 SSE_TIMEOUT_MS=420000 node scripts/audit-query-sse.mjs "Which mechanistic path could connect lupus, IL-6 signaling, and obesity?"
+```
 
-- Returns `selected`, `candidates`, `rationale`
-- Restricts to disease entity namespaces (`EFO`, `MONDO`, `ORPHANET`, `DOID`, `HP`)
-- Uses semantic ranking + lexical guardrails to avoid non-disease variants (for example biomarker/measurement entities)
+- UI screenshot capture (example runner):
+```bash
+TARGETGRAPH_BASE_URL=http://localhost:3000 TARGETGRAPH_UI_OUT=/tmp/targetgraph-ui-final-examples node scripts/ui-final-capture-examples.mjs
+```
 
-### `GET /api/runCaseStream?query=...&mode=multihop[&diseaseId=...]`
+## Latest Landing-Query API Results (Feb 19, 2026)
 
-Decision-brief streaming endpoint consumed by `/brief`:
+Artifacts:
+- `/tmp/targetgraph-ui-usability/sse-audit2-what-targets-and-pathways-connect-als-to-oxidative-stress-.json`
+- `/tmp/targetgraph-ui-usability/sse-audit2-how-might-obesity-lead-to-type-2-diabetes-through-inflammatory-signaling-.json`
+- `/tmp/targetgraph-ui-usability/sse-audit2-which-mechanistic-path-could-connect-lupus-il-6-signaling-and-obesity-.json`
 
-- `query_plan` - typed anchor/entity/constraint plan built from resolver-native candidates
-- `entity_candidates` - raw candidate anchors and unresolved mentions
-- `resolver_candidates` - disease candidates surfaced before run starts
-- `resolver_selected` - selected disease entity + rationale
-- `status` - step status, counts, source health, completion
-- `agent_step` - natural-language timeline entries for user explainability
-- `graph_patch` - incremental node/edge updates for mechanism graph
-- `path_update` - currently strongest mechanism thread for graph focus
-- `brief_section` - recommendation + assembled brief sections
-- `done` - run completion event
-- `error` - recoverable/non-recoverable failures
+Observed:
+- All 3 runs emitted `final_answer`, `run_completed`, and `done`.
+- Medical MCP was called in all 3 runs (`medicalToolCallCount > 0`).
+- ALS and obesity queries returned fully connected anchor paths.
+- Lupus/IL-6/obesity returned explicit partial-anchor signal:
+  - `pathConnectedAcrossAnchors: false`
+  - `unresolvedAnchorPairs: ["missing primary anchor: IL6"]`
 
-Modes:
+This is intentional behavior: do not claim full anchor connectivity when IL-6 is unresolved in the active edge trail.
 
-- `multihop`: agentic multihop exploration with streamed graph deltas, execution logs, and citation-grounded synthesis.
+## Vercel Notes
 
-### `GET /api/streamGraph?diseaseQuery=...&maxTargets=...`
+For public deployment, do not rely on localhost MCP ports.
 
-Low-level pipeline endpoint still available for internal orchestration and compatibility.
+`MCP_TRANSPORT_MODE=fallback_only` means:
+- MCP transport calls are disabled (no direct calls to `/mcp` tool servers from the web app runtime).
+- The app uses built-in HTTP/API fallback paths for all integrated sources, including Medical evidence enrichment.
+- If MCP endpoints are reachable, `auto`/`prefer_mcp` can still be used to prefer transport-backed tools.
 
-Pipeline phases:
+Minimum stable public v1 path:
+- Deploy `apps/web` as the Vercel project root.
+- Set `MCP_TRANSPORT_MODE=fallback_only` in Vercel env vars.
+- `OPENAI_API_KEY` on the server is optional if users provide their own key in the landing page input.
+- If you want server-side key fallback, set `OPENAI_API_KEY` as well.
+- Keep MCP service URLs unset or set them only when you have externally reachable MCP infra.
 
-1. Resolve disease
-2. Fetch target evidence (OpenTargets MCP)
-3. Add pathways (Reactome MCP)
-4. Add drugs/activities (OpenTargets + ChEMBL MCP)
-5. Add interactions (STRING MCP)
-6. Add literature/trials (BioMCP)
-7. Rank + narrative (OpenAI)
+Timeout support:
+- Long-running routes export `maxDuration = 800`:
+  - `apps/web/src/app/api/runCaseStream/route.ts`
+  - `apps/web/src/app/api/streamGraph/route.ts`
+  - `apps/web/src/app/api/agentDiscover/route.ts`
+- This does not change internal agent time budgets; it only raises the Vercel function ceiling.
+- On Vercel, effective max duration is plan-dependent (Fluid Compute required for longest runs).
 
-## Hypothesis Mode API
+## Known Issues / Next Hardening
 
-`POST /api/hypothesis`
-
-Input includes selected pathway, slider weights, and evidence table.
-Output includes:
-
-- `recommendedTargets` (1 or 3)
-- `mechanismThread` JSON (`claim`, `evidenceBullets`, `counterfactuals`, `caveats`, `nextExperiments`)
-- `missingInputs`
-
-## Deep Discoverer API
-
-`GET /api/agentDiscover?diseaseQuery=...&question=...&diseaseId=...`
-
-SSE events:
-
-- `status` - workflow bootstrapping state.
-- `journey` - live agent journey entries (tool start/result, source, entities).
-- `subagent_start` - explicit specialist subagent starts.
-- `subagent_result` - structured handoff payload from specialist subagents.
-- `followup_question_spawned` - targeted multihop follow-up generated during run.
-- `branch_update` - branch state update (active/candidate/discarded).
-- `final` - consolidated readout (answer, biomedical case, focus thread, caveats, next actions).
-- `done` - elapsed time.
-
-Implementation uses LangGraph/LangChain agent middleware with DeepAgents-style subagent delegation:
-
-- `pathway_mapper` (mechanism mapping)
-- `translational_scout` (compound/tractability scouting)
-- Optional PubMed MCP enrichment (`PUBMED_MCP_URL`) for explicit literature branching in live journey updates.
-
-## Agentic Architecture
-
-Current architecture is orchestrator-first with typed handoffs:
-
-1. Query planner resolves mixed entity anchors and constraints using resolver-native candidates (no hardcoded biomedical dictionaries).
-2. Orchestrator delegates parallel specialist retrieval (`pathway_mapper`, `translational_scout`) plus deterministic fallbacks.
-3. Tool outputs can spawn follow-up tasks; branch state is streamed as active/candidate/discarded.
-4. Intermediate results are emitted as both:
-   - textual journey/handoff events
-   - live graph deltas and path updates in the mechanism canvas.
-
-Reference docs used for architecture decisions:
-
-- DeepAgents: https://docs.deepagents.dev/
-- LangGraph multi-agent: https://langchain-ai.github.io/langgraph/concepts/multi_agent/
-- Anthropic agent engineering patterns: https://www.anthropic.com/engineering/building-effective-agents
-
-## Decision and Scoring
-
-Hypothesis score uses weighted linear model:
-
-`HypothesisScore = w1*OpenTargetsEvidence + w2*DrugActionability + w3*NetworkCentrality + w4*LiteratureSupport`
-
-Weights are derived from two sliders:
-
-- Novelty ↔ Actionability
-- Low safety risk ↔ High novelty tolerance
-
-## Fail-Soft Behavior
-
-If any source degrades, the app continues streaming partial data.
-Source health is tracked in the stepper (`green/yellow/red`), and hypothesis mode still returns outputs with missing-input caveats.
-
-## MCP Repositories and Docs
-
-Required MCP servers:
-
-- OpenTargets MCP Server: https://github.com/Augmented-Nature/OpenTargets-MCP-Server
-- Reactome MCP Server: https://github.com/Augmented-Nature/Reactome-MCP-Server
-- STRING-db MCP Server: https://github.com/Augmented-Nature/STRING-db-MCP-Server
-- ChEMBL MCP Server: https://github.com/Augmented-Nature/ChEMBL-MCP-Server
-- BioMCP: https://github.com/genomoncology/biomcp
-- BioMCP docs: https://biomcp.org
-- Augmented-Nature org index: https://github.com/Augmented-Nature
-
-Primary APIs (credibility + fallbacks):
-
-- Open Targets GraphQL: https://api.platform.opentargets.org/api/v4/graphql
-- Reactome Content Service: https://reactome.org/ContentService/
-- Reactome Content Service docs: https://reactome.org/dev/content-service
-- STRING MCP endpoint (config target): https://mcp.string-db.org/
-- STRING API docs: https://string-db.org/help/api/
-- ChEMBL REST docs: https://chembl.github.io/chembl-restful-web-service-api/
-
-## Credibility Note (Footer Requirement)
-
-- Open Targets GraphQL endpoint: https://api.platform.opentargets.org/api/v4/graphql
-- Reactome Content Service is the current supported API; legacy RESTful API is deprecated.
-
-## Validation Status
-
-Validated locally in this repository:
-
-- `npm --prefix apps/web run lint` ✅
-- `npm --prefix apps/web run build` ✅
-- Chromium automation (Playwright) across 5 diseases ✅
-  - Alzheimer disease
-  - Non-small cell lung cancer
-  - Rheumatoid arthritis
-  - Crohn disease
-  - Acute myeloid leukemia
-  - Full pipeline completion observed on each run with no browser runtime errors
-- Decision brief stream checks across 5 diseases ✅
-  - Canonical disease resolution observed (`MONDO_0004975`, `EFO_0003060`, `EFO_0000685`, `EFO_0000384`, `EFO_0000222`)
-  - `P6: Build complete` status observed in all runs
-- Direct MCP endpoint checks ✅
-  - OpenTargets: `http://127.0.0.1:7010/mcp`
-  - Reactome: `http://127.0.0.1:7020/mcp`
-  - STRING: `http://127.0.0.1:7030/mcp`
-  - ChEMBL: `http://127.0.0.1:7040/mcp`
-  - BioMCP: `http://127.0.0.1:8000/mcp`
-  - Verified by direct tool calls (`search_diseases`, `find_pathways_by_gene`, `get_interaction_network`, `search_targets`, `article_searcher`, `trial_searcher`)
-
-Recent observed timings (balanced mode, February 11, 2026):
-
-- API stream completion across 5 diseases: ~25s to ~29s
-- Typical bottlenecks: P5 (BioMCP literature/trial enrichment), P6 (OpenAI narrative refinement with timeout fallback)
-- Agent discoverer run observed: ~53s end-to-end for a full delegated workflow
-
-Runtime validation with live MCP services depends on your local Docker runtime and API/network availability.
+- Landing-page `Run analysis` enablement is tied to in-page key state; automation needs hydration-aware input handling.
+- End-to-end runtimes increased (deep discoverer now contributes more). Expect several minutes on complex queries.
+- Additional pre-publish hardening still recommended: remove dead code paths, tighten request limits/rate limiting, sanitize logs, and finalize external MCP networking strategy for Vercel.

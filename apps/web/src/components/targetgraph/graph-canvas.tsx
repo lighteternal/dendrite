@@ -55,8 +55,8 @@ const edgeColors: Record<GraphEdge["type"], string> = {
   pathway_drug: "#756de0",
 };
 
-const MIN_ZOOM = 0.34;
-const MAX_ZOOM = 1.9;
+const MIN_ZOOM = 0.42;
+const MAX_ZOOM = 2.05;
 
 type SourceCountMap = Record<EdgeSourceGroup, number>;
 
@@ -301,9 +301,9 @@ export function GraphCanvas({
 
     return new Set<string>([
       ...rankBy("disease", 1, "score"),
-      ...rankBy("target", 6, "score"),
-      ...rankBy("pathway", 4, "degree"),
-      ...rankBy("drug", 4, "degree"),
+      ...rankBy("target", 8, "score"),
+      ...rankBy("pathway", 6, "degree"),
+      ...rankBy("drug", 5, "degree"),
     ]);
   }, [degreeMap, nodes]);
 
@@ -341,7 +341,7 @@ export function GraphCanvas({
           type: node.type,
           label: shortLabel(
             labelSource,
-            node.type === "target" ? 16 : node.type === "pathway" ? 28 : 24,
+            node.type === "target" ? 20 : node.type === "pathway" ? 34 : 28,
           ),
           rawSize: nodeSize(node),
           color: nodeColorFor(node),
@@ -355,6 +355,7 @@ export function GraphCanvas({
       const sourceMeta = EDGE_SOURCE_GROUP_META[sourceGroup];
       const showEdgeLabel =
         activeEdgeSet.has(edge.id) ||
+        (washedEdgeIds?.has(edge.id) ?? false) ||
         (edge.type === "disease_disease" && typeof edge.meta.status === "string") ||
         typeof edge.meta.bridgeType === "string" ||
         (edge.type !== "target_target" && (edge.weight ?? 0) >= 0.92 && nodes.length <= 60);
@@ -424,19 +425,19 @@ export function GraphCanvas({
           height: "data(rawSize)",
           "background-color": "data(color)",
           color: "#2f2c66",
-          "font-size": 11,
+          "font-size": 12,
           "font-family": "var(--font-body)",
           "text-wrap": "wrap",
-          "text-max-width": 124,
-          "min-zoomed-font-size": 7,
+          "text-max-width": 154,
+          "min-zoomed-font-size": 8,
           "text-background-color": "#ffffff",
-          "text-background-opacity": 0.9,
+          "text-background-opacity": 0.94,
           "text-background-shape": "roundrectangle",
-          "text-background-padding": "1.4px",
+          "text-background-padding": "2px",
           "text-border-width": 1,
           "text-border-color": "#d1d5f3",
           "text-border-opacity": 0.85,
-          "text-margin-y": 12,
+          "text-margin-y": 14,
           "text-valign": "bottom",
           "border-width": 1.2,
           "border-color": "#ffffff",
@@ -545,18 +546,18 @@ export function GraphCanvas({
         selector: "node.is-faded",
         style: {
           opacity: 0.28,
-          "text-opacity": 0.24,
+          "text-opacity": 0.42,
         },
       },
       {
         selector: "node.is-washed",
         style: {
           "background-color": "#b7bfd4",
-          opacity: 0.8,
-          "text-opacity": 0.96,
+          opacity: 0.84,
+          "text-opacity": 1,
           "text-border-color": "#aebad1",
-          "text-background-color": "#e5ebf7",
-          color: "#3f4b69",
+          "text-background-color": "#eef2fb",
+          color: "#324262",
         },
       },
       {
@@ -728,7 +729,8 @@ export function GraphCanvas({
         selector: "edge.label-visible",
         style: {
           label: "data(label)",
-          "font-size": 10,
+          "font-size": 11,
+          "min-zoomed-font-size": 7,
           color: "#35417f",
           "text-background-color": "#f3f2ff",
           "text-background-opacity": 0.92,
@@ -758,7 +760,7 @@ export function GraphCanvas({
             animationDuration: 320,
             fit: true,
             padding: 28,
-            spacingFactor: hasMultiRoots ? 1.18 : 1.06,
+            spacingFactor: hasMultiRoots ? 1.1 : 0.98,
             roots: preferredRootIds.length > 0 ? preferredRootIds : undefined,
             avoidOverlap: true,
           }
@@ -767,47 +769,47 @@ export function GraphCanvas({
             animate: true,
             animationDuration: 360,
             fit: true,
-            padding: 28,
+            padding: 22,
             randomize: false,
-            gravity: 0.34,
-            componentSpacing: 58,
+            gravity: 0.46,
+            componentSpacing: 42,
             idealEdgeLength: (edge: { data: (key: string) => string }) => {
               const type = edge.data("type") as GraphEdge["type"];
-              if (type === "disease_target") return 138;
-              if (type === "target_pathway") return 118;
-              if (type === "target_drug") return 112;
-              if (type === "target_target") return 126;
-              return 115;
+              if (type === "disease_target") return 124;
+              if (type === "target_pathway") return 108;
+              if (type === "target_drug") return 98;
+              if (type === "target_target") return 114;
+              return 102;
             },
             nodeRepulsion: (node: { data: (key: string) => string }) => {
               const type = node.data("type") as GraphNode["type"];
-              if (type === "disease") return 145000;
-              if (type === "target") return 98000;
-              return 68000;
+              if (type === "disease") return 128000;
+              if (type === "target") return 88000;
+              return 62000;
             },
           },
     );
 
     layout.on("layoutstop", () => {
-      const padding = nodes.length <= 12 ? 36 : nodes.length <= 40 ? 32 : 26;
+      const padding = nodes.length <= 12 ? 26 : nodes.length <= 40 ? 20 : 16;
       cy.fit(undefined, padding);
       const currentZoom = cy.zoom();
       const maxPreferredZoom =
         nodes.length <= 5
-          ? 0.95
+          ? 1.05
           : nodes.length <= 12
-            ? 1.08
+            ? 1.2
             : nodes.length <= 30
-              ? 1.18
-              : 1.35;
+              ? 1.32
+              : 1.48;
       const minPreferredZoom =
         nodes.length >= 130
-          ? 0.34
+          ? 0.42
           : nodes.length >= 80
-            ? 0.4
+            ? 0.48
             : nodes.length >= 40
-              ? 0.46
-              : 0.52;
+              ? 0.58
+              : 0.66;
       const bounded = Math.max(minPreferredZoom, Math.min(currentZoom, maxPreferredZoom));
       cy.zoom(clampZoom(bounded));
       cy.center();

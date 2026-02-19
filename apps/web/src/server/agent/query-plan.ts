@@ -717,7 +717,7 @@ async function extractMentions(query: string): Promise<{
               {
                 type: "input_text",
                 text:
-                  "Extract resolver-ready biomedical mentions and explicit constraints from the user query. Return only entities that can be resolved with tools; keep language exact; do not invent entities.",
+                  "Extract resolver-ready biomedical mentions and explicit constraints from the user query. Preserve all principal entities explicitly mentioned by the user (including mediator molecules/cytokines, diseases, targets, and interventions) when resolvable. Return only entities that can be resolved with tools; keep language exact; do not invent entities.",
               },
             ],
           },
@@ -1177,6 +1177,27 @@ function deriveFollowups(anchors: QueryPlanAnchor[], constraints: QueryPlanConst
   const diseases = anchors.filter((item) => item.entityType === "disease");
   const targets = anchors.filter((item) => item.entityType === "target");
   const drugs = anchors.filter((item) => item.entityType === "drug");
+  const principalAnchors = anchors.slice(0, 4);
+
+  if (principalAnchors.length >= 2) {
+    let pairCount = 0;
+    for (let leftIndex = 0; leftIndex < principalAnchors.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < principalAnchors.length; rightIndex += 1) {
+        const left = principalAnchors[leftIndex];
+        const right = principalAnchors[rightIndex];
+        if (!left || !right) continue;
+        addFollowup(
+          followups,
+          `Test mechanistic bridge evidence between ${left.name} and ${right.name}.`,
+          "Multi-anchor query detected; preserve explicit anchor pairs during exploration.",
+          [left.id, right.id],
+        );
+        pairCount += 1;
+        if (pairCount >= 3) break;
+      }
+      if (pairCount >= 3) break;
+    }
+  }
 
   if (diseases.length >= 2) {
     addFollowup(

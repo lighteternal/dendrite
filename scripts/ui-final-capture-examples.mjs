@@ -67,13 +67,27 @@ async function setSessionApiKey() {
 async function waitForDone(page, maxMs) {
   const started = Date.now();
   let lastText = "";
+  let sawRunningState = false;
   while (Date.now() - started < maxMs) {
     const text = await page.locator("body").innerText();
     lastText = text;
     const buildDone = /Build complete/i.test(text);
-    const hasFinal = /Agent scientific answer/i.test(text) || /No conclusive mechanism identified/i.test(text);
+    const hasFinal =
+      /Agent scientific answer/i.test(text) ||
+      /No conclusive mechanism identified/i.test(text) ||
+      /No decisive thread yet/i.test(text);
     const inProgress = /Answer in progress/i.test(text);
-    if (buildDone && (hasFinal || !inProgress)) {
+    const interruptEnabled = await page
+      .getByRole("button", { name: /^Interrupt$/i })
+      .isEnabled()
+      .catch(() => false);
+    if (interruptEnabled || inProgress || /Execution log/i.test(text)) {
+      sawRunningState = true;
+    }
+    if (
+      (sawRunningState && hasFinal && !interruptEnabled) ||
+      (buildDone && !inProgress)
+    ) {
       return { done: true, elapsedMs: Date.now() - started, text };
     }
     await page.waitForTimeout(2000);

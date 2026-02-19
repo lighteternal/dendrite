@@ -15,6 +15,39 @@ const SAMPLE_QUERIES = [
 ] as const;
 
 const LIVE_WORDS = ["live.", "discover.", "answer evidence-first."] as const;
+const CONNECTED_MCP_TOOLS = [
+  { key: "opentargets", label: "OpenTargets MCP" },
+  { key: "reactome", label: "Reactome MCP" },
+  { key: "string", label: "STRING MCP" },
+  { key: "chembl", label: "ChEMBL MCP" },
+  { key: "biomcp", label: "BioMCP" },
+  { key: "pubmed", label: "PubMed MCP" },
+  { key: "medical", label: "Medical MCP" },
+] as const;
+
+type ToolHealthState = "loading" | "green" | "red";
+
+type ToolHealthMap = Record<
+  (typeof CONNECTED_MCP_TOOLS)[number]["key"],
+  {
+    state: ToolHealthState;
+    detail: string;
+    latencyMs: number | null;
+  }
+>;
+
+function initialToolHealthMap(): ToolHealthMap {
+  return Object.fromEntries(
+    CONNECTED_MCP_TOOLS.map((tool) => [
+      tool.key,
+      {
+        state: "loading",
+        detail: "Health probe pending",
+        latencyMs: null,
+      },
+    ]),
+  ) as ToolHealthMap;
+}
 
 export function LandingPage() {
   const router = useRouter();
@@ -26,6 +59,8 @@ export function LandingPage() {
   const [liveWordIndex, setLiveWordIndex] = useState(0);
   const [typedLiveWord, setTypedLiveWord] = useState("");
   const [isDeletingLiveWord, setIsDeletingLiveWord] = useState(false);
+  const [toolHealth, setToolHealth] = useState<ToolHealthMap>(() => initialToolHealthMap());
+  const [toolHealthCheckedAt, setToolHealthCheckedAt] = useState<string | null>(null);
 
   useEffect(() => {
     const currentWord = LIVE_WORDS[liveWordIndex] ?? LIVE_WORDS[0];
@@ -52,6 +87,84 @@ export function LandingPage() {
 
     return () => clearTimeout(timer);
   }, [isDeletingLiveWord, liveWordIndex, typedLiveWord]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadHealth = async (refresh = false) => {
+      try {
+        const response = await fetch(
+          refresh ? "/api/mcpHealth?refresh=1" : "/api/mcpHealth",
+          {
+            cache: "no-store",
+          },
+        );
+        if (!response.ok) {
+          throw new Error(`health request failed (${response.status})`);
+        }
+        const payload = (await response.json()) as {
+          checkedAt?: unknown;
+          tools?: Array<{
+            key?: unknown;
+            state?: unknown;
+            detail?: unknown;
+            latencyMs?: unknown;
+          }>;
+        };
+        if (cancelled) return;
+
+        const next = initialToolHealthMap();
+        for (const row of payload.tools ?? []) {
+          const key = String(row.key ?? "") as keyof ToolHealthMap;
+          if (!(key in next)) continue;
+          next[key] = {
+            state: row.state === "green" ? "green" : "red",
+            detail:
+              typeof row.detail === "string" && row.detail.trim().length > 0
+                ? row.detail
+                : row.state === "green"
+                  ? "Probe succeeded"
+                  : "Probe failed",
+            latencyMs:
+              typeof row.latencyMs === "number" && Number.isFinite(row.latencyMs)
+                ? Math.max(0, Math.round(row.latencyMs))
+                : null,
+          };
+        }
+
+        setToolHealth(next);
+        setToolHealthCheckedAt(
+          typeof payload.checkedAt === "string" ? payload.checkedAt : new Date().toISOString(),
+        );
+      } catch {
+        if (cancelled) return;
+        setToolHealth((current) => {
+          const next = { ...current };
+          for (const tool of CONNECTED_MCP_TOOLS) {
+            const currentState = next[tool.key];
+            if (currentState.state === "loading") {
+              next[tool.key] = {
+                state: "red",
+                detail: "Health probe unavailable",
+                latencyMs: null,
+              };
+            }
+          }
+          return next;
+        });
+      }
+    };
+
+    void loadHealth();
+    const interval = window.setInterval(() => {
+      void loadHealth(true);
+    }, 120_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   const hasApiKey = apiKey.trim().length > 0;
   const canRun = query.trim().length >= 6 && hasApiKey;
@@ -210,16 +323,39 @@ export function LandingPage() {
                 Synthesis
               </div>
             ) : (
-              <div className="flex flex-wrap gap-1.5 px-3 py-3 text-[11px]">
-                {["OpenTargets", "Reactome", "ChEMBL", "STRING", "BioMCP", "PubMed"].map((toolName) => (
-                  <span
-                    key={toolName}
-                    className="rounded-full border border-[#d6e5f3] bg-white px-2.5 py-1 text-[#48698f]"
-                  >
-                    {toolName}
-                  </span>
-                ))}
-              </div>
+              <>
+                <div className="flex flex-wrap gap-1.5 px-3 py-3 text-[11px]">
+                  {CONNECTED_MCP_TOOLS.map((tool) => {
+                    const health = toolHealth[tool.key];
+                    const dotClass =
+                      health.state === "green"
+                        ? "bg-emerald-500"
+                        : health.state === "red"
+                          ? "bg-rose-500"
+                          : "bg-slate-300";
+                    const title =
+                      health.latencyMs !== null
+                        ? `${health.detail} (${health.latencyMs}ms)`
+                        : health.detail;
+                    return (
+                      <span
+                        key={tool.key}
+                        title={title}
+                        className="inline-flex items-center gap-1.5 rounded-full border border-[#d6e5f3] bg-white px-2.5 py-1 text-[#48698f]"
+                      >
+                        <span className={`h-2 w-2 rounded-full ${dotClass}`} />
+                        {tool.label}
+                      </span>
+                    );
+                  })}
+                </div>
+                <div className="px-3 pb-3 text-[10px] text-[#5e7698]">
+                  Green = responding. Red = probe failed.
+                  {toolHealthCheckedAt
+                    ? ` Last check: ${new Date(toolHealthCheckedAt).toLocaleTimeString()}.`
+                    : ""}
+                </div>
+              </>
             )}
           </div>
         </header>

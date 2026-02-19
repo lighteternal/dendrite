@@ -13,6 +13,7 @@ import {
 } from "@/server/telemetry";
 
 export const runtime = "nodejs";
+export const maxDuration = 800;
 
 const encoder = new TextEncoder();
 

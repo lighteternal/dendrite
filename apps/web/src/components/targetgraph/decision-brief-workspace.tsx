@@ -235,6 +235,97 @@ function linkInlineCitationMarkers(
   });
 }
 
+const ANSWER_SECTION_HEADING_PATTERN =
+  /^(?:[-*]\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?\s*((?:working\s+conclusion(?:\s+and\s+practical\s+next\s+step)?|direct\s+answer|conclusion|evidence\s+synthesis|evidence\s+summary|mechanistic\s+support|biological\s+interpretation|interpretation|self[-\s]*critique(?:\s+and\s+correction)?|critique\s+and\s+correction|alignment\s+check|what\s+to\s+test\s+next|next\s+experiments?|next\s+actions?|experiment\s+plan|residual\s+uncertainty|what\s+remains\s+uncertain|uncertainty))[^:]*\s*(?:\*\*|__)?\s*:?\s*(.*)$/i;
+
+function canonicalAnswerSectionHeading(label: string): string | null {
+  const normalized = label
+    .trim()
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ");
+  if (
+    normalized.startsWith("working conclusion") ||
+    normalized.startsWith("direct answer") ||
+    normalized.startsWith("conclusion")
+  ) {
+    return "Working conclusion";
+  }
+  if (
+    normalized.startsWith("evidence synthesis") ||
+    normalized.startsWith("evidence summary") ||
+    normalized.startsWith("mechanistic support")
+  ) {
+    return "Evidence synthesis";
+  }
+  if (normalized.startsWith("biological interpretation") || normalized === "interpretation") {
+    return "Biological interpretation";
+  }
+  if (
+    normalized.startsWith("what to test next") ||
+    normalized.startsWith("next experiments") ||
+    normalized.startsWith("next actions") ||
+    normalized.startsWith("experiment plan")
+  ) {
+    return "What to test next";
+  }
+  if (
+    normalized.startsWith("residual uncertainty") ||
+    normalized.startsWith("what remains uncertain") ||
+    normalized.startsWith("uncertainty")
+  ) {
+    return "Residual uncertainty";
+  }
+  if (
+    normalized.startsWith("self critique") ||
+    normalized.startsWith("self-critique") ||
+    normalized.startsWith("critique and correction") ||
+    normalized.startsWith("alignment check")
+  ) {
+    return "Internal critique";
+  }
+  return null;
+}
+
+function normalizeAnswerMarkdownForRender(text: string): string {
+  if (!text) return text;
+  let normalized = text.replace(/\r/g, "");
+  const escapedNewlineCount = (normalized.match(/\\n/g) ?? []).length;
+  const realNewlineCount = (normalized.match(/\n/g) ?? []).length;
+  if (escapedNewlineCount >= 2 && realNewlineCount <= 1) {
+    normalized = normalized
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "  ");
+  }
+  normalized = normalized.replace(/\\u2022/g, "•");
+  const lines = normalized
+    .replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n\n$2")
+    .split("\n");
+  const rebuilt: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const match = trimmed.match(ANSWER_SECTION_HEADING_PATTERN);
+    if (!match) {
+      rebuilt.push(line);
+      continue;
+    }
+    const heading = canonicalAnswerSectionHeading(match[1] ?? "");
+    if (!heading) {
+      rebuilt.push(line);
+      continue;
+    }
+    if (heading === "Internal critique") {
+      continue;
+    }
+    const inlineContent = (match[2] ?? "").trim();
+    rebuilt.push(`### ${heading}`);
+    if (inlineContent.length > 0) rebuilt.push(inlineContent);
+  }
+  return rebuilt.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function MarkdownAnswer({
   text,
   className,
@@ -244,9 +335,10 @@ function MarkdownAnswer({
   className?: string;
   citationIndices?: ReadonlySet<number>;
 }) {
+  const normalizedText = useMemo(() => normalizeAnswerMarkdownForRender(text), [text]);
   const linkedText = useMemo(
-    () => linkInlineCitationMarkers(text, citationIndices ?? new Set<number>()),
-    [citationIndices, text],
+    () => linkInlineCitationMarkers(normalizedText, citationIndices ?? new Set<number>()),
+    [citationIndices, normalizedText],
   );
 
   return (
@@ -254,10 +346,24 @@ function MarkdownAnswer({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          h1: ({ children }) => (
+            <h1 className="mb-2 mt-3 text-[15px] font-semibold text-[#33457a] first:mt-0">{children}</h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="mb-2 mt-3 text-[14px] font-semibold text-[#33457a] first:mt-0">{children}</h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="mb-1.5 mt-3 text-[12px] font-semibold uppercase tracking-[0.08em] text-[#42508a] first:mt-0">
+              {children}
+            </h3>
+          ),
           p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
           ul: ({ children }) => <ul className="mb-2 list-disc space-y-1 pl-5 last:mb-0">{children}</ul>,
           ol: ({ children }) => <ol className="mb-2 list-decimal space-y-1 pl-5 last:mb-0">{children}</ol>,
           li: ({ children }) => <li>{children}</li>,
+          blockquote: ({ children }) => (
+            <blockquote className="mb-2 border-l-2 border-[#d4d8f4] pl-3 text-[#556395]">{children}</blockquote>
+          ),
           strong: ({ children }) => <strong className="font-semibold text-[#33457a]">{children}</strong>,
           em: ({ children }) => <em className="italic">{children}</em>,
           code: ({ children }) => (
@@ -1491,7 +1597,7 @@ export function DecisionBriefWorkspace({
                   <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
                     <div className="font-semibold text-[#47429d]">
                       {hasAgentFinalAnswer
-                        ? "Agent scientific answer"
+                        ? "Final answer"
                         : `${verdictHeadingTarget} in ${verdictHeadingPathway}`}
                     </div>
                     <MarkdownAnswer

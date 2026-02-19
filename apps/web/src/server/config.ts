@@ -118,6 +118,7 @@ export const appConfig = {
     string: process.env.STRING_MCP_URL ?? "http://localhost:7030/mcp",
     chembl: process.env.CHEMBL_MCP_URL ?? "http://localhost:7040/mcp",
     biomcp: process.env.BIOMCP_URL ?? "http://localhost:8000/mcp",
+    medical: process.env.MEDICAL_MCP_URL ?? "http://localhost:7060/mcp",
     pubmed:
       process.env.PUBMED_MCP_URL ??
       process.env.BIOMCP_URL ??

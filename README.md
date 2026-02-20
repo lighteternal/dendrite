@@ -1,4 +1,4 @@
-# Dendrite
+# <img src="dendrite.png" alt="Dendrite logo" width="34" valign="middle" /> Dendrite
 
 Dendrite is an agentic biomedical discovery app that turns a free-text question into a live, explorable mechanism-hypothesis graph and an evidence-grounded synthesis.
 

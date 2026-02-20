@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Search } from "lucide-react";
+import { ArrowRight, Github, Linkedin, Search } from "lucide-react";
 import { LandingMoleculeBackground } from "@/components/dendrite/landing-molecule-background";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,8 @@ import {
 import { EXAMPLE_REPLAY_OPTIONS } from "@/lib/example-replay";
 
 const SAMPLE_QUERIES = EXAMPLE_REPLAY_OPTIONS.map((option) => option.query);
+const GITHUB_URL = "https://github.com/lighteternal/dendrite";
+const LINKEDIN_URL = "https://www.linkedin.com/in/dimitris-papadopoulos/";
 
 const LIVE_WORDS = ["live.", "as evidence arrives.", "hypothesis-by-hypothesis."] as const;
 const AGENT_SEQUENCE = [
@@ -495,8 +497,30 @@ export function LandingPage() {
           </div>
         </section>
 
-        <footer className="border-t border-[#d8e5f3] pt-4 text-[11px] text-[#5f7598]">
-          Preclinical evidence synthesis only; not for clinical decision-making.
+        <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-[#d8e5f3] pt-4 text-[11px] text-[#5f7598]">
+          <span>Preclinical evidence synthesis only; not for clinical decision-making.</span>
+          <div className="flex items-center gap-2">
+            <a
+              href={GITHUB_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Dendrite on GitHub"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-[#d2deeb] bg-white/80 text-[#617694] transition-colors hover:text-[#111827] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea8cd]"
+              title="GitHub"
+            >
+              <Github className="h-4 w-4" />
+            </a>
+            <a
+              href={LINKEDIN_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Dimitris Papadopoulos on LinkedIn"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-[#d2deeb] bg-white/80 text-[#617694] transition-colors hover:text-[#111827] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea8cd]"
+              title="LinkedIn"
+            >
+              <Linkedin className="h-4 w-4" />
+            </a>
+          </div>
         </footer>
       </div>
     </main>

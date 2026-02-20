@@ -87,15 +87,35 @@ const INTERNAL_STREAM_CONNECT_TIMEOUT_MS = 35_000;
 const SESSION_RUN_STALE_MS = 15 * 60 * 1000;
 const SESSION_API_KEY_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_JOURNEY_EVENTS = 300;
-const RUN_HARD_BUDGET_MS = 10 * 60 * 1000;
-const FINALIZATION_RESERVE_MS = 90_000;
-const DISCOVERER_TIMEOUT_MS = Math.max(
-  120_000,
+const RUN_HARD_BUDGET_LIMIT_MS = 10 * 60 * 1000;
+const RUN_HARD_BUDGET_MS = Math.max(
+  180_000,
+  Math.min(RUN_HARD_BUDGET_LIMIT_MS, appConfig.run.hardBudgetMs),
+);
+const FINALIZATION_RESERVE_MS = Math.max(
+  60_000,
+  Math.min(
+    appConfig.run.finalizationReserveMs,
+    180_000,
+    Math.max(60_000, RUN_HARD_BUDGET_MS - 30_000),
+  ),
+);
+const DISCOVERER_TIMEOUT_CEILING_MS = Math.max(
+  90_000,
   RUN_HARD_BUDGET_MS - FINALIZATION_RESERVE_MS,
 );
-const MAX_DISCOVERER_FINAL_WAIT_MS = 150_000;
-const FALLBACK_SYNTHESIS_TIMEOUT_MS = 120_000;
-const FINAL_GROUNDING_TIMEOUT_MS = 120_000;
+const MAX_DISCOVERER_FINAL_WAIT_MS = Math.max(
+  30_000,
+  Math.min(appConfig.run.discovererFinalWaitMs, FINALIZATION_RESERVE_MS),
+);
+const FALLBACK_SYNTHESIS_TIMEOUT_MS = Math.max(
+  20_000,
+  appConfig.run.fallbackSynthesisTimeoutMs,
+);
+const FINAL_GROUNDING_TIMEOUT_MS = Math.max(
+  20_000,
+  appConfig.run.finalGroundingTimeoutMs,
+);
 
 type FinalBriefSnapshot = {
   recommendation?: {
@@ -679,9 +699,30 @@ async function fetchInternalStream(
   throw lastError instanceof Error ? lastError : new Error("streamGraph unavailable");
 }
 
-function mapBaselineProgress(rawPct: number): number {
+const BASELINE_PHASE_PROGRESS_BANDS: Record<
+  string,
+  { start: number; end: number }
+> = {
+  P0: { start: 2, end: 10 },
+  P1: { start: 10, end: 30 },
+  P2: { start: 30, end: 48 },
+  P3: { start: 48, end: 64 },
+  P4: { start: 64, end: 76 },
+  P5: { start: 76, end: 88 },
+  P6: { start: 88, end: 90 },
+};
+
+function mapBaselineProgress(
+  phase: string,
+  rawPct: number,
+  previousPct = 2,
+): number {
   const clamped = Math.max(0, Math.min(100, Number(rawPct) || 0));
-  return Math.max(2, Math.min(84, Math.round((clamped / 100) * 84)));
+  const band = BASELINE_PHASE_PROGRESS_BANDS[phase] ?? { start: 2, end: 88 };
+  const ratio = clamped / 100;
+  const mapped = Math.round(band.start + (band.end - band.start) * ratio);
+  const bounded = Math.max(2, Math.min(88, mapped));
+  return Math.max(previousPct, bounded);
 }
 
 function compactText(value: string, max = 110): string {
@@ -1075,6 +1116,76 @@ function countWordsInText(value: string): number {
     .filter(Boolean).length;
 }
 
+function splitTextIntoSentences(value: string): string[] {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return [];
+
+  const SegmenterCtor = (
+    globalThis as {
+      Intl?: {
+        Segmenter?: new (
+          locales?: string | string[],
+          options?: { granularity?: "grapheme" | "word" | "sentence" },
+        ) => {
+          segment: (input: string) => Iterable<{ segment: string }>;
+        };
+      };
+    }
+  ).Intl?.Segmenter;
+
+  if (SegmenterCtor) {
+    try {
+      const segmenter = new SegmenterCtor("en", { granularity: "sentence" });
+      const segments = Array.from(segmenter.segment(normalized))
+        .map((item) => item.segment.trim())
+        .filter(Boolean);
+      if (segments.length > 0) return segments;
+    } catch {
+      // fallback regex below
+    }
+  }
+
+  return (
+    normalized.match(/[^.!?]+[.!?](?:\s*\[\d+\])*/g)?.map((item) => item.trim()).filter(Boolean) ??
+    [normalized]
+  );
+}
+
+function trimProseToSentenceBudget(value: string, maxWords: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (countWordsInText(normalized) <= maxWords) return normalized;
+
+  const sentences = splitTextIntoSentences(normalized);
+  if (sentences.length === 0) return truncateWords(normalized, maxWords);
+
+  const softCapWords = Math.max(maxWords, Math.round(maxWords * 1.22));
+  const selected: string[] = [];
+  let used = 0;
+  for (const sentence of sentences) {
+    const sentenceWords = countWordsInText(sentence);
+    if (sentenceWords === 0) continue;
+
+    if (selected.length === 0) {
+      if (sentenceWords <= softCapWords) {
+        selected.push(sentence);
+        used = sentenceWords;
+        continue;
+      }
+      return truncateWords(sentence, maxWords);
+    }
+
+    if (used + sentenceWords > maxWords) {
+      break;
+    }
+    selected.push(sentence);
+    used += sentenceWords;
+  }
+
+  if (selected.length === 0) return truncateWords(normalized, maxWords);
+  return selected.join(" ").replace(/\s+/g, " ").trim();
+}
+
 function trimSectionToWordBudget(section: string, maxWords: number): string {
   const budget = Math.max(1, maxWords);
   const lines = section
@@ -1083,29 +1194,29 @@ function trimSectionToWordBudget(section: string, maxWords: number): string {
     .filter((line) => line.trim().length > 0);
   if (lines.length === 0) return "";
 
+  const hasBullets = lines.some((line) => /^[-*]\s+/.test(line));
+  if (!hasBullets) {
+    return trimProseToSentenceBudget(lines.join(" "), budget);
+  }
+
   const selected: string[] = [];
   let used = 0;
   for (const line of lines) {
     const stripped = line.replace(/^[-*]\s+/, "").trim();
-    const words = countWordsInText(stripped);
-    if (words === 0) continue;
-    if (used + words <= budget) {
-      selected.push(line);
-      used += words;
-      continue;
-    }
+    if (!stripped) continue;
     const remaining = budget - used;
     if (remaining <= 0) break;
-    const trimmed = truncateWords(stripped, remaining);
-    if (!trimmed) break;
-    const prefix = /^[-*]\s+/.test(line) ? "- " : "";
-    selected.push(`${prefix}${trimmed}`);
-    used = budget;
-    break;
+    const trimmed = trimProseToSentenceBudget(stripped, remaining);
+    const words = countWordsInText(trimmed);
+    if (!trimmed || words === 0) continue;
+    if (selected.length > 0 && used + words > budget) break;
+    selected.push(`- ${trimmed}`);
+    used += words;
+    if (used >= budget) break;
   }
 
   const merged = selected.join("\n").trim();
-  if (!merged) return truncateWords(lines.join(" "), budget);
+  if (!merged) return trimProseToSentenceBudget(lines.join(" "), budget);
   return merged;
 }
 
@@ -1185,6 +1296,15 @@ function normalizeAnswerEnding(text: string): string {
   if (/[.!?](?:\s*\[\d+\])*\s*$/.test(normalized)) {
     return normalized;
   }
+  const punctuationMatches = [...normalized.matchAll(/[.!?](?:\s*\[\d+\])*/g)];
+  if (punctuationMatches.length > 0) {
+    const last = punctuationMatches[punctuationMatches.length - 1];
+    const boundary = (last.index ?? 0) + last[0].length;
+    const tail = normalized.slice(boundary).trim();
+    if (tail && countWordsInText(tail) <= 14) {
+      return normalized.slice(0, boundary).trim();
+    }
+  }
   return `${normalized}.`;
 }
 
@@ -1245,8 +1365,29 @@ function normalizeCitationMarkersAgainstLedger(
 }
 
 function truncateWords(text: string, maxWords: number): string {
-  const words = text.trim().split(/\s+/).filter(Boolean);
-  if (words.length <= maxWords) return text.trim();
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return normalized;
+
+  const sentences = splitTextIntoSentences(normalized);
+  if (sentences.length > 1) {
+    const selectedSentences: string[] = [];
+    let used = 0;
+    for (const sentence of sentences) {
+      const sentenceWords = countWordsInText(sentence);
+      if (sentenceWords === 0) continue;
+      if (selectedSentences.length === 0 && sentenceWords > maxWords) break;
+      if (used + sentenceWords > maxWords) break;
+      selectedSentences.push(sentence);
+      used += sentenceWords;
+    }
+    if (selectedSentences.length > 0) {
+      return selectedSentences.join(" ").replace(/\s+/g, " ").trim();
+    }
+  }
+
   let selected = words.slice(0, maxWords);
   while (
     selected.length > 8 &&
@@ -1312,14 +1453,35 @@ function capUncertaintySection(
     .trim();
   if (!normalized) return `${before}\n\n${heading}`;
 
-  const sentenceMatches =
-    normalized.match(/[^.!?]+[.!?](?:\s*\[\d+\])*/g)?.map((item) => item.trim()).filter(Boolean) ??
-    [];
+  const sentenceMatches = splitTextIntoSentences(normalized);
+  const selected: string[] = [];
+  let used = 0;
+  const softCap = Math.max(maxWords, Math.round(maxWords * 1.2));
+  for (const sentence of sentenceMatches) {
+    if (selected.length >= maxSentences) break;
+    const words = countWordsInText(sentence);
+    if (words === 0) continue;
 
-  const selected =
-    sentenceMatches.length > 0
-      ? sentenceMatches.slice(0, maxSentences)
-      : [truncateWords(normalized, maxWords)];
+    if (selected.length === 0 && words > maxWords && words <= softCap) {
+      selected.push(sentence.trim());
+      used = words;
+      continue;
+    }
+    if (used + words > maxWords) {
+      if (selected.length === 0) {
+        const fallback = trimProseToSentenceBudget(sentence, maxWords);
+        if (fallback) selected.push(fallback);
+      }
+      break;
+    }
+    selected.push(sentence.trim());
+    used += words;
+  }
+
+  if (selected.length === 0) {
+    const fallback = trimProseToSentenceBudget(normalized, maxWords);
+    return `${before}\n\n${heading}\n${fallback}`.trim();
+  }
 
   return `${before}\n\n${heading}\n${selected.join(" ")}`.trim();
 }
@@ -4307,10 +4469,12 @@ export async function GET(request: NextRequest) {
       let lastRecommendationSignature = "";
       let lastProvisionalEmitMs = 0;
       let lastAgentStepSignature = "";
+      let lastForwardedBaselinePct = 2;
       let preStreamHeartbeatMessage = "Resolving biomedical anchors";
       let preStreamHeartbeatPct = 2;
       let preStreamHeartbeat: ReturnType<typeof setInterval> | null = null;
       let discovererPromise: Promise<DiscovererFinal | null> | null = null;
+      let discovererTimeoutMs = 0;
       let discovererFinal: DiscovererFinal | null = null;
       let discovererAnswerEmitted = false;
       let journeyEventCount = 0;
@@ -4949,42 +5113,60 @@ export async function GET(request: NextRequest) {
           ],
         });
 
-        discovererPromise = withTimeout(
-          runDeepDiscoverer({
-            diseaseQuery: chosen.selected.name,
-            diseaseIdHint: chosen.selected.id,
-            question: query,
-            emitJourney,
-          }),
-          DISCOVERER_TIMEOUT_MS,
-        )
-          .then((final) => {
-            discovererFinal = final;
-            return final;
-          })
-          .catch((error) => {
-            const message =
-              error instanceof Error ? error.message : "agent discoverer failed";
-            warnRequestLog(log, "run_case.agent_discoverer_failed", {
-              message,
+        discovererTimeoutMs = boundedStageTimeoutMs(
+          startedAt,
+          DISCOVERER_TIMEOUT_CEILING_MS,
+          {
+            reserveMs: FINALIZATION_RESERVE_MS,
+            minMs: 30_000,
+          },
+        );
+        if (discovererTimeoutMs > 0) {
+          discovererPromise = withTimeout(
+            runDeepDiscoverer({
+              diseaseQuery: chosen.selected.name,
+              diseaseIdHint: chosen.selected.id,
+              question: query,
+              emitJourney,
+            }),
+            discovererTimeoutMs,
+          )
+            .then((final) => {
+              discovererFinal = final;
+              return final;
+            })
+            .catch((error) => {
+              const message =
+                error instanceof Error ? error.message : "agent discoverer failed";
+              warnRequestLog(log, "run_case.agent_discoverer_failed", {
+                message,
+                discovererTimeoutMs,
+              });
+              emit("run_error", {
+                phase: "agent_discoverer",
+                message,
+                recoverable: true,
+              });
+              emit("narration_delta", {
+                id: `run-${runId}-agent-warning`,
+                ts: new Date().toISOString(),
+                kind: "warning",
+                title: "Agent branch degraded",
+                detail: message,
+                source: "agent",
+                pathState: "candidate",
+                entities: [],
+              });
+              return null;
             });
-            emit("run_error", {
-              phase: "agent_discoverer",
-              message,
-              recoverable: true,
-            });
-            emit("narration_delta", {
-              id: `run-${runId}-agent-warning`,
-              ts: new Date().toISOString(),
-              kind: "warning",
-              title: "Agent branch degraded",
-              detail: message,
-              source: "agent",
-              pathState: "candidate",
-              entities: [],
-            });
-            return null;
+        } else {
+          emit("run_error", {
+            phase: "agent_discoverer",
+            message:
+              "Time budget reserved for final synthesis; skipping deep discoverer branch expansion.",
+            recoverable: true,
           });
+        }
 
         const plannedTargetSeeds = [
           ...(resolvedQueryPlan?.anchors ?? [])
@@ -5159,6 +5341,20 @@ export async function GET(request: NextRequest) {
             await reader.cancel().catch(() => undefined);
             break;
           }
+          if (!internalDoneReceived && remainingRunBudgetMs(startedAt, FINALIZATION_RESERVE_MS) <= 0) {
+            emit("run_error", {
+              phase: "stream_graph",
+              message:
+                "Exploration budget reached. Finalizing answer from accumulated evidence before hard timeout.",
+              recoverable: true,
+            });
+            warnRequestLog(log, "run_case.exploration_budget_reached", {
+              elapsedMs: Date.now() - startedAt,
+              reserveMs: FINALIZATION_RESERVE_MS,
+            });
+            await reader.cancel().catch(() => undefined);
+            break;
+          }
           const { value, done } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
@@ -5179,7 +5375,21 @@ export async function GET(request: NextRequest) {
                 const status = payload as CaseStatusEvent;
                 sourceHealth = status.sourceHealth ?? sourceHealth;
                 const pct = Math.max(0, Math.min(100, Number(status.pct) || 0));
-                const forwardedPct = pct >= 100 ? 84 : mapBaselineProgress(pct);
+                const forwardedPct =
+                  pct >= 100
+                    ? Math.max(
+                        lastForwardedBaselinePct,
+                        BASELINE_PHASE_PROGRESS_BANDS[status.phase]?.end ?? 88,
+                      )
+                    : mapBaselineProgress(
+                        status.phase,
+                        pct,
+                        lastForwardedBaselinePct,
+                      );
+                lastForwardedBaselinePct = Math.max(
+                  lastForwardedBaselinePct,
+                  forwardedPct,
+                );
                 const forwardedMessage =
                   pct >= 100
                     ? "Baseline graph build complete; consolidating evidence and generating final answer"
@@ -5968,7 +6178,7 @@ export async function GET(request: NextRequest) {
                 emit("status", {
                   phase: "P6",
                   message: "Consolidating evidence coverage and scoring mechanism threads",
-                  pct: 80,
+                  pct: 90,
                   elapsedMs: Date.now() - startedAt,
                   partial: true,
                   counts: {
@@ -5983,7 +6193,7 @@ export async function GET(request: NextRequest) {
                 emit("status", {
                   phase: "P6",
                   message: "Compiling citation ledger and preparing scientific synthesis",
-                  pct: 84,
+                  pct: 92,
                   elapsedMs: Date.now() - startedAt,
                   partial: true,
                   counts: {
@@ -5997,7 +6207,7 @@ export async function GET(request: NextRequest) {
                   emit("status", {
                     phase: "P6",
                     message: "Generating final scientific answer from mapped evidence",
-                    pct: 86,
+                    pct: 94,
                     elapsedMs: Date.now() - startedAt,
                     partial: true,
                     counts: {
@@ -6008,36 +6218,43 @@ export async function GET(request: NextRequest) {
                   });
 
                   const synthesisStartedAt = Date.now();
-                  const synthesisBudgetMs = boundedStageTimeoutMs(
-                    startedAt,
-                    MAX_DISCOVERER_FINAL_WAIT_MS,
-                    {
-                      reserveMs: 22_000,
-                      minMs: 30_000,
-                    },
-                  );
                   const synthesisProgressWindowMs = Math.max(
-                    45_000,
-                    Math.min(3 * 60 * 1000, synthesisBudgetMs || 45_000),
+                    90_000,
+                    remainingRunBudgetMs(startedAt, 12_000),
                   );
+                  let lastSynthesisPct = 94;
                   const synthesisHeartbeat = setInterval(() => {
                     if (streamState.closed || streamAbort.signal.aborted) return;
                     const elapsed = Math.max(0, Date.now() - synthesisStartedAt);
                     const remainingBudgetMs = remainingRunBudgetMs(startedAt, 0);
-                    const waitingSeconds = Math.floor(elapsed / 1000);
-                    const ratio = Math.min(0.99, elapsed / synthesisProgressWindowMs);
-                    const pct = Math.max(
-                      86,
-                      Math.min(98, 86 + Math.floor(ratio * 13)),
+                    const ratio = Math.min(
+                      1,
+                      elapsed / Math.max(90_000, synthesisProgressWindowMs),
                     );
+                    let pct = Math.max(
+                      lastSynthesisPct,
+                      Math.min(99, 94 + Math.floor(ratio * 5)),
+                    );
+                    if (remainingBudgetMs <= 90_000) {
+                      pct = Math.max(pct, 98);
+                    }
+                    if (remainingBudgetMs <= 30_000) {
+                      pct = Math.max(pct, 99);
+                    }
+                    if (pct >= 99 && remainingBudgetMs > 45_000) {
+                      pct = 98;
+                    }
+                    lastSynthesisPct = pct;
                     emit("status", {
                       phase: "P6",
                       message:
-                        remainingBudgetMs <= 90_000
-                          ? "Approaching run budget; finalizing with current evidence and citations"
-                          : waitingSeconds >= Math.floor(synthesisProgressWindowMs / 1000) * 0.6
-                          ? "Synthesis still running; validating thread quality and caveats"
-                          : "Synthesis running; assembling mechanism rationale and caveats",
+                        remainingBudgetMs <= 35_000
+                          ? "Finalizing answer and citations within run budget"
+                          : ratio >= 0.82
+                            ? "Validating synthesis consistency and inline citations"
+                            : ratio >= 0.45
+                              ? "Refining mechanism narrative and ranking evidence support"
+                              : "Synthesizing answer from the active evidence graph",
                       pct,
                       elapsedMs: Date.now() - startedAt,
                       partial: true,
@@ -6047,12 +6264,15 @@ export async function GET(request: NextRequest) {
                       },
                       sourceHealth,
                     });
-                  }, 5000);
+                  }, 3000);
 
                   try {
                     const discovererWaitBudgetMs = boundedStageTimeoutMs(
                       startedAt,
-                      DISCOVERER_TIMEOUT_MS - 5_000,
+                      Math.max(
+                        25_000,
+                        (discovererTimeoutMs || DISCOVERER_TIMEOUT_CEILING_MS) - 5_000,
+                      ),
                       {
                         reserveMs: 24_000,
                         minMs: 25_000,

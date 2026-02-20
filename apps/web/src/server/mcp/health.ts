@@ -16,12 +16,16 @@ export type McpHealthKey =
   | "pubmed"
   | "medical";
 
-export type McpHealthState = "green" | "red";
+export type McpHealthState = "green" | "yellow" | "red";
+export type McpHealthLiveness = "up" | "down";
+export type McpHealthCapability = "ok" | "degraded" | "failed";
 
 export type McpHealthRow = {
   key: McpHealthKey;
   label: string;
   state: McpHealthState;
+  liveness: McpHealthLiveness;
+  capability: McpHealthCapability;
   detail: string;
   latencyMs: number;
   checkedAt: string;
@@ -39,6 +43,7 @@ type ProbeResult = {
 };
 
 const PROBE_TIMEOUT_MS = 16_000;
+const LIVENESS_TIMEOUT_MS = 4_500;
 const SNAPSHOT_TTL_MS = 90_000;
 
 let cachedSnapshot: McpHealthSnapshot | null = null;
@@ -65,24 +70,79 @@ async function runProbe(
   probe: () => Promise<ProbeResult>,
 ): Promise<McpHealthRow> {
   const startedAt = Date.now();
+  const checkedAt = new Date().toISOString();
+  const probeUrl = appConfig.mcp[key];
+
   try {
-    const result = await withTimeout(probe(), PROBE_TIMEOUT_MS);
-    return {
-      key,
-      label,
-      state: result.ok ? "green" : "red",
-      detail: result.detail,
-      latencyMs: Date.now() - startedAt,
-      checkedAt: new Date().toISOString(),
-    };
+    const response = await withTimeout(
+      fetch(probeUrl, {
+        method: "GET",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+        },
+      }),
+      LIVENESS_TIMEOUT_MS,
+    );
+    if (response.status >= 500) {
+      return {
+        key,
+        label,
+        state: "red",
+        liveness: "down",
+        capability: "failed",
+        detail: `service returned ${response.status}`,
+        latencyMs: Date.now() - startedAt,
+        checkedAt,
+      };
+    }
   } catch (error) {
     return {
       key,
       label,
       state: "red",
-      detail: error instanceof Error ? error.message : "probe failed",
+      liveness: "down",
+      capability: "failed",
+      detail: error instanceof Error ? error.message : "liveness probe failed",
       latencyMs: Date.now() - startedAt,
-      checkedAt: new Date().toISOString(),
+      checkedAt,
+    };
+  }
+
+  try {
+    const result = await withTimeout(probe(), PROBE_TIMEOUT_MS);
+    if (result.ok) {
+      return {
+        key,
+        label,
+        state: "green",
+        liveness: "up",
+        capability: "ok",
+        detail: result.detail,
+        latencyMs: Date.now() - startedAt,
+        checkedAt,
+      };
+    }
+    return {
+      key,
+      label,
+      state: "yellow",
+      liveness: "up",
+      capability: "degraded",
+      detail: `${result.detail} (service reachable)`,
+      latencyMs: Date.now() - startedAt,
+      checkedAt,
+    };
+  } catch (error) {
+    return {
+      key,
+      label,
+      state: "yellow",
+      liveness: "up",
+      capability: "degraded",
+      detail: error instanceof Error ? `reachable; ${error.message}` : "reachable; capability probe failed",
+      latencyMs: Date.now() - startedAt,
+      checkedAt,
     };
   }
 }

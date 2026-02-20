@@ -315,6 +315,9 @@ export function GraphCanvas({
         selectedNodeId === node.id ||
         activeNodeSet.has(node.id) ||
         (washedNodeIds?.has(node.id) ?? false) ||
+        (hasFocusedSubset &&
+          (node.type === "target" ||
+            (node.type === "pathway" && nodes.length <= 84))) ||
         autoLabelNodeIds.has(node.id) ||
         (node.type !== "interaction" && nodes.length <= 16) ||
         (node.type === "target" && nodes.length <= 36) ||
@@ -545,19 +548,21 @@ export function GraphCanvas({
       {
         selector: "node.is-faded",
         style: {
-          opacity: 0.28,
-          "text-opacity": 0.42,
+          opacity: 0.54,
+          "text-opacity": 0.82,
+          "text-background-opacity": 0.9,
+          "text-border-opacity": 0.72,
         },
       },
       {
         selector: "node.is-washed",
         style: {
-          "background-color": "#b7bfd4",
-          opacity: 0.84,
+          "background-color": "#a8b4cc",
+          opacity: 0.9,
           "text-opacity": 1,
-          "text-border-color": "#aebad1",
-          "text-background-color": "#eef2fb",
-          color: "#324262",
+          "text-border-color": "#9cabca",
+          "text-background-color": "#f2f5fd",
+          color: "#2c3e5f",
         },
       },
       {
@@ -691,7 +696,7 @@ export function GraphCanvas({
       {
         selector: "edge.is-faded",
         style: {
-          opacity: 0.16,
+          opacity: 0.38,
         },
       },
       {
@@ -718,11 +723,19 @@ export function GraphCanvas({
       {
         selector: "edge.is-washed",
         style: {
-          "line-color": "#97a1bb",
-          "target-arrow-color": "#97a1bb",
+          "line-color": "#7f8eb1",
+          "target-arrow-color": "#7f8eb1",
           "line-style": "dashed",
-          "line-dash-pattern": [4, 6],
-          opacity: 0.82,
+          "line-dash-pattern": [4, 5],
+          opacity: 0.9,
+        },
+      },
+      {
+        selector: "edge.is-faded.label-visible, edge.is-washed.label-visible",
+        style: {
+          color: "#2f3f67",
+          "text-background-opacity": 0.94,
+          "text-border-opacity": 0.84,
         },
       },
       {

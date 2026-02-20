@@ -230,17 +230,28 @@ const clampTimeout = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, value));
 const DISCOVERER_MAX_RUN_MS = clampTimeout(
   appConfig.deepDiscover.maxRunMs,
-  150_000,
-  300_000,
+  180_000,
+  600_000,
 );
 const AGENT_TIMEOUT_MS = Math.min(
-  clampTimeout(appConfig.deepDiscover.agentTimeoutMs, 60_000, 180_000),
-  Math.max(60_000, DISCOVERER_MAX_RUN_MS - 30_000),
+  clampTimeout(appConfig.deepDiscover.agentTimeoutMs, 90_000, 420_000),
+  Math.max(90_000, DISCOVERER_MAX_RUN_MS - 25_000),
 );
-const TOOL_TIMEOUT_MS = clampTimeout(appConfig.deepDiscover.toolTimeoutMs, 15_000, 90_000);
+const TOOL_TIMEOUT_MS = Math.min(
+  clampTimeout(appConfig.deepDiscover.toolTimeoutMs, 20_000, 180_000),
+  Math.max(20_000, AGENT_TIMEOUT_MS - 10_000),
+);
 const MAX_PUBMED_SUBQUERIES = appConfig.deepDiscover.maxPubmedSubqueries;
-const COORDINATOR_TIMEOUT_MS = clampTimeout(Math.min(AGENT_TIMEOUT_MS, 90_000), 25_000, 90_000);
-const SUBAGENT_TIMEOUT_MS = clampTimeout(Math.min(AGENT_TIMEOUT_MS, 120_000), 30_000, 120_000);
+const COORDINATOR_TIMEOUT_MS = clampTimeout(
+  Math.min(AGENT_TIMEOUT_MS, 180_000),
+  30_000,
+  180_000,
+);
+const SUBAGENT_TIMEOUT_MS = clampTimeout(
+  Math.min(AGENT_TIMEOUT_MS, 240_000),
+  45_000,
+  240_000,
+);
 
 const coordinatorPlanSchema = z.object({
   strategy: z.string().max(320),

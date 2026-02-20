@@ -6,15 +6,26 @@ import { ArrowRight, Search } from "lucide-react";
 import { LandingMoleculeBackground } from "@/components/targetgraph/landing-molecule-background";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { EXAMPLE_REPLAY_ID, EXAMPLE_REPLAY_QUERY } from "@/lib/example-replay";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { EXAMPLE_REPLAY_OPTIONS } from "@/lib/example-replay";
 
-const SAMPLE_QUERIES = [
-  EXAMPLE_REPLAY_QUERY,
-  "How might obesity lead to type 2 diabetes through inflammatory signaling?",
-  "Which mechanistic path could connect lupus, IL-6 signaling, and obesity?",
+const SAMPLE_QUERIES = EXAMPLE_REPLAY_OPTIONS.map((option) => option.query);
+
+const LIVE_WORDS = ["live.", "as evidence arrives.", "hypothesis-by-hypothesis."] as const;
+const AGENT_SEQUENCE = [
+  "Query Planner",
+  "Pathway Mapper",
+  "Translational Scout",
+  "Bridge Hunter",
+  "Literature Scout",
+  "Final Synthesis",
 ] as const;
-
-const LIVE_WORDS = ["live.", "discover.", "answer evidence-first."] as const;
 const CONNECTED_MCP_TOOLS = [
   { key: "opentargets", label: "OpenTargets MCP" },
   { key: "reactome", label: "Reactome MCP" },
@@ -25,7 +36,7 @@ const CONNECTED_MCP_TOOLS = [
   { key: "medical", label: "Medical MCP" },
 ] as const;
 
-type ToolHealthState = "loading" | "green" | "red";
+type ToolHealthState = "loading" | "green" | "yellow" | "red";
 
 type ToolHealthMap = Record<
   (typeof CONNECTED_MCP_TOOLS)[number]["key"],
@@ -55,10 +66,12 @@ export function LandingPage() {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [isPersistingKey, setIsPersistingKey] = useState(false);
+  const [exampleSelectResetKey, setExampleSelectResetKey] = useState(0);
   const [headerTab, setHeaderTab] = useState<"agent" | "tools">("agent");
   const [liveWordIndex, setLiveWordIndex] = useState(0);
   const [typedLiveWord, setTypedLiveWord] = useState("");
   const [isDeletingLiveWord, setIsDeletingLiveWord] = useState(false);
+  const [activeAgentStep, setActiveAgentStep] = useState(0);
   const [toolHealth, setToolHealth] = useState<ToolHealthMap>(() => initialToolHealthMap());
   const [toolHealthCheckedAt, setToolHealthCheckedAt] = useState<string | null>(null);
 
@@ -117,14 +130,22 @@ export function LandingPage() {
         for (const row of payload.tools ?? []) {
           const key = String(row.key ?? "") as keyof ToolHealthMap;
           if (!(key in next)) continue;
+          const rowState =
+            row.state === "green"
+              ? "green"
+              : row.state === "yellow"
+                ? "yellow"
+                : "red";
           next[key] = {
-            state: row.state === "green" ? "green" : "red",
+            state: rowState,
             detail:
               typeof row.detail === "string" && row.detail.trim().length > 0
                 ? row.detail
-                : row.state === "green"
+                : rowState === "green"
                   ? "Probe succeeded"
-                  : "Probe failed",
+                  : rowState === "yellow"
+                    ? "Service reachable, capability probe degraded"
+                    : "Service unreachable",
             latencyMs:
               typeof row.latencyMs === "number" && Number.isFinite(row.latencyMs)
                 ? Math.max(0, Math.round(row.latencyMs))
@@ -164,6 +185,13 @@ export function LandingPage() {
       cancelled = true;
       window.clearInterval(interval);
     };
+  }, []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setActiveAgentStep((current) => (current + 1) % AGENT_SEQUENCE.length);
+    }, 1300);
+    return () => window.clearInterval(interval);
   }, []);
 
   const hasApiKey = apiKey.trim().length > 0;
@@ -247,6 +275,11 @@ export function LandingPage() {
   return (
     <main className="relative min-h-screen overflow-hidden">
       <LandingMoleculeBackground />
+      <div className="pointer-events-none absolute left-0 top-20 z-20">
+        <div className="rounded-r-full border border-l-0 border-[#d7e5f3] bg-white/90 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#4f6f95] shadow-[0_10px_24px_rgba(18,52,88,0.12)] backdrop-blur">
+          Alpha
+        </div>
+      </div>
 
       <div className="relative mx-auto flex w-full max-w-5xl flex-col gap-5 px-4 pb-12 pt-8 md:px-8 md:pt-12">
         <header className="tg-panel-rise rounded-3xl border border-[#d8e5f3] bg-white/90 p-6 shadow-[0_36px_120px_rgba(18,52,88,0.14)] backdrop-blur md:p-8">
@@ -278,13 +311,13 @@ export function LandingPage() {
           </div>
 
           <h1 className="max-w-4xl text-3xl font-semibold leading-tight tracking-tight text-[#17355f] md:text-5xl">
-            Trace multi-hop, mechanism-level links across diseases, targets, pathways, and interventions.
+            Trace multi-hop mechanistic hypotheses across diseases, targets, pathways, and interventions.
           </h1>
 
           <p className="mt-3 max-w-4xl text-sm leading-7 text-[#4b6b8f] md:text-base">
-            Agentic AI explores competing multihop hypotheses, keeps every tested branch visible and converges on a
-            citation-backed biological answer. Watch it{" "}
-            <span className="inline-flex min-w-[16ch] items-center font-semibold text-[#1e5f95]">
+            Agentic AI explores competing routes, keeps every tested branch visible, and produces an
+            evidence-grounded synthesis with citations, caveats, and next experiments. Watch it{" "}
+            <span className="inline-flex min-w-[24ch] items-center font-semibold text-[#1e5f95]">
               {typedLiveWord || " "}
               <span className="ml-0.5 inline-block h-4 w-px animate-pulse bg-[#1e5f95]" />
             </span>
@@ -318,9 +351,34 @@ export function LandingPage() {
 
             {headerTab === "agent" ? (
               <div className="px-3 py-3 text-xs text-[#456689]">
-                See 
-                Planner &rarr; Pathway Mapper &rarr; Bridge Hunter &rarr; Translational Scout &rarr; Literature Scout &rarr; Final
-                Synthesis
+                <span className="mr-1 text-[#55759a]">Agent loop:</span>
+                <span className="inline-flex flex-wrap items-center gap-1 align-middle">
+                  {AGENT_SEQUENCE.map((step, index) => {
+                    const isActive = index === activeAgentStep;
+                    return (
+                      <span key={step} className="inline-flex items-center gap-1">
+                        <span
+                          className={`rounded-md border px-1.5 py-0.5 transition ${
+                            isActive
+                              ? "border-[#9ec5e9] bg-white text-[#1f5f95] shadow-[0_6px_14px_rgba(34,90,141,0.12)]"
+                              : "border-transparent bg-[#f2f8ff] text-[#6583a8]"
+                          }`}
+                        >
+                          {step}
+                        </span>
+                        {index < AGENT_SEQUENCE.length - 1 ? (
+                          <span
+                            className={`transition ${
+                              isActive ? "text-[#4f7fad]" : "text-[#8aa4bf]"
+                            }`}
+                          >
+                            •
+                          </span>
+                        ) : null}
+                      </span>
+                    );
+                  })}
+                </span>
               </div>
             ) : (
               <>
@@ -330,6 +388,8 @@ export function LandingPage() {
                     const dotClass =
                       health.state === "green"
                         ? "bg-emerald-500"
+                        : health.state === "yellow"
+                          ? "bg-amber-500"
                         : health.state === "red"
                           ? "bg-rose-500"
                           : "bg-slate-300";
@@ -350,7 +410,7 @@ export function LandingPage() {
                   })}
                 </div>
                 <div className="px-3 pb-3 text-[10px] text-[#5e7698]">
-                  Green = responding. Red = probe failed.
+                  Green = responding. Amber = reachable but degraded or slow. Red = unreachable.
                   {toolHealthCheckedAt
                     ? ` Last check: ${new Date(toolHealthCheckedAt).toLocaleTimeString()}.`
                     : ""}
@@ -398,20 +458,30 @@ export function LandingPage() {
               Long runs can take a few minutes when multiple branches and literature queries are explored.
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                className="h-11 border-[#b7cae3] bg-white text-[#2e5f8a] hover:bg-[#eef6ff]"
-                onClick={() => {
-                  void runWithQuery(EXAMPLE_REPLAY_QUERY, {
+              <Select
+                key={exampleSelectResetKey}
+                disabled={isPersistingKey}
+                onValueChange={(value) => {
+                  const selected = EXAMPLE_REPLAY_OPTIONS.find((option) => option.id === value);
+                  if (!selected) return;
+                  setExampleSelectResetKey((current) => current + 1);
+                  void runWithQuery(selected.query, {
                     allowEmptyKey: true,
-                    replayId: EXAMPLE_REPLAY_ID,
+                    replayId: selected.id,
                   });
                 }}
-                disabled={isPersistingKey}
               >
-                Run example
-              </Button>
+                <SelectTrigger className="h-11 w-[340px] border-[#b7cae3] bg-white text-[#2e5f8a] hover:bg-[#eef6ff]">
+                  <SelectValue placeholder="Run example" />
+                </SelectTrigger>
+                <SelectContent className="border-[#d0e0f1] bg-white text-[#2e5f8a]">
+                  {EXAMPLE_REPLAY_OPTIONS.map((option) => (
+                    <SelectItem key={option.id} value={option.id} className="text-xs">
+                      {option.query}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <Button
                 className="h-11 bg-[#23679b] text-white hover:bg-[#1c547f]"
                 onClick={() => {

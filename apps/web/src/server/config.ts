@@ -133,6 +133,25 @@ export const appConfig = {
     p5PerTargetTimeoutMs: parseNumber(process.env.STREAM_P5_PER_TARGET_TIMEOUT_MS, 45_000),
     maxLiteratureTargets: parseNumber(process.env.STREAM_MAX_LITERATURE_TARGETS, 5),
   },
+  run: {
+    hardBudgetMs: parseNumber(process.env.RUN_HARD_BUDGET_MS, 10 * 60 * 1000),
+    finalizationReserveMs: parseNumber(
+      process.env.RUN_FINALIZATION_RESERVE_MS,
+      90_000,
+    ),
+    fallbackSynthesisTimeoutMs: parseNumber(
+      process.env.RUN_FALLBACK_SYNTHESIS_TIMEOUT_MS,
+      120_000,
+    ),
+    finalGroundingTimeoutMs: parseNumber(
+      process.env.RUN_FINAL_GROUNDING_TIMEOUT_MS,
+      120_000,
+    ),
+    discovererFinalWaitMs: parseNumber(
+      process.env.RUN_DISCOVERER_FINAL_WAIT_MS,
+      150_000,
+    ),
+  },
   deepDiscover: {
     agentTimeoutMs: parseNumber(process.env.DEEP_DISCOVER_AGENT_TIMEOUT_MS, 600_000),
     toolTimeoutMs: parseNumber(process.env.DEEP_DISCOVER_TOOL_TIMEOUT_MS, 120_000),

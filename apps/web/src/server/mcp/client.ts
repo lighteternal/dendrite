@@ -56,7 +56,7 @@ export class McpClient {
     });
     const client = new Client(
       {
-        name: "targetgraph-web",
+        name: "dendrite-web",
         version: "0.1.0",
       },
       {

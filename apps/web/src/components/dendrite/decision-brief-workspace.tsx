@@ -11,8 +11,8 @@ import {
   Play,
   Search,
 } from "lucide-react";
-import { PathFirstGraph } from "@/components/targetgraph/path-first-graph";
-import { type BridgeAnalysis } from "@/components/targetgraph/bridge-analysis";
+import { PathFirstGraph } from "@/components/dendrite/path-first-graph";
+import { type BridgeAnalysis } from "@/components/dendrite/bridge-analysis";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1135,7 +1135,7 @@ export function DecisionBriefWorkspace({
       <header className="sticky top-0 z-40 border-b border-[#d6dbf3] bg-white/95 px-3 py-2 backdrop-blur md:px-6">
         <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex items-center gap-2">
-            <Badge className="rounded-full bg-[#4d47d8] px-3 py-1 text-white">TargetGraph</Badge>
+            <Badge className="rounded-full bg-[#4d47d8] px-3 py-1 text-white">Dendrite</Badge>
             <Button
               size="sm"
               variant="secondary"
@@ -1514,7 +1514,7 @@ export function DecisionBriefWorkspace({
                             agentFinalReadout,
                             selectedEdge,
                           },
-                          `targetgraph-brief-${query.replace(/\s+/g, "-").toLowerCase()}.json`,
+                          `dendrite-brief-${query.replace(/\s+/g, "-").toLowerCase()}.json`,
                         );
                       }}
                     >

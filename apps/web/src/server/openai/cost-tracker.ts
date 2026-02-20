@@ -342,7 +342,7 @@ export function getOpenAiPromptCacheConfig(operation: string, model?: string): {
 } {
   if (!appConfig.openai.promptCachingEnabled) return {};
 
-  const prefix = cleanKey(appConfig.openai.promptCacheKeyPrefix || "targetgraph");
+  const prefix = cleanKey(appConfig.openai.promptCacheKeyPrefix || "dendrite");
   const op = cleanKey(operation || "generic");
   const modelPart = model ? cleanKey(model) : "model";
   const key = `${prefix}:${op}:${modelPart}`.slice(0, 180);

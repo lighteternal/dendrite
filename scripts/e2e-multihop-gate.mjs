@@ -1,8 +1,8 @@
 import { chromium } from "playwright";
 import fs from "node:fs/promises";
 
-const baseUrl = process.env.TARGETGRAPH_BASE_URL ?? "http://localhost:3000";
-const outDir = process.env.TARGETGRAPH_E2E_OUT ?? "/tmp/targetgraph-e2e-gate";
+const baseUrl = process.env.DENDRITE_BASE_URL ?? "http://localhost:3000";
+const outDir = process.env.DENDRITE_E2E_OUT ?? "/tmp/dendrite-e2e-gate";
 await fs.mkdir(outDir, { recursive: true });
 
 const queries = [

@@ -187,7 +187,7 @@ export const appConfig = {
       process.env.OPENAI_PROMPT_CACHE_RETENTION,
     ),
     promptCacheKeyPrefix:
-      process.env.OPENAI_PROMPT_CACHE_KEY_PREFIX ?? "targetgraph-v1",
+      process.env.OPENAI_PROMPT_CACHE_KEY_PREFIX ?? "dendrite-v1",
     pricingByModel: {
       ...defaultModelPricing,
       ...parseModelPricingMap(process.env.OPENAI_MODEL_PRICING_JSON),

@@ -1,4 +1,4 @@
-import { DecisionBriefWorkspace } from "@/components/targetgraph/decision-brief-workspace";
+import { DecisionBriefWorkspace } from "@/components/dendrite/decision-brief-workspace";
 
 type SearchParams = Promise<Record<string, string | string[] | undefined>>;
 

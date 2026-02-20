@@ -38,7 +38,7 @@ const replayMetaById: Record<
     durationMs: 75_000,
     evidenceReview: {
       checkedAt: "2026-02-20",
-      reviewer: "targetgraph-maintainer",
+      reviewer: "dendrite-maintainer",
       rationale:
         "Replay selected from a completed run that resolves obesity to T2D through PPARG/GLP1R-centered metabolic and inflammatory mechanisms with supporting references.",
       sources: [
@@ -52,7 +52,7 @@ const replayMetaById: Record<
     durationMs: 75_000,
     evidenceReview: {
       checkedAt: "2026-02-20",
-      reviewer: "targetgraph-maintainer",
+      reviewer: "dendrite-maintainer",
       rationale:
         "Replay uses a completed ALS/oxidative-stress run whose final synthesis aligns with established mechanisms linking SQSTM1/NFE2L2 antioxidant regulation to oxidative stress in ALS.",
       sources: [
@@ -66,7 +66,7 @@ const replayMetaById: Record<
     durationMs: 75_000,
     evidenceReview: {
       checkedAt: "2026-02-20",
-      reviewer: "targetgraph-maintainer",
+      reviewer: "dendrite-maintainer",
       rationale:
         "Replay selected from a completed run linking alcohol exposure to colorectal cancer via ethanol metabolism and ADH pathway evidence with literature-backed risk support.",
       sources: [
@@ -90,7 +90,7 @@ const fixtures: Record<string, ReplayFixture> = Object.fromEntries(
         durationMs: meta?.durationMs ?? 75_000,
         evidenceReview: meta?.evidenceReview ?? {
           checkedAt: new Date().toISOString().slice(0, 10),
-          reviewer: "targetgraph-maintainer",
+          reviewer: "dendrite-maintainer",
           rationale: "Replay fixture loaded from captured run output.",
           sources: [],
         },

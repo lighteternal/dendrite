@@ -1,4 +1,4 @@
-# TargetGraph PRD: Multihop Biomedical Discovery
+# Dendrite PRD: Multihop Biomedical Discovery
 
 ## 1. Product Goal
 Deliver a single-mode biomedical search product that:

@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import type { GraphEdge, GraphNode, RankingResponse } from "@/lib/contracts";
 import { makeEdgeId, makeNodeId } from "@/lib/graph";
-import { buildEvidenceTable } from "@/components/targetgraph/evidence";
+import { buildEvidenceTable } from "@/components/dendrite/evidence";
 import { rankTargetsFallback } from "@/server/openai/ranking";
 import { getDiseaseTargetsSummary, searchDiseases } from "@/server/mcp/opentargets";
 import { findPathwaysByGene } from "@/server/mcp/reactome";
@@ -598,7 +598,7 @@ function resolveSessionKey(request: NextRequest, explicitSessionId?: string | nu
   const explicit = explicitSessionId?.trim();
   if (explicit) return `session:${explicit}`;
 
-  const cookieSession = request.cookies.get("targetgraph_session_id")?.value?.trim();
+  const cookieSession = request.cookies.get("dendrite_session_id")?.value?.trim();
   if (cookieSession) return `cookie:${cookieSession}`;
 
   const forwarded =
@@ -677,7 +677,7 @@ async function fetchInternalStream(
           Accept: "text/event-stream",
           ...(apiKeyOverride
             ? {
-                "x-targetgraph-api-key": apiKeyOverride,
+                "x-dendrite-api-key": apiKeyOverride,
               }
             : {}),
         },

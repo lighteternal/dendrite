@@ -262,7 +262,7 @@ function delay(ms: number): Promise<void> {
 
 function getBrowserSessionId(): string {
   if (typeof window === "undefined") return "server-session";
-  const storageKey = "targetgraph_session_id";
+  const storageKey = "dendrite_session_id";
   const existing = window.localStorage.getItem(storageKey);
   if (existing) return existing;
   const generated =

@@ -16,12 +16,12 @@ import {
   Sparkles,
   Telescope,
 } from "lucide-react";
-import { BuildStepper } from "@/components/targetgraph/build-stepper";
-import { DeepDiscoverer } from "@/components/targetgraph/deep-discoverer";
-import { buildEvidenceTable } from "@/components/targetgraph/evidence";
-import { HypothesisPanel } from "@/components/targetgraph/hypothesis-panel";
-import { MechanismSankey } from "@/components/targetgraph/mechanism-sankey";
-import { NodeInspector } from "@/components/targetgraph/node-inspector";
+import { BuildStepper } from "@/components/dendrite/build-stepper";
+import { DeepDiscoverer } from "@/components/dendrite/deep-discoverer";
+import { buildEvidenceTable } from "@/components/dendrite/evidence";
+import { HypothesisPanel } from "@/components/dendrite/hypothesis-panel";
+import { MechanismSankey } from "@/components/dendrite/mechanism-sankey";
+import { NodeInspector } from "@/components/dendrite/node-inspector";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -35,7 +35,7 @@ import { useGraphStream } from "@/hooks/useGraphStream";
 import { toast } from "sonner";
 
 const GraphCanvas = dynamic(
-  () => import("@/components/targetgraph/graph-canvas").then((mod) => mod.GraphCanvas),
+  () => import("@/components/dendrite/graph-canvas").then((mod) => mod.GraphCanvas),
   { ssr: false },
 );
 
@@ -68,7 +68,7 @@ function downloadJson(data: unknown, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-const recentStorageKey = "targetgraph_recent_cases";
+const recentStorageKey = "dendrite_recent_cases";
 
 const lensLabel: Record<ConnectionLens, string> = {
   balanced: "Balanced",
@@ -578,7 +578,7 @@ export function GraphWorkbench({
                   edges: stream.edges,
                   ranking: stream.ranking,
                 },
-                `targetgraph-${diseaseQuery.replace(/\s+/g, "-").toLowerCase()}.json`,
+                `dendrite-${diseaseQuery.replace(/\s+/g, "-").toLowerCase()}.json`,
               );
               toast.success("Graph JSON exported");
             }}
@@ -748,7 +748,7 @@ export function GraphWorkbench({
       <header className="sticky top-0 z-40 border-b border-[#ddd9ff] bg-white/96 px-3 py-3 backdrop-blur md:px-6">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex items-center gap-2">
-            <Badge className="rounded-full bg-[#5b57e6] px-3 py-1 text-white">TargetGraph</Badge>
+            <Badge className="rounded-full bg-[#5b57e6] px-3 py-1 text-white">Dendrite</Badge>
             <Button
               size="sm"
               variant="secondary"

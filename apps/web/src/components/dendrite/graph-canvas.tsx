@@ -10,7 +10,7 @@ import {
   EDGE_SOURCE_GROUPS,
   getEdgeSourceGroup,
   type EdgeSourceGroup,
-} from "@/components/targetgraph/graph-source";
+} from "@/components/dendrite/graph-source";
 import { Button } from "@/components/ui/button";
 
 const CytoscapeComponent = dynamic(() => import("react-cytoscapejs"), {
@@ -1147,7 +1147,7 @@ export function GraphCanvas({
             });
             const a = document.createElement("a");
             a.href = png;
-            a.download = "targetgraph-network.png";
+            a.download = "dendrite-network.png";
             a.click();
           }}
           className="border-[#d5dbf4] bg-white text-[#4649a2] hover:bg-[#f1f2ff]"

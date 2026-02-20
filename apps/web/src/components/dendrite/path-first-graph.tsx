@@ -2,14 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
-import { GraphCanvas } from "@/components/targetgraph/graph-canvas";
-import { analyzeBridgeOutcomes, type BridgeAnalysis } from "@/components/targetgraph/bridge-analysis";
+import { GraphCanvas } from "@/components/dendrite/graph-canvas";
+import { analyzeBridgeOutcomes, type BridgeAnalysis } from "@/components/dendrite/bridge-analysis";
 import {
   EDGE_SOURCE_GROUP_META,
   EDGE_SOURCE_GROUPS,
   getEdgeSourceGroup,
   type EdgeSourceGroup,
-} from "@/components/targetgraph/graph-source";
+} from "@/components/dendrite/graph-source";
 import type { QueryPlan } from "@/hooks/useCaseRunStream";
 import { Badge } from "@/components/ui/badge";
 

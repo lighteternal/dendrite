@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowRight, Search } from "lucide-react";
-import { LandingMoleculeBackground } from "@/components/targetgraph/landing-molecule-background";
+import { LandingMoleculeBackground } from "@/components/dendrite/landing-molecule-background";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -199,7 +199,7 @@ export function LandingPage() {
 
   const resolveSessionId = () => {
     if (typeof window === "undefined") return "landing-session";
-    const storageKey = "targetgraph_session_id";
+    const storageKey = "dendrite_session_id";
     const existing = window.localStorage.getItem(storageKey);
     if (existing) return existing;
     const generated =
@@ -285,7 +285,7 @@ export function LandingPage() {
         <header className="tg-panel-rise rounded-3xl border border-[#d8e5f3] bg-white/90 p-6 shadow-[0_36px_120px_rgba(18,52,88,0.14)] backdrop-blur md:p-8">
           <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
-              <Badge className="rounded-full bg-[#235f8f] px-3 py-1 text-white">TargetGraph</Badge>
+              <Badge className="rounded-full bg-[#235f8f] px-3 py-1 text-white">Dendrite</Badge>
               <Badge className="rounded-full border border-[#d6e5f3] bg-[#f5faff] text-[#38658e]">
                 Agentic biomedical discovery
               </Badge>

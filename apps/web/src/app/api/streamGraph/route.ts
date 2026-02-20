@@ -133,7 +133,7 @@ export async function GET(request: NextRequest) {
   const includeInteractions = searchParams.get("interactions") !== "0";
   const includeLiterature = searchParams.get("literature") !== "0";
   const requestApiKey = normalizeApiKey(
-    request.headers.get("x-targetgraph-api-key"),
+    request.headers.get("x-dendrite-api-key"),
   );
   const log = startRequestLog("/api/streamGraph", {
     diseaseQuery: diseaseQuery?.slice(0, 120),

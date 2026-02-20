@@ -1,6 +1,6 @@
-# TargetGraph
+# Dendrite
 
-TargetGraph is an agentic biomedical discovery app that turns a free-text question into a live, explorable mechanism-hypothesis graph and an evidence-grounded synthesis.
+Dendrite is an agentic biomedical discovery app that turns a free-text question into a live, explorable mechanism-hypothesis graph and an evidence-grounded synthesis.
 
 It is for research synthesis and hypothesis generation, not clinical decision-making.
 
@@ -14,7 +14,7 @@ It is for research synthesis and hypothesis generation, not clinical decision-ma
 
 ## How To Interpret Results
 
-TargetGraph links entities using heterogeneous evidence types, including:
+Dendrite links entities using heterogeneous evidence types, including:
 
 - genetic/association evidence
 - pathway membership

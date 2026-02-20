@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 
 const base = process.env.BASE_URL || 'http://localhost:3000';
 const navTimeoutMs = Number(process.env.PW_NAV_TIMEOUT_MS || 120000);
-const outDir = '/tmp/targetgraph-ui-usability';
+const outDir = '/tmp/dendrite-ui-usability';
 await fs.mkdir(outDir, { recursive: true });
 
 const queries = [
@@ -76,7 +76,7 @@ async function runQuery(query, index) {
 
   // Validate one-active-query lock via same-session API call.
   const lockProbe = await page.evaluate(async () => {
-    const sid = window.localStorage.getItem('targetgraph_session_id');
+    const sid = window.localStorage.getItem('dendrite_session_id');
     if (!sid) return { skipped: true };
     const runId = `probe-${Date.now()}`;
     const controller = new AbortController();

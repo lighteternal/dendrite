@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 
 const base = 'http://localhost:3000';
-const outDir = '/tmp/targetgraph-live-audit';
+const outDir = '/tmp/dendrite-live-audit';
 await fs.mkdir(outDir, { recursive: true });
 
 const queries = [

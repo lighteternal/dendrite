@@ -278,7 +278,7 @@ export async function rankTargets(rows: RankingInputRow[]): Promise<RankingRespo
 
   try {
     const json = await callStructuredJson<RankingResponse>({
-      schemaName: "targetgraph_ranking",
+      schemaName: "dendrite_ranking",
       schema,
       systemPrompt,
       userPrompt,
@@ -405,7 +405,7 @@ export async function generateMechanismThread(
 
   try {
     const json = await callStructuredJson<HypothesisResponse>({
-      schemaName: "targetgraph_hypothesis",
+      schemaName: "dendrite_hypothesis",
       schema,
       systemPrompt,
       userPrompt,

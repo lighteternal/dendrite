@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { Check, ChevronDown, Loader2 } from "lucide-react";
-import { PIPELINE_STEPS } from "@/components/targetgraph/constants";
+import { PIPELINE_STEPS } from "@/components/dendrite/constants";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";

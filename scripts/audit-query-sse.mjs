@@ -9,7 +9,7 @@ if (!query) {
 }
 
 const timeoutMs = Number(process.env.SSE_TIMEOUT_MS || 420000);
-const outDir = "/tmp/targetgraph-ui-usability";
+const outDir = "/tmp/dendrite-ui-usability";
 await fs.mkdir(outDir, { recursive: true });
 
 const safe = query.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 96);

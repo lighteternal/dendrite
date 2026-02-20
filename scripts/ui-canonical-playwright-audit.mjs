@@ -1,9 +1,9 @@
 import { chromium } from "playwright";
 import fs from "node:fs/promises";
 
-const baseUrl = process.env.TARGETGRAPH_BASE_URL ?? "http://localhost:3000";
-const outDir = process.env.TARGETGRAPH_UI_OUT ?? "/tmp/targetgraph-ui-canonical";
-const timeoutMs = Number(process.env.TARGETGRAPH_UI_TIMEOUT_MS ?? 180000);
+const baseUrl = process.env.DENDRITE_BASE_URL ?? "http://localhost:3000";
+const outDir = process.env.DENDRITE_UI_OUT ?? "/tmp/dendrite-ui-canonical";
+const timeoutMs = Number(process.env.DENDRITE_UI_TIMEOUT_MS ?? 180000);
 const queries = [
   "What targets and pathways connect ALS to oxidative stress?",
   "How might obesity lead to type 2 diabetes through inflammatory signaling?",

@@ -1,4 +1,4 @@
-import { LandingPage } from "@/components/targetgraph/landing-page";
+import { LandingPage } from "@/components/dendrite/landing-page";
 
 export default function Home() {
   return <LandingPage />;

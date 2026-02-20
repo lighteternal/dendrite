@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 
 const base = process.env.BASE_URL || 'http://localhost:3000';
 const navTimeoutMs = Number(process.env.PW_NAV_TIMEOUT_MS || 120000);
-const outDir = '/tmp/targetgraph-ui-usability';
+const outDir = '/tmp/dendrite-ui-usability';
 await fs.mkdir(outDir, { recursive: true });
 
 const query = process.argv.slice(2).join(' ').trim() || 'which pathways connect il6 to rheumatoid arthritis';

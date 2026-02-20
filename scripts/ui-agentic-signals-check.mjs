@@ -1,11 +1,11 @@
 import { chromium } from "playwright";
 import fs from "node:fs/promises";
 
-const baseUrl = process.env.TARGETGRAPH_BASE_URL ?? "http://localhost:3000";
-const outDir = process.env.TARGETGRAPH_UI_OUT ?? "/tmp/targetgraph-ui-agentic";
+const baseUrl = process.env.DENDRITE_BASE_URL ?? "http://localhost:3000";
+const outDir = process.env.DENDRITE_UI_OUT ?? "/tmp/dendrite-ui-agentic";
 await fs.mkdir(outDir, { recursive: true });
 
-const queryEnv = process.env.TARGETGRAPH_UI_QUERIES;
+const queryEnv = process.env.DENDRITE_UI_QUERIES;
 const queries = queryEnv
   ? queryEnv.split("||").map((item) => item.trim()).filter(Boolean)
   : [
@@ -13,7 +13,7 @@ const queries = queryEnv
       "what hidden mechanism links lupus and obesity through il6 signaling",
     ];
 
-const timeoutMs = Number(process.env.TARGETGRAPH_UI_TIMEOUT_MS ?? 480000);
+const timeoutMs = Number(process.env.DENDRITE_UI_TIMEOUT_MS ?? 480000);
 
 function slug(value) {
   return value.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 90);

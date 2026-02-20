@@ -1,8 +1,8 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 
-const base = process.env.TARGETGRAPH_BASE_URL ?? 'http://localhost:3000';
-const outDir = process.env.TARGETGRAPH_UI_OUT ?? '/tmp/targetgraph-ui-regression';
+const base = process.env.DENDRITE_BASE_URL ?? 'http://localhost:3000';
+const outDir = process.env.DENDRITE_UI_OUT ?? '/tmp/dendrite-ui-regression';
 await fs.mkdir(outDir, { recursive: true });
 
 const queries = [

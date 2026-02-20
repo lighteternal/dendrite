@@ -3,7 +3,7 @@ import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "TargetGraph",
+  title: "Dendrite",
   description:
     "Live disease-target-drug-pathway graph with hypothesis scoring and evidence-grounded narrative.",
 };

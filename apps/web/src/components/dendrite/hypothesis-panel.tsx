@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import type { GraphEdge, GraphNode, HypothesisResponse } from "@/lib/contracts";
 import { makeEdgeId, makeNodeId } from "@/lib/graph";
-import { buildEvidenceTable } from "@/components/targetgraph/evidence";
+import { buildEvidenceTable } from "@/components/dendrite/evidence";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";

@@ -1,10 +1,10 @@
 import { chromium } from "playwright";
 import fs from "node:fs/promises";
 
-const baseUrl = process.env.TARGETGRAPH_BASE_URL ?? "http://localhost:3000";
-const outDir = process.env.TARGETGRAPH_UI_OUT ?? "/tmp/targetgraph-ui-final-examples";
-const timeoutMs = Number(process.env.TARGETGRAPH_UI_TIMEOUT_MS ?? 620000);
-const sessionId = process.env.TARGETGRAPH_SESSION_ID ?? `ui-final-${Date.now()}`;
+const baseUrl = process.env.DENDRITE_BASE_URL ?? "http://localhost:3000";
+const outDir = process.env.DENDRITE_UI_OUT ?? "/tmp/dendrite-ui-final-examples";
+const timeoutMs = Number(process.env.DENDRITE_UI_TIMEOUT_MS ?? 620000);
+const sessionId = process.env.DENDRITE_SESSION_ID ?? `ui-final-${Date.now()}`;
 const apiKey = process.env.OPENAI_API_KEY?.trim() ?? "";
 
 const runs = [
@@ -102,7 +102,7 @@ const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 2200, height: 1400 } });
 await context.addInitScript(
   ({ forcedSessionId }) => {
-    window.localStorage.setItem("targetgraph_session_id", forcedSessionId);
+    window.localStorage.setItem("dendrite_session_id", forcedSessionId);
   },
   { forcedSessionId: sessionId },
 );

@@ -26,6 +26,7 @@ type Props = {
   edges: GraphEdge[];
   pathUpdate: PathUpdate | null;
   washedPathUpdates?: PathUpdate[];
+  shortlistPathUpdates?: PathUpdate[];
   showPathwayContext: boolean;
   showDrugContext: boolean;
   showInteractionContext: boolean;
@@ -55,6 +56,7 @@ export function PathFirstGraph({
   edges,
   pathUpdate,
   washedPathUpdates = [],
+  shortlistPathUpdates = [],
   showPathwayContext,
   showDrugContext,
   showInteractionContext,
@@ -135,6 +137,12 @@ export function PathFirstGraph({
     }
     const pathFocusNodeIds = new Set(pathUpdate?.nodeIds ?? []);
     const pathFocusEdgeIds = new Set(pathUpdate?.edgeIds ?? []);
+    const shortlistNodeIds = new Set<string>();
+    const shortlistEdgeIds = new Set<string>();
+    for (const shortlist of shortlistPathUpdates) {
+      for (const nodeId of shortlist.nodeIds) shortlistNodeIds.add(nodeId);
+      for (const edgeId of shortlist.edgeIds) shortlistEdgeIds.add(edgeId);
+    }
     const hasPathUpdateEdges = (pathUpdate?.edgeIds?.length ?? 0) > 0;
     const pathUpdateUsesOnlyProxyEdges =
       hasPathUpdateEdges &&
@@ -196,10 +204,14 @@ export function PathFirstGraph({
     const washedEdgeIds = new Set<string>();
     for (const washed of washedPathUpdates) {
       for (const nodeId of washed.nodeIds) {
-        if (!pathFocusNodeIds.has(nodeId)) washedNodeIds.add(nodeId);
+        if (!pathFocusNodeIds.has(nodeId) && !shortlistNodeIds.has(nodeId)) {
+          washedNodeIds.add(nodeId);
+        }
       }
       for (const edgeId of washed.edgeIds) {
-        if (!pathFocusEdgeIds.has(edgeId)) washedEdgeIds.add(edgeId);
+        if (!pathFocusEdgeIds.has(edgeId) && !shortlistEdgeIds.has(edgeId)) {
+          washedEdgeIds.add(edgeId);
+        }
       }
     }
     const focusNodeIds = new Set(pathFocusNodeIds);
@@ -258,6 +270,16 @@ export function PathFirstGraph({
     const isSourceEnabled = (edge: GraphEdge) => sourceFilter[getEdgeSourceGroup(edge)];
 
     const selectedEdgeIds = new Set<string>(focusEdgeIds);
+    for (const edgeId of shortlistEdgeIds) {
+      selectedEdgeIds.add(edgeId);
+      const edge = edgeById.get(edgeId);
+      if (!edge) continue;
+      focusNodeIds.add(edge.source);
+      focusNodeIds.add(edge.target);
+    }
+    for (const nodeId of shortlistNodeIds) {
+      focusNodeIds.add(nodeId);
+    }
     const addTopEdgesForTarget = (targetId: string, type: GraphEdge["type"], limit: number) => {
       const top = allEdges
         .filter((edge) =>
@@ -463,6 +485,8 @@ export function PathFirstGraph({
       sourceFilterMuted: filteredOutEdges,
       highlightedNodeIds: pathFocusNodeIds,
       highlightedEdgeIds: pathFocusEdgeIds,
+      shortlistedNodeIds: shortlistNodeIds,
+      shortlistedEdgeIds: shortlistEdgeIds,
       washedNodeIds,
       washedEdgeIds,
       summary,
@@ -479,6 +503,7 @@ export function PathFirstGraph({
     pathUpdate?.edgeIds,
     pathUpdate?.nodeIds,
     pathUpdate?.summary,
+    shortlistPathUpdates,
     washedPathUpdates,
     showDrugContext,
     showInteractionContext,
@@ -680,6 +705,8 @@ export function PathFirstGraph({
         }}
         highlightedNodeIds={computed.highlightedNodeIds}
         highlightedEdgeIds={computed.highlightedEdgeIds}
+        shortlistedNodeIds={computed.shortlistedNodeIds}
+        shortlistedEdgeIds={computed.shortlistedEdgeIds}
         washedNodeIds={computed.washedNodeIds}
         washedEdgeIds={computed.washedEdgeIds}
         dimUnfocused

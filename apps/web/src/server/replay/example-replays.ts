@@ -1,6 +1,6 @@
 import rawObesityT2dEvents from "@/server/replay/fixtures/example-obesity-t2d-v1.events.json";
 import rawAlsOxidativeEvents from "@/server/replay/fixtures/example-als-oxidative-v1.events.json";
-import rawAlcoholColorectalEvents from "@/server/replay/fixtures/example-alcohol-colorectal-v1.events.json";
+import rawT2dCkdEvents from "@/server/replay/fixtures/example-t2d-ckd-v1.events.json";
 import { EXAMPLE_REPLAY_OPTIONS } from "@/lib/example-replay";
 
 export type ReplayEvent = {
@@ -24,7 +24,7 @@ export type ReplayFixture = {
 const replayEventsById: Record<string, ReplayEvent[]> = {
   "example-obesity-t2d-v1": (rawObesityT2dEvents as ReplayEvent[]) ?? [],
   "example-als-oxidative-v1": (rawAlsOxidativeEvents as ReplayEvent[]) ?? [],
-  "example-alcohol-colorectal-v1": (rawAlcoholColorectalEvents as ReplayEvent[]) ?? [],
+  "example-t2d-ckd-v1": (rawT2dCkdEvents as ReplayEvent[]) ?? [],
 };
 
 const replayMetaById: Record<
@@ -62,17 +62,17 @@ const replayMetaById: Record<
       ],
     },
   },
-  "example-alcohol-colorectal-v1": {
+  "example-t2d-ckd-v1": {
     durationMs: 75_000,
     evidenceReview: {
-      checkedAt: "2026-02-20",
+      checkedAt: "2026-02-21",
       reviewer: "dendrite-maintainer",
       rationale:
-        "Replay selected from a completed run linking alcohol exposure to colorectal cancer via ethanol metabolism and ADH pathway evidence with literature-backed risk support.",
+        "Replay selected from a completed run linking type 2 diabetes mellitus and chronic kidney disease through shared ACE-centered renin-angiotensin and vascular injury mechanisms with literature support.",
       sources: [
-        "https://www.cancer.gov/about-cancer/causes-prevention/risk/alcohol/alcohol-fact-sheet",
-        "https://www.iarc.who.int/featured-news/media-centre-iarc-news-red-meat-and-processed-meat/",
-        "https://reactome.org/PathwayBrowser/",
+        "https://www.kidney.org/kidney-topics/diabetes-and-chronic-kidney-disease",
+        "https://www.niddk.nih.gov/health-information/diabetes/overview/preventing-problems/kidney-disease-nephropathy",
+        "https://reactome.org/content/detail/R-HSA-202040",
       ],
     },
   },

@@ -26,6 +26,8 @@ type Props = {
   onSelectEdge?: (edge: GraphEdge | null) => void;
   highlightedNodeIds?: Set<string>;
   highlightedEdgeIds?: Set<string>;
+  shortlistedNodeIds?: Set<string>;
+  shortlistedEdgeIds?: Set<string>;
   washedNodeIds?: Set<string>;
   washedEdgeIds?: Set<string>;
   dimUnfocused?: boolean;
@@ -196,6 +198,8 @@ export function GraphCanvas({
   onSelectEdge,
   highlightedNodeIds,
   highlightedEdgeIds,
+  shortlistedNodeIds,
+  shortlistedEdgeIds,
   washedNodeIds,
   washedEdgeIds,
   dimUnfocused = true,
@@ -276,7 +280,14 @@ export function GraphCanvas({
     [highlightedEdgeIds, localFocusEdgeIds],
   );
 
-  const hasFocusedSubset = dimUnfocused && (activeNodeSet.size > 0 || activeEdgeSet.size > 0);
+  const shortlistNodeSet = shortlistedNodeIds ?? new Set<string>();
+  const shortlistEdgeSet = shortlistedEdgeIds ?? new Set<string>();
+  const hasFocusedSubset =
+    dimUnfocused &&
+    (activeNodeSet.size > 0 ||
+      activeEdgeSet.size > 0 ||
+      shortlistNodeSet.size > 0 ||
+      shortlistEdgeSet.size > 0);
   const focusPulse = useMemo(() => (Math.sin(dashOffset / 2.8) + 1) / 2, [dashOffset]);
 
   useEffect(() => {
@@ -314,6 +325,7 @@ export function GraphCanvas({
         node.type === "disease" ||
         selectedNodeId === node.id ||
         activeNodeSet.has(node.id) ||
+        shortlistNodeSet.has(node.id) ||
         (washedNodeIds?.has(node.id) ?? false) ||
         (hasFocusedSubset &&
           (node.type === "target" ||
@@ -325,8 +337,11 @@ export function GraphCanvas({
         (node.type === "drug" && nodes.length <= 24);
 
       const classes = [
-        hasFocusedSubset && !activeNodeSet.has(node.id) ? "is-faded" : "",
+        hasFocusedSubset && !activeNodeSet.has(node.id) && !shortlistNodeSet.has(node.id)
+          ? "is-faded"
+          : "",
         activeNodeSet.has(node.id) ? "is-focused" : "",
+        shortlistNodeSet.has(node.id) && !activeNodeSet.has(node.id) ? "is-shortlisted" : "",
         washedNodeIds?.has(node.id) && !activeNodeSet.has(node.id) ? "is-washed" : "",
         selectedNodeId === node.id ? "is-selected" : "",
         node.meta.queryAnchor ? "is-query-anchor" : "",
@@ -358,13 +373,17 @@ export function GraphCanvas({
       const sourceMeta = EDGE_SOURCE_GROUP_META[sourceGroup];
       const showEdgeLabel =
         activeEdgeSet.has(edge.id) ||
+        shortlistEdgeSet.has(edge.id) ||
         (washedEdgeIds?.has(edge.id) ?? false) ||
         (edge.type === "disease_disease" && typeof edge.meta.status === "string") ||
         typeof edge.meta.bridgeType === "string" ||
         (edge.type !== "target_target" && (edge.weight ?? 0) >= 0.92 && nodes.length <= 60);
       const classes = [
-        hasFocusedSubset && !activeEdgeSet.has(edge.id) ? "is-faded" : "",
+        hasFocusedSubset && !activeEdgeSet.has(edge.id) && !shortlistEdgeSet.has(edge.id)
+          ? "is-faded"
+          : "",
         activeEdgeSet.has(edge.id) ? "is-focused" : "",
+        shortlistEdgeSet.has(edge.id) && !activeEdgeSet.has(edge.id) ? "is-shortlisted" : "",
         selectedEdgeId === edge.id ? "is-selected" : "",
         washedEdgeIds?.has(edge.id) && !activeEdgeSet.has(edge.id) ? "is-washed" : "",
         showEdgeLabel ? "label-visible" : "",
@@ -414,6 +433,8 @@ export function GraphCanvas({
     nodes,
     selectedNodeId,
     selectedEdgeId,
+    shortlistEdgeSet,
+    shortlistNodeSet,
     washedEdgeIds,
     washedNodeIds,
   ]);
@@ -563,6 +584,17 @@ export function GraphCanvas({
           "text-border-color": "#9cabca",
           "text-background-color": "#f2f5fd",
           color: "#2c3e5f",
+        },
+      },
+      {
+        selector: "node.is-shortlisted",
+        style: {
+          opacity: 0.95,
+          "border-width": 2,
+          "border-color": "#7e84be",
+          "text-opacity": 1,
+          "text-background-opacity": 0.95,
+          color: "#2b3a66",
         },
       },
       {
@@ -728,6 +760,16 @@ export function GraphCanvas({
           "line-style": "dashed",
           "line-dash-pattern": [4, 5],
           opacity: 0.9,
+        },
+      },
+      {
+        selector: "edge.is-shortlisted",
+        style: {
+          "line-color": "#6f78b8",
+          "target-arrow-color": "#6f78b8",
+          "line-style": "solid",
+          width: "mapData(weight, 0, 1, 1.6, 4.2)",
+          opacity: 0.88,
         },
       },
       {

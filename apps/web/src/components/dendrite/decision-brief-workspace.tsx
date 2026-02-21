@@ -1109,21 +1109,49 @@ export function DecisionBriefWorkspace({
       .filter((item): item is PathUpdate => Boolean(item));
   }, [buildPathForTargetSymbol, stream.finalBrief]);
 
+  const shortlistPaths = useMemo(() => {
+    const candidates = stream.finalBrief?.threadCandidates;
+    if (!candidates?.length) return [];
+    return candidates
+      .slice(0, 3)
+      .map((candidate) => {
+        const nodeIds = [...new Set(candidate.nodeIds ?? [])];
+        const edgeIds = [...new Set(candidate.edgeIds ?? [])];
+        if (nodeIds.length === 0 && edgeIds.length === 0) {
+          return buildPathForTargetSymbol(candidate.target);
+        }
+        return {
+          nodeIds,
+          edgeIds,
+          summary: compact(candidate.summary),
+        } satisfies PathUpdate;
+      })
+      .filter((item): item is PathUpdate => Boolean(item));
+  }, [buildPathForTargetSymbol, stream.finalBrief]);
+
   const mergedWashedPaths = useMemo(() => {
     const activeSignature = pathSignature(activePath);
+    const shortlistSignatures = new Set(shortlistPaths.map((path) => pathSignature(path)));
     const seen = new Set<string>();
     const merged: PathUpdate[] = [];
 
     for (const item of [...washedPaths, ...alternativePaths]) {
       const signature = pathSignature(item);
-      if (!signature || signature === activeSignature || seen.has(signature)) continue;
+      if (
+        !signature ||
+        signature === activeSignature ||
+        seen.has(signature) ||
+        shortlistSignatures.has(signature)
+      ) {
+        continue;
+      }
       seen.add(signature);
       merged.push(item);
       if (merged.length >= 10) break;
     }
 
     return merged;
-  }, [activePath, alternativePaths, washedPaths]);
+  }, [activePath, alternativePaths, shortlistPaths, washedPaths]);
 
   const topStatus = stream.status?.message ?? "Preparing run";
   const runLabel = "Multi-hop search";
@@ -1559,6 +1587,7 @@ export function DecisionBriefWorkspace({
                 edges={graphEdges}
                 pathUpdate={graphPath}
                 washedPathUpdates={mergedWashedPaths}
+                shortlistPathUpdates={shortlistPaths}
                 showPathwayContext={showPathwayContext}
                 showDrugContext={showDrugContext}
                 showInteractionContext={showInteractionContext}

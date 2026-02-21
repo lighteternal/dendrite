@@ -104,6 +104,17 @@ export type FinalBriefSection = {
       metric: number;
     };
   };
+  threadCandidates?: Array<{
+    summary: string;
+    target: string;
+    pathway: string;
+    drug: string;
+    diseases: string[];
+    nodeIds: string[];
+    edgeIds: string[];
+    supportScore: number;
+    connectedAcrossAnchors?: boolean;
+  }>;
   caveats: string[];
   nextActions: string[];
   queryAlignment?: {

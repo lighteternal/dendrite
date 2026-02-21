@@ -92,6 +92,9 @@ const SESSION_RUN_STALE_MS = 15 * 60 * 1000;
 const SESSION_API_KEY_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_JOURNEY_EVENTS = 300;
 const RUN_HARD_BUDGET_LIMIT_MS = 10 * 60 * 1000;
+const MAX_ANCHOR_PATH_INPUTS = 10;
+const SECONDARY_ANCHOR_TARGET_LIMIT = 10;
+const SECONDARY_ANCHOR_SEED_ROWS = 10;
 const RUN_HARD_BUDGET_MS = Math.max(
   180_000,
   Math.min(RUN_HARD_BUDGET_LIMIT_MS, appConfig.run.hardBudgetMs),
@@ -149,6 +152,19 @@ type FinalBriefSnapshot = {
     articleSnippets?: number;
     trialSnippets?: number;
   };
+  threadCandidates?: MechanismThreadCandidate[];
+};
+
+type MechanismThreadCandidate = {
+  summary: string;
+  target: string;
+  pathway: string;
+  drug: string;
+  diseases: string[];
+  nodeIds: string[];
+  edgeIds: string[];
+  supportScore: number;
+  connectedAcrossAnchors?: boolean;
 };
 
 type PathFocusSnapshot = {
@@ -159,6 +175,7 @@ type PathFocusSnapshot = {
   targets: string[];
   pathways: string[];
   drugs: string[];
+  threads: MechanismThreadCandidate[];
 };
 
 type SupplementalEvidenceCitation = {
@@ -1621,6 +1638,95 @@ function buildGraphPathContext(input: {
     edgeTrail,
     connectedAcrossAnchors: Boolean(input.pathUpdate.connectedAcrossAnchors),
     unresolvedAnchorPairs: input.pathUpdate.unresolvedAnchorPairs ?? [],
+    threadCandidates: (input.pathUpdate.threadCandidates ?? []).slice(0, 3).map((thread) => ({
+      summary: sanitizePathSummaryForNarrative(thread.summary),
+      target: thread.target,
+      pathway: thread.pathway,
+      drug: thread.drug,
+      diseases: thread.diseases.slice(0, 3),
+      supportScore: thread.supportScore,
+      connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
+    })),
+  };
+}
+
+function mergeThreadCandidates(
+  primary: MechanismThreadCandidate[],
+  secondary: MechanismThreadCandidate[],
+  limit = 3,
+): MechanismThreadCandidate[] {
+  const merged: MechanismThreadCandidate[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: MechanismThreadCandidate | null | undefined) => {
+    if (!candidate) return;
+    const summary = sanitizePathSummaryForNarrative(candidate.summary);
+    const target = String(candidate.target ?? "").trim().toUpperCase();
+    const pathway = String(candidate.pathway ?? "").trim().toUpperCase();
+    const key = `${target}::${pathway}::${summary.toLowerCase()}`;
+    if (!summary || seen.has(key)) return;
+    seen.add(key);
+    merged.push({
+      ...candidate,
+      summary,
+    });
+  };
+  for (const row of primary) {
+    if (merged.length >= limit) break;
+    push(row);
+  }
+  for (const row of secondary) {
+    if (merged.length >= limit) break;
+    push(row);
+  }
+  return merged.slice(0, limit);
+}
+
+function buildThreadCandidateFromPathUpdate(input: {
+  pathUpdate: DerivedPathUpdate;
+  nodeMap: Map<string, GraphNode>;
+}): MechanismThreadCandidate {
+  const { pathUpdate, nodeMap } = input;
+  const diseases: string[] = [];
+  const targets: string[] = [];
+  const pathways: string[] = [];
+  const drugs: string[] = [];
+
+  const pushUnique = (bucket: string[], value: string | null | undefined) => {
+    const normalized = String(value ?? "").trim();
+    if (!normalized) return;
+    if (!bucket.includes(normalized)) bucket.push(normalized);
+  };
+
+  for (const nodeId of pathUpdate.nodeIds) {
+    const node = nodeMap.get(nodeId);
+    if (!node) continue;
+    if (node.type === "disease") {
+      pushUnique(diseases, String(node.meta.displayName ?? node.label ?? "").trim());
+      continue;
+    }
+    if (node.type === "target") {
+      pushUnique(targets, String(node.meta.targetSymbol ?? node.label ?? "").trim());
+      continue;
+    }
+    if (node.type === "pathway") {
+      pushUnique(pathways, String(node.meta.displayName ?? node.label ?? "").trim());
+      continue;
+    }
+    if (node.type === "drug") {
+      pushUnique(drugs, String(node.meta.displayName ?? node.label ?? "").trim());
+    }
+  }
+
+  return {
+    summary: sanitizePathSummaryForNarrative(pathUpdate.summary),
+    target: targets[0] ?? "not provided",
+    pathway: pathways[0] ?? "not provided",
+    drug: drugs[0] ?? "not provided",
+    diseases,
+    nodeIds: pathUpdate.nodeIds.slice(0, 32),
+    edgeIds: pathUpdate.edgeIds.slice(0, 32),
+    supportScore: Math.max(0.2, pathUpdate.edgeIds.length + (pathUpdate.connectedAcrossAnchors ? 1.5 : 0)),
+    connectedAcrossAnchors: Boolean(pathUpdate.connectedAcrossAnchors),
   };
 }
 
@@ -1674,6 +1780,16 @@ function derivePathFocusSnapshot(input: {
     }
   }
 
+  const baseThread = buildThreadCandidateFromPathUpdate({
+    pathUpdate,
+    nodeMap,
+  });
+  const mergedThreads = mergeThreadCandidates(
+    [baseThread],
+    pathUpdate.threadCandidates ?? [],
+    3,
+  );
+
   return {
     summary: sanitizePathSummaryForNarrative(pathUpdate.summary),
     connectedAcrossAnchors: Boolean(pathUpdate.connectedAcrossAnchors),
@@ -1682,6 +1798,7 @@ function derivePathFocusSnapshot(input: {
     targets,
     pathways,
     drugs,
+    threads: mergedThreads,
   };
 }
 
@@ -1711,11 +1828,31 @@ function mergePathFocusIntoBrief(
   brief: ReturnType<typeof generateBriefSections>,
   pathFocus: PathFocusSnapshot | null,
 ): ReturnType<typeof generateBriefSections> {
-  if (!pathFocus?.connectedAcrossAnchors) return brief;
+  if (!pathFocus) return brief;
+  const mergedThreadCandidates = mergeThreadCandidates(
+    pathFocus.threads ?? [],
+    brief.threadCandidates ?? [],
+    3,
+  );
+  if (!pathFocus.connectedAcrossAnchors) {
+    if (mergedThreadCandidates.length === 0) return brief;
+    return {
+      ...brief,
+      threadCandidates: mergedThreadCandidates,
+    };
+  }
   const primaryTarget = pathFocus.targets[0];
-  if (!primaryTarget || !brief.recommendation) return brief;
+  if (!primaryTarget || !brief.recommendation) {
+    return {
+      ...brief,
+      threadCandidates: mergedThreadCandidates,
+    };
+  }
   if (brief.recommendation.target?.toUpperCase() === primaryTarget.toUpperCase()) {
-    return brief;
+    return {
+      ...brief,
+      threadCandidates: mergedThreadCandidates,
+    };
   }
   const primaryPathway = pathFocus.pathways[0] ?? "not provided";
   const primaryDrug = pathFocus.drugs[0] ?? "not provided";
@@ -1728,6 +1865,7 @@ function mergePathFocusIntoBrief(
 
   return {
     ...brief,
+    threadCandidates: mergedThreadCandidates,
     recommendation: {
       ...brief.recommendation,
       target: primaryTarget,
@@ -1761,6 +1899,7 @@ function alignKeyFindingsToPath(
   final: DiscovererFinal,
   pathFocus: PathFocusSnapshot | null,
   activePathSummary: string | null,
+  threadCandidates?: MechanismThreadCandidate[],
 ): DiscovererFinal {
   if (!pathFocus?.connectedAcrossAnchors) return final;
   const summary =
@@ -1790,6 +1929,16 @@ function alignKeyFindingsToPath(
 
   if (!replaced) {
     keyFindings.unshift(`Strongest thread: ${summary}`);
+  }
+  const alternates = (threadCandidates ?? [])
+    .map((item) => sanitizePathSummaryForNarrative(item.summary))
+    .filter((item) => item.length > 0 && item.toLowerCase() !== summary.toLowerCase())
+    .slice(0, 2);
+  if (alternates.length > 0) {
+    const alternateLine = `Additional supported threads: ${alternates.join(" | ")}`;
+    if (!keyFindings.some((item) => item.toLowerCase().startsWith("additional supported threads:"))) {
+      keyFindings.push(alternateLine);
+    }
   }
 
   return {
@@ -1866,6 +2015,7 @@ function buildScientificTemplateHintsFromDraft(input: {
   draft: DiscovererFinal;
   activePathSummary: string | null;
   pathFocus?: PathFocusSnapshot | null;
+  threadCandidates?: MechanismThreadCandidate[];
 }): ScientificTemplateHints {
   const pathSummary =
     sanitizePathSummaryForNarrative(input.activePathSummary) ||
@@ -1885,10 +2035,24 @@ function buildScientificTemplateHintsFromDraft(input: {
   ]
     .map((row) => clean(String(row ?? "")))
     .filter(Boolean);
+  const threadHints = (input.threadCandidates ?? [])
+    .map((thread, index) => {
+      const summary = sanitizePathSummaryForNarrative(thread.summary);
+      if (!summary) return "";
+      return `Supported thread ${index + 1}: ${summary}.`;
+    })
+    .filter(Boolean)
+    .slice(0, 3);
+  const evidenceItems = [
+    ...(input.draft.keyFindings ?? []),
+    ...(threadHints.length > 1 ? [threadHints.join(" ")] : threadHints),
+  ]
+    .map((item) => clean(String(item ?? "")))
+    .filter(Boolean);
 
   return {
     workingConclusion: truncateWords(workingHintParts.join(" "), 150),
-    evidenceItems: (input.draft.keyFindings ?? []).map((item) => clean(String(item ?? ""))).filter(Boolean),
+    evidenceItems,
     interpretation: interpretationParts.join(" "),
     nextActions: (input.draft.nextActions ?? []).map((item) => clean(String(item ?? ""))).filter(Boolean),
     residualUncertainty: caveats,
@@ -1900,6 +2064,7 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
   answer: string;
   draft: DiscovererFinal;
   pathFocus?: PathFocusSnapshot | null;
+  threadCandidates?: MechanismThreadCandidate[];
   graphPathContext?: ReturnType<typeof buildGraphPathContext> | null;
   queryPlan?: ResolvedQueryPlan | null;
   allowedEntityLabels?: string[];
@@ -1914,6 +2079,7 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
         draft: input.draft,
         activePathSummary: input.pathFocus?.summary ?? null,
         pathFocus: input.pathFocus,
+        threadCandidates: input.threadCandidates ?? [],
       }),
     ),
     700,
@@ -1950,6 +2116,7 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
                     "### Residual uncertainty",
                     "Check that uncertainty is mostly confined to the final section.",
                     "Check that claims match graph-supported entities and no new unsupported entities are introduced.",
+                    "If threadCandidates has 2 or more items, ensure the answer mentions at least two supported threads (primary + alternate) in evidence synthesis.",
                     "Check inline numeric citations are present and use only ledger indices.",
                     "Return JSON only with keys:",
                     "requiresRevision (boolean), templateCompliant (boolean), graphAligned (boolean), citationUse ('ok'|'weak'|'missing'), highPriorityFixes (string[]), revisionPlan (string).",
@@ -1967,6 +2134,13 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
                       query: input.query,
                       answer: normalizedAnswer,
                       pathFocus: input.pathFocus ?? null,
+                      threadCandidates: (input.threadCandidates ?? []).slice(0, 3).map((thread) => ({
+                        summary: sanitizePathSummaryForNarrative(thread.summary),
+                        target: thread.target,
+                        pathway: thread.pathway,
+                        drug: thread.drug,
+                        diseases: thread.diseases,
+                      })),
                       graphPathContext: input.graphPathContext ?? null,
                       queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
                         mention: anchor.mention,
@@ -2031,6 +2205,7 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
                     "### What to test next",
                     "### Residual uncertainty",
                     "Keep the answer evidence-grounded and aligned to graph-supported entities.",
+                    "When threadCandidates has 2 or more entries, include at least two supported mechanism routes while keeping one primary conclusion.",
                     "Use only allowed entities and provided citation indices.",
                     "Use inline numeric citations [n] after factual claims.",
                     "Keep uncertainty concise and mostly in the final section.",
@@ -2057,6 +2232,13 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
                         revisionPlan: "Repair template and align claims to evidence.",
                       },
                       pathFocus: input.pathFocus ?? null,
+                      threadCandidates: (input.threadCandidates ?? []).slice(0, 3).map((thread) => ({
+                        summary: sanitizePathSummaryForNarrative(thread.summary),
+                        target: thread.target,
+                        pathway: thread.pathway,
+                        drug: thread.drug,
+                        diseases: thread.diseases,
+                      })),
                       graphPathContext: input.graphPathContext ?? null,
                       allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                       queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
@@ -2106,6 +2288,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
     draft: input.draft,
     activePathSummary: input.activePathSummary,
     pathFocus: input.pathFocus,
+    threadCandidates: input.brief.threadCandidates ?? [],
   });
   if (!synthesisClient || citations.length === 0) {
     const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
@@ -2149,6 +2332,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
                       "### Residual uncertainty",
                       "The first paragraph must answer the user question directly in concrete biomedical terms and include a practical next step.",
                       "Prioritize the graph-supported mechanism path as the primary answer thread when a path context is provided.",
+                      "If threadCandidates includes multiple plausible routes, summarize 2-3 graph-supported threads (one primary plus alternatives).",
                       "If the path focus is connected across query anchors, the first paragraph must center on the path focus target/pathway and stay consistent with that trail.",
                       "Do not assert a primary mechanism hop that is absent from the provided graph path edge trail.",
                       "Keep conclusions and mechanism discussion focused on entities present in the allowed graph entity labels.",
@@ -2194,6 +2378,15 @@ async function groundFinalAnswerWithInlineCitations(input: {
                         activePathSummary: input.activePathSummary,
                         graphPathContext: input.graphPathContext ?? null,
                         pathFocus: input.pathFocus ?? null,
+                        threadCandidates: (input.brief.threadCandidates ?? []).slice(0, 3).map((thread) => ({
+                          summary: sanitizePathSummaryForNarrative(thread.summary),
+                          target: thread.target,
+                          pathway: thread.pathway,
+                          drug: thread.drug,
+                          diseases: thread.diseases,
+                          supportScore: thread.supportScore,
+                          connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
+                        })),
                         allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                         recommendation: input.brief.recommendation ?? null,
                         evidenceSummary: input.brief.evidenceSummary ?? null,
@@ -2300,6 +2493,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
                         "### What to test next",
                         "### Residual uncertainty",
                         "The working conclusion and supporting mechanism bullets must center on the required graph-supported path focus target/pathway.",
+                        "When multiple threadCandidates are provided, keep one primary thread and include up to two concise alternatives that are also graph-supported.",
                         "Do not add unsupported claims.",
                         "Keep uncertainty concise (<=10%).",
                         "Keep inline numeric citation markers.",
@@ -2318,6 +2512,14 @@ async function groundFinalAnswerWithInlineCitations(input: {
                           query: input.query,
                           currentAnswer: grounded,
                           requiredPathFocus: input.pathFocus,
+                          threadCandidates: (input.brief.threadCandidates ?? []).slice(0, 3).map((thread) => ({
+                            summary: sanitizePathSummaryForNarrative(thread.summary),
+                            target: thread.target,
+                            pathway: thread.pathway,
+                            drug: thread.drug,
+                            diseases: thread.diseases,
+                            supportScore: thread.supportScore,
+                          })),
                           graphPathContext: input.graphPathContext ?? null,
                           allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                           recommendation: input.brief.recommendation ?? null,
@@ -2361,6 +2563,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
         answer: grounded,
         draft: input.draft,
         pathFocus: input.pathFocus ?? null,
+        threadCandidates: input.brief.threadCandidates ?? [],
         graphPathContext: input.graphPathContext ?? null,
         queryPlan: input.queryPlan ?? null,
         allowedEntityLabels: input.allowedEntityLabels ?? [],
@@ -2402,19 +2605,24 @@ async function synthesizeFallbackFinalAnswer(input: {
   if (!synthesisClient) return null;
 
   const recommendation = input.brief.recommendation ?? null;
+  const threadCandidates = (input.brief.threadCandidates ?? []).slice(0, 3);
+  const primaryThread = threadCandidates[0] ?? null;
   const pathFocusConnected = Boolean(
     input.pathFocus?.connectedAcrossAnchors && (input.pathFocus.targets[0] || input.pathFocus.pathways[0]),
   );
   const focusPathway =
     (pathFocusConnected ? input.pathFocus?.pathways[0] : null)?.trim() ||
+    primaryThread?.pathway?.trim() ||
     recommendation?.pathway?.trim() ||
     "not provided";
   const focusTarget =
     (pathFocusConnected ? input.pathFocus?.targets[0] : null)?.trim() ||
+    primaryThread?.target?.trim() ||
     recommendation?.target?.trim() ||
     "not provided";
   const focusDrug =
     (pathFocusConnected ? input.pathFocus?.drugs[0] : null)?.trim() ||
+    primaryThread?.drug?.trim() ||
     recommendation?.drugHook?.trim() ||
     "not provided";
   const prioritizedCitations = prioritizeCitationsForGrounding(
@@ -2457,6 +2665,7 @@ async function synthesizeFallbackFinalAnswer(input: {
                       "### Residual uncertainty",
                       "Start with a direct answer sentence to the query and include a practical next step.",
                       "When path focus is connected across anchors, center the answer on that target/pathway thread.",
+                      "If threadCandidates includes multiple plausible routes, summarize 2-3 graph-supported threads (one primary plus alternatives).",
                       "Write a substantive summary (~500-700 words), not a one-liner.",
                       "Use concrete biomedical entities and keep mechanism detail proportional to its decision value.",
                       "Balance mechanism with directly useful interpretation; include 2-3 concrete experimental or translational next actions with expected readouts.",
@@ -2490,6 +2699,15 @@ async function synthesizeFallbackFinalAnswer(input: {
                         selectedDisease: input.selectedDiseaseName,
                         activePathSummary: input.activePathSummary,
                         pathFocus: input.pathFocus ?? null,
+                        threadCandidates: threadCandidates.map((thread) => ({
+                          summary: sanitizePathSummaryForNarrative(thread.summary),
+                          target: thread.target,
+                          pathway: thread.pathway,
+                          drug: thread.drug,
+                          diseases: thread.diseases,
+                          supportScore: thread.supportScore,
+                          connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
+                        })),
                         allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                         recommendation,
                         alternatives: (input.brief.alternatives ?? []).slice(0, 3),
@@ -2522,6 +2740,9 @@ async function synthesizeFallbackFinalAnswer(input: {
     const keyFindings = [
       recommendation?.why?.trim() || "",
       recommendation?.interactionHook?.trim() || "",
+      ...threadCandidates.map(
+        (thread, index) => `Thread ${index + 1}: ${sanitizePathSummaryForNarrative(thread.summary)}`,
+      ),
       `Citations mapped: ${citationCount}`,
     ].filter(Boolean).slice(0, 6);
     const caveats = prioritizeCaveatsForAnswer(input.brief.caveats ?? [], 2);
@@ -2533,7 +2754,11 @@ async function synthesizeFallbackFinalAnswer(input: {
     const templateHints: ScientificTemplateHints = {
       workingConclusion: recommendation?.why ?? input.activePathSummary ?? input.query,
       evidenceItems: keyFindings,
-      interpretation: recommendation?.interactionHook ?? input.activePathSummary ?? "",
+      interpretation:
+        recommendation?.interactionHook ??
+        primaryThread?.summary ??
+        input.activePathSummary ??
+        "",
       nextActions,
       residualUncertainty: caveats,
     };
@@ -2925,6 +3150,7 @@ type DerivedPathUpdate = {
   summary: string;
   connectedAcrossAnchors?: boolean;
   unresolvedAnchorPairs?: string[];
+  threadCandidates?: MechanismThreadCandidate[];
 };
 
 function normalizeForMatch(value: string): string {
@@ -3106,7 +3332,10 @@ function deriveAnchorPathUpdate(
   const explicitAnchors = allAnchors.filter((anchor) =>
     isAnchorExplicitlyMentionedInQuery(anchor, queryPlan?.query ?? ""),
   );
-  const anchors = (explicitAnchors.length >= 2 ? explicitAnchors : allAnchors).slice(0, 5);
+  const anchors = (explicitAnchors.length >= 2 ? explicitAnchors : allAnchors).slice(
+    0,
+    MAX_ANCHOR_PATH_INPUTS,
+  );
   if (anchors.length < 2) return null;
 
   const anchorNodeIds = anchors
@@ -3684,6 +3913,134 @@ function findTargetNodeBySymbol(nodeMap: Map<string, GraphNode>, symbol: string)
   return null;
 }
 
+function buildMechanismThreadCandidateFromTargetSymbol(input: {
+  symbol: string;
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+  focusBoost: number;
+}): MechanismThreadCandidate | null {
+  const targetNode = findTargetNodeBySymbol(input.nodeMap, input.symbol);
+  if (!targetNode) return null;
+
+  const edges = [...input.edgeMap.values()];
+  const diseaseEdges = edges
+    .filter((edge) => edge.type === "disease_target" && edge.target === targetNode.id)
+    .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
+  if (diseaseEdges.length === 0) return null;
+
+  const primaryDiseaseEdge = diseaseEdges[0]!;
+  const secondaryDiseaseEdge = diseaseEdges.find((edge) => edge.source !== primaryDiseaseEdge.source) ?? null;
+  const pathwayEdge =
+    edges
+      .filter((edge) => edge.type === "target_pathway" && edge.source === targetNode.id)
+      .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))[0] ?? null;
+  const drugEdge =
+    edges
+      .filter((edge) => edge.type === "target_drug" && edge.source === targetNode.id)
+      .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))[0] ?? null;
+
+  const primaryDiseaseNode = input.nodeMap.get(primaryDiseaseEdge.source);
+  const pathwayNode = pathwayEdge ? input.nodeMap.get(pathwayEdge.target) : null;
+  const drugNode = drugEdge ? input.nodeMap.get(drugEdge.target) : null;
+
+  const diseaseNames = [
+    String(primaryDiseaseNode?.meta.displayName ?? primaryDiseaseNode?.label ?? "").trim(),
+    secondaryDiseaseEdge
+      ? String(
+          input.nodeMap.get(secondaryDiseaseEdge.source)?.meta.displayName ??
+            input.nodeMap.get(secondaryDiseaseEdge.source)?.label ??
+            "",
+        ).trim()
+      : "",
+  ].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+
+  const threadLabels = [
+    diseaseNames[0] ?? "",
+    String(targetNode.meta.targetSymbol ?? targetNode.label ?? "").trim(),
+    String(pathwayNode?.meta.displayName ?? pathwayNode?.label ?? "").trim(),
+    String(drugNode?.meta.displayName ?? drugNode?.label ?? "").trim(),
+  ].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+
+  const nodeIds = [
+    primaryDiseaseEdge.source,
+    targetNode.id,
+    pathwayEdge?.target ?? null,
+    drugEdge?.target ?? null,
+  ].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+  const edgeIds = [
+    primaryDiseaseEdge.id,
+    pathwayEdge?.id ?? null,
+    drugEdge?.id ?? null,
+  ].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+  const targetScore = Number(targetNode.meta.openTargetsEvidence ?? targetNode.score ?? 0);
+  const supportScore =
+    Math.max(0, primaryDiseaseEdge.weight ?? 0) * 1.5 +
+    Math.max(0, pathwayEdge?.weight ?? 0) * 0.7 +
+    Math.max(0, drugEdge?.weight ?? 0) * 0.35 +
+    Math.max(0, targetScore) * 0.6 +
+    (secondaryDiseaseEdge ? 0.25 : 0) +
+    input.focusBoost;
+
+  return {
+    summary: threadLabels.join(" -> "),
+    target: String(targetNode.meta.targetSymbol ?? targetNode.label ?? "").trim() || "not provided",
+    pathway: String(pathwayNode?.meta.displayName ?? pathwayNode?.label ?? "").trim() || "not provided",
+    drug: String(drugNode?.meta.displayName ?? drugNode?.label ?? "").trim() || "not provided",
+    diseases: diseaseNames.slice(0, 2),
+    nodeIds,
+    edgeIds,
+    supportScore: Number(supportScore.toFixed(4)),
+    connectedAcrossAnchors: Boolean(secondaryDiseaseEdge),
+  };
+}
+
+function buildMechanismThreadCandidates(input: {
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+  selectedSymbol: string | null;
+  rankedSymbols: string[];
+  pathFocusTargetSymbols: string[];
+  limit?: number;
+}): MechanismThreadCandidate[] {
+  const limit = Math.max(1, Math.min(5, input.limit ?? 3));
+  const focusSet = new Set(input.pathFocusTargetSymbols.map((item) => item.trim().toUpperCase()));
+  const seedSymbols = [
+    ...(input.pathFocusTargetSymbols ?? []),
+    input.selectedSymbol ?? "",
+    ...input.rankedSymbols.slice(0, 8),
+  ]
+    .map((value) => value.trim().toUpperCase())
+    .filter(Boolean)
+    .filter((value, index, all) => all.indexOf(value) === index);
+
+  const candidates = seedSymbols
+    .map((symbol) =>
+      buildMechanismThreadCandidateFromTargetSymbol({
+        symbol,
+        nodeMap: input.nodeMap,
+        edgeMap: input.edgeMap,
+        focusBoost: focusSet.has(symbol) ? 0.8 : 0,
+      }),
+    )
+    .filter((value): value is MechanismThreadCandidate => Boolean(value))
+    .sort((left, right) => right.supportScore - left.supportScore);
+
+  if (candidates.length === 0) return [];
+
+  const selectedSymbol = (input.selectedSymbol ?? "").trim().toUpperCase();
+  if (selectedSymbol) {
+    const selectedIndex = candidates.findIndex(
+      (candidate) => candidate.target.toUpperCase() === selectedSymbol,
+    );
+    if (selectedIndex > 0) {
+      const [selected] = candidates.splice(selectedIndex, 1);
+      if (selected) candidates.unshift(selected);
+    }
+  }
+
+  return mergeThreadCandidates(candidates, [], limit);
+}
+
 function normalizeCitationText(value: unknown, fallback: string): string {
   if (typeof value === "string" && value.trim().length > 0) {
     return value.trim().slice(0, 180);
@@ -4147,6 +4504,278 @@ function buildVerdictCitations(options: {
   return citations;
 }
 
+type GeneratedBriefSections = {
+  recommendation: {
+    target: string;
+    score: number;
+    why: string;
+    pathway: string;
+    drugHook: string;
+    interactionHook: string;
+  } | null;
+  alternatives: Array<{
+    symbol: string;
+    score: number;
+    reason: string;
+    caveat: string;
+  }>;
+  evidenceTrace: Array<{
+    symbol: string;
+    score: number;
+    refs: Array<{ field: string; value: string | number | boolean }>;
+  }>;
+  citations: NonNullable<FinalBriefSnapshot["citations"]>;
+  evidenceSummary: {
+    targetsWithEvidence: number;
+    articleSnippets: number;
+    trialSnippets: number;
+    citationCount: number;
+    citationBreakdown: {
+      article: number;
+      trial: number;
+      metric: number;
+    };
+  };
+  threadCandidates: MechanismThreadCandidate[];
+  caveats: string[];
+  nextActions: string[];
+  queryAlignment: {
+    status: "matched" | "anchored" | "mismatch" | "none";
+    requestedMentions: string[];
+    requestedTargetSymbols: string[];
+    matchedTarget?: string;
+    baselineTop?: string;
+    note: string;
+  };
+};
+
+type ThreadArbitrationDecision = {
+  primaryIndex: number;
+  orderedIndices: number[];
+};
+
+function parseThreadArbitrationDecision(
+  raw: string,
+  candidateCount: number,
+): ThreadArbitrationDecision | null {
+  const parsed = parseModelJsonObject(raw);
+  if (!parsed) return null;
+  const primaryIndexRaw = Number(parsed.primaryIndex);
+  const primaryIndex = Number.isFinite(primaryIndexRaw) ? Math.floor(primaryIndexRaw) : 0;
+  if (primaryIndex < 0 || primaryIndex >= candidateCount) return null;
+
+  const orderedIndicesRaw = Array.isArray(parsed.orderedIndices)
+    ? parsed.orderedIndices
+        .map((item) => Number(item))
+        .filter((item) => Number.isFinite(item))
+        .map((item) => Math.floor(item))
+        .filter((item) => item >= 0 && item < candidateCount)
+    : [];
+  const deduped = orderedIndicesRaw.filter(
+    (item, index, all) => all.indexOf(item) === index,
+  );
+  if (!deduped.includes(primaryIndex)) {
+    deduped.unshift(primaryIndex);
+  } else {
+    deduped.sort((left, right) =>
+      left === primaryIndex ? -1 : right === primaryIndex ? 1 : 0,
+    );
+  }
+  for (let index = 0; index < candidateCount; index += 1) {
+    if (!deduped.includes(index)) deduped.push(index);
+  }
+  return {
+    primaryIndex,
+    orderedIndices: deduped.slice(0, candidateCount),
+  };
+}
+
+function reorderAlternativesFromThreads(
+  brief: GeneratedBriefSections,
+  threads: MechanismThreadCandidate[],
+): GeneratedBriefSections["alternatives"] {
+  if (threads.length <= 1) return brief.alternatives;
+  const existingBySymbol = new Map(
+    brief.alternatives.map((item) => [item.symbol.trim().toUpperCase(), item]),
+  );
+  const ordered: GeneratedBriefSections["alternatives"] = [];
+  for (const thread of threads.slice(1)) {
+    const symbol = thread.target.trim().toUpperCase();
+    if (!symbol) continue;
+    const existing = existingBySymbol.get(symbol);
+    if (existing) {
+      ordered.push(existing);
+      continue;
+    }
+    const scoreFromTrace =
+      brief.evidenceTrace.find((item) => item.symbol.trim().toUpperCase() === symbol)?.score ??
+      Math.max(0.1, Math.min(0.98, thread.supportScore / 3.2));
+    ordered.push({
+      symbol: thread.target,
+      score: Number(scoreFromTrace.toFixed(4)),
+      reason: `Thread support: ${sanitizePathSummaryForNarrative(thread.summary).slice(0, 140)}`,
+      caveat: thread.connectedAcrossAnchors
+        ? "Secondary thread with cross-entity support"
+        : "Secondary thread with partial cross-entity support",
+    });
+  }
+  for (const item of brief.alternatives) {
+    if (!ordered.some((candidate) => candidate.symbol === item.symbol)) {
+      ordered.push(item);
+    }
+    if (ordered.length >= 5) break;
+  }
+  return ordered.slice(0, 5);
+}
+
+function applyThreadSelectionToBrief(
+  brief: GeneratedBriefSections,
+  threads: MechanismThreadCandidate[],
+): GeneratedBriefSections {
+  if (threads.length === 0) return brief;
+  const primary = threads[0]!;
+  if (!brief.recommendation) {
+    return {
+      ...brief,
+      threadCandidates: threads,
+      alternatives: reorderAlternativesFromThreads(brief, threads),
+    };
+  }
+  const traceForPrimary = brief.evidenceTrace.find(
+    (item) => item.symbol.trim().toUpperCase() === primary.target.trim().toUpperCase(),
+  );
+  const recommendationScore = Number(
+    (traceForPrimary?.score ?? brief.recommendation.score ?? 0).toFixed(4),
+  );
+  const recommendationWhy = clean(
+    `${brief.recommendation.why ?? ""} Primary thread selected via query-aligned evidence arbitration.`,
+  );
+  return {
+    ...brief,
+    recommendation: {
+      ...brief.recommendation,
+      target: primary.target || brief.recommendation.target,
+      pathway: primary.pathway || brief.recommendation.pathway,
+      drugHook: primary.drug || brief.recommendation.drugHook,
+      score: recommendationScore,
+      why: recommendationWhy || brief.recommendation.why,
+    },
+    threadCandidates: threads,
+    alternatives: reorderAlternativesFromThreads(brief, threads),
+  };
+}
+
+async function arbitratePrimaryThreadCandidate(input: {
+  query: string;
+  brief: GeneratedBriefSections;
+  queryPlan?: ResolvedQueryPlan | null;
+  timeoutMs: number;
+}): Promise<GeneratedBriefSections> {
+  const threads = (input.brief.threadCandidates ?? []).slice(0, 3);
+  if (threads.length < 2) return input.brief;
+  const arbitrationClient = createTrackedOpenAIClient();
+  if (!arbitrationClient) return input.brief;
+
+  const timeoutMs = Math.max(2_500, Math.min(12_000, input.timeoutMs));
+  const queryAnchors = (input.queryPlan?.anchors ?? [])
+    .slice(0, 8)
+    .map((anchor) => ({
+      mention: anchor.mention,
+      entityType: anchor.entityType,
+      id: anchor.id,
+      name: anchor.name,
+      confidence: Number(anchor.confidence.toFixed(3)),
+    }));
+  const evidenceTrace = input.brief.evidenceTrace.slice(0, 8).map((item) => ({
+    symbol: item.symbol,
+    score: item.score,
+    refs: item.refs.slice(0, 4),
+  }));
+
+  const response = await withOpenAiOperationContext(
+    "run_case.primary_thread_arbitration",
+    () =>
+      withTimeout(
+        arbitrationClient.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 260,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Select the best primary mechanism thread candidate for the user query.",
+                    "Prefer threads that best match explicit query anchors and biologically coherent routes.",
+                    "Use candidate support, evidence trace, and cross-entity connectivity as tie-breakers.",
+                    "Do not introduce entities that are not present in candidates.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify({
+                    query: input.query,
+                    queryAnchors,
+                    candidates: threads.map((thread, index) => ({
+                      index,
+                      summary: sanitizePathSummaryForNarrative(thread.summary),
+                      target: thread.target,
+                      pathway: thread.pathway,
+                      drug: thread.drug,
+                      diseases: thread.diseases,
+                      supportScore: thread.supportScore,
+                      connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
+                    })),
+                    evidenceTrace,
+                  }),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "thread_arbitration",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  primaryIndex: { type: "integer" },
+                  orderedIndices: {
+                    type: "array",
+                    items: { type: "integer" },
+                  },
+                  rationale: { type: "string" },
+                },
+                required: ["primaryIndex", "orderedIndices", "rationale"],
+              },
+            },
+          },
+        }),
+        timeoutMs,
+      ),
+  ).catch(() => null);
+  if (!response) return input.brief;
+
+  const decision = parseThreadArbitrationDecision(String(response.output_text ?? ""), threads.length);
+  if (!decision) return input.brief;
+
+  const reordered = decision.orderedIndices
+    .map((index) => threads[index])
+    .filter((thread): thread is MechanismThreadCandidate => Boolean(thread));
+  if (reordered.length === 0) return input.brief;
+  return applyThreadSelectionToBrief(input.brief, reordered);
+}
+
 function generateBriefSections(options: {
   ranking: RankingResponse | null;
   nodeMap: Map<string, GraphNode>;
@@ -4160,7 +4789,7 @@ function generateBriefSections(options: {
   pathConnectedAcrossAnchors?: boolean;
   unresolvedAnchorPairCount?: number;
   enrichmentLinksByNodeId: EnrichmentLinksByNodeId;
-}) {
+}): GeneratedBriefSections {
   const {
     ranking,
     nodeMap,
@@ -4203,11 +4832,18 @@ function generateBriefSections(options: {
       evidenceTrace: [],
       citations: [],
       evidenceSummary,
+      threadCandidates: [],
       caveats: ["No ranked target evidence available yet."],
       nextActions: [
         "Increase run depth or retry with more specific disease phrasing.",
         "Inspect source health to identify degraded inputs.",
       ],
+      queryAlignment: {
+        status: "none",
+        requestedMentions: semanticConceptMentions,
+        requestedTargetSymbols: [],
+        note: "No ranked target evidence available for alignment checks.",
+      },
     };
   }
 
@@ -4279,6 +4915,14 @@ function generateBriefSections(options: {
 
   const pathways = selectedTop?.pathwayHooks ?? [];
   const dataGaps = resolvedRanking.systemSummary.dataGaps;
+  const threadCandidates = buildMechanismThreadCandidates({
+    nodeMap,
+    edgeMap,
+    selectedSymbol: selectedTop?.symbol ?? null,
+    rankedSymbols: boostedRanking.map((item) => item.symbol),
+    pathFocusTargetSymbols: [...pathFocusSet],
+    limit: 3,
+  });
 
   const alternatives = boostedRanking
     .filter((item) => item.symbol !== selectedTop?.symbol)
@@ -4424,6 +5068,7 @@ function generateBriefSections(options: {
     evidenceTrace,
     citations,
     evidenceSummary,
+    threadCandidates,
     caveats: reconciledCaveats,
     nextActions,
     queryAlignment,
@@ -5374,12 +6019,12 @@ export async function GET(request: NextRequest) {
           const settled = await Promise.allSettled(
             secondaryAnchorSeedCandidates.slice(0, 2).map(async (candidate) => {
               const rows = await withTimeout(
-                getDiseaseTargetsSummary(candidate.id, 5),
+                getDiseaseTargetsSummary(candidate.id, SECONDARY_ANCHOR_TARGET_LIMIT),
                 Math.min(DISEASE_SEARCH_TIMEOUT_MS, 8_000),
               );
               return {
                 candidate,
-                rows: rows.slice(0, 5),
+                rows: rows.slice(0, SECONDARY_ANCHOR_SEED_ROWS),
                 symbols: rows
                   .map((row) => row.targetSymbol?.trim().toUpperCase())
                   .filter((symbol): symbol is string => Boolean(symbol && symbol.length >= 2)),
@@ -6464,6 +7109,20 @@ export async function GET(request: NextRequest) {
                   supplementalEvidence,
                 );
                 brief = mergePathFocusIntoBrief(brief, initialPathFocus);
+                {
+                  const arbitrationTimeoutMs = boundedStageTimeoutMs(startedAt, 8_000, {
+                    reserveMs: 18_000,
+                    minMs: 2_500,
+                  });
+                  if (arbitrationTimeoutMs > 0) {
+                    brief = await arbitratePrimaryThreadCandidate({
+                      query,
+                      brief,
+                      queryPlan: resolvedQueryPlan,
+                      timeoutMs: arbitrationTimeoutMs,
+                    });
+                  }
+                }
 
                 const emitBriefSnapshot = (
                   snapshot: ReturnType<typeof generateBriefSections>,
@@ -6640,6 +7299,20 @@ export async function GET(request: NextRequest) {
                       supplementalEvidence,
                     );
                     brief = mergePathFocusIntoBrief(brief, finalPathFocus);
+                    {
+                      const arbitrationTimeoutMs = boundedStageTimeoutMs(startedAt, 8_000, {
+                        reserveMs: 14_000,
+                        minMs: 2_500,
+                      });
+                      if (arbitrationTimeoutMs > 0) {
+                        brief = await arbitratePrimaryThreadCandidate({
+                          query,
+                          brief,
+                          queryPlan: resolvedQueryPlan,
+                          timeoutMs: arbitrationTimeoutMs,
+                        });
+                      }
+                    }
                     emitBriefSnapshot(brief);
 
                     if (!final) {
@@ -6672,6 +7345,7 @@ export async function GET(request: NextRequest) {
                           ),
                           finalPathFocus,
                           sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                          brief.threadCandidates ?? [],
                         );
                         discovererFinal = {
                           ...discovererFinal,
@@ -6717,6 +7391,7 @@ export async function GET(request: NextRequest) {
                         ),
                         finalPathFocus,
                         sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                        brief.threadCandidates ?? [],
                       );
                       const groundingTimeoutMs = boundedStageTimeoutMs(
                         startedAt,
@@ -6749,6 +7424,7 @@ export async function GET(request: NextRequest) {
                         groundedFinal,
                         finalPathFocus,
                         sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                        brief.threadCandidates ?? [],
                       );
                       discovererFinal = {
                         ...discovererFinal,
@@ -6912,6 +7588,20 @@ export async function GET(request: NextRequest) {
             supplementalEvidence,
           );
           brief = mergePathFocusIntoBrief(brief, finalPathFocus);
+          {
+            const arbitrationTimeoutMs = boundedStageTimeoutMs(startedAt, 8_000, {
+              reserveMs: 12_000,
+              minMs: 2_500,
+            });
+            if (arbitrationTimeoutMs > 0) {
+              brief = await arbitratePrimaryThreadCandidate({
+                query,
+                brief,
+                queryPlan: resolvedQueryPlan,
+                timeoutMs: arbitrationTimeoutMs,
+              });
+            }
+          }
 
           emit("brief_section", {
             section: "final_brief",
@@ -6979,6 +7669,7 @@ export async function GET(request: NextRequest) {
                   ),
                   finalPathFocus,
                   sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                  brief.threadCandidates ?? [],
                 );
               }
             }
@@ -6992,6 +7683,7 @@ export async function GET(request: NextRequest) {
               ),
               finalPathFocus,
               sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+              brief.threadCandidates ?? [],
             );
             const groundingTimeoutMs = boundedStageTimeoutMs(
               startedAt,

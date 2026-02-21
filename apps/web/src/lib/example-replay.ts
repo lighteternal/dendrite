@@ -13,8 +13,8 @@ export const EXAMPLE_REPLAY_OPTIONS: ExampleReplayOption[] = [
     query: "How is ALS connected to oxidative stress?",
   },
   {
-    id: "example-alcohol-colorectal-v1",
-    query: "How is alcohol connected to colorectal cancer?",
+    id: "example-t2d-ckd-v1",
+    query: "How is type 2 diabetes connected to chronic kidney disease?",
   },
 ];
 

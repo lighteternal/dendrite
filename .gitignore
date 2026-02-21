@@ -35,3 +35,4 @@ services/mcp-chembl/*
 !services/mcp-chembl/.gitkeep
 services/biomcp/*
 !services/biomcp/.gitkeep
+.vercel

@@ -16,7 +16,11 @@ import {
 } from "@/server/agent/deep-discoverer";
 import { extractRelationMentionsFast } from "@/server/agent/relation-mention-extractor";
 import { type ResolvedQueryPlan } from "@/server/agent/query-plan";
-import { type DiseaseCandidate } from "@/server/openai/disease-resolver";
+import {
+  resolveDiseaseAlternativesLoop,
+  suggestDiseaseResolverMentions,
+  type DiseaseCandidate,
+} from "@/server/openai/disease-resolver";
 import {
   endRequestLog,
   errorRequestLog,
@@ -41,7 +45,7 @@ import {
 } from "@/server/replay/example-replays";
 
 export const runtime = "nodejs";
-export const maxDuration = 800;
+export const maxDuration = 300;
 
 type RunMode = "multihop";
 
@@ -2749,6 +2753,7 @@ function extractDiseaseAnchorMentions(query: string): string[] {
   const connectPatterns = [
     /(.+?)\s+connect(?:ion|ed|s)?\s+(?:to|with|and)\s+(.+?)(?:\s+(?:through|via|using)\s+.+)?$/i,
     /\bconnect(?:ion|ed|s)?\s+(?:between\s+)?(.+?)\s+(?:to|with|and|vs|versus)\s+(.+?)(?:\s+(?:through|via|using)\s+.+)?$/i,
+    /\b(.+?)\s+relat(?:ed|es?)\s+(?:to|with)\s+(.+?)(?:\s+(?:through|via|using)\s+.+)?$/i,
     /\b(.+?)\s+(?:vs|versus)\s+(.+?)$/i,
   ] as const;
   for (const pattern of connectPatterns) {
@@ -2778,7 +2783,8 @@ function allowWholeQueryDiseaseSearch(query: string): boolean {
   const tokenCount = normalized.split(/\s+/).filter(Boolean).length;
   if (tokenCount === 0) return false;
   if (tokenCount > 5) return false;
-  const relationPattern = /\bbetween\b|\bconnect(?:ion)?\b|\brelationship\b|\blink\b|\boverlap\b|\bvs\b|\bversus\b/i;
+  const relationPattern =
+    /\bbetween\b|\bconnect(?:ion)?\b|\brelationship\b|\brelat(?:ed|es?)\b|\blink\b|\boverlap\b|\bassociated\b|\bcorrelated\b|\bvs\b|\bversus\b/i;
   if (relationPattern.test(normalized) && tokenCount > 3) return false;
   return true;
 }
@@ -3373,6 +3379,9 @@ function compactName(value: string, max = 42): string {
 function buildCrossDiseaseBridgePatch(
   primaryDisease: DiseaseCandidate,
   secondaryDiseases: DiseaseCandidate[],
+  options?: {
+    queryAnchorSecondaryIds?: Set<string>;
+  },
 ): {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -3403,8 +3412,11 @@ function buildCrossDiseaseBridgePatch(
     },
   });
 
+  const queryAnchorSecondaryIds = options?.queryAnchorSecondaryIds ?? new Set<string>();
+
   for (const disease of secondaryDiseases.slice(0, 3)) {
     const nodeId = makeNodeId("disease", disease.id);
+    const queryAnchorSecondary = queryAnchorSecondaryIds.has(disease.id);
     secondaryNodeIds.push(nodeId);
     nodes.push({
       id: nodeId,
@@ -3416,7 +3428,7 @@ function buildCrossDiseaseBridgePatch(
       meta: {
         displayName: disease.name,
         description: disease.description,
-        role: "query_anchor_secondary",
+        role: queryAnchorSecondary ? "query_anchor_secondary" : "query_candidate_secondary",
       },
     });
 
@@ -3431,7 +3443,9 @@ function buildCrossDiseaseBridgePatch(
       meta: {
         source: "query_anchor",
         status: "candidate",
-        note: "Searching for mechanistic bridge between query anchors.",
+        note: queryAnchorSecondary
+          ? "Searching for mechanistic bridge between query anchors."
+          : "Exploring additional disease branch discovered during multihop search.",
       },
     });
   }
@@ -3951,6 +3965,50 @@ function summarizeEvidenceCoverage(
   };
 }
 
+function reconcileSnippetCaveats(
+  caveats: string[],
+  evidenceSummary: {
+    articleSnippets: number;
+    trialSnippets: number;
+  },
+): string[] {
+  const articleSnippets = Math.max(0, Number(evidenceSummary.articleSnippets || 0));
+  const trialSnippets = Math.max(0, Number(evidenceSummary.trialSnippets || 0));
+
+  const filtered = caveats.filter((item) => {
+    const normalized = item.toLowerCase();
+    if (articleSnippets > 0 && normalized.includes("no literature snippets")) return false;
+    if (trialSnippets > 0 && normalized.includes("no trial snippets")) return false;
+    if (articleSnippets === 0 && /\b\d+\s+article snippets provided\b/i.test(item)) return false;
+    if (trialSnippets === 0 && /\b\d+\s+trial snippets provided\b/i.test(item)) return false;
+    return true;
+  });
+
+  const hasArticleSnippetLine = filtered.some((item) =>
+    /(?:article snippets provided|no literature snippets provided)/i.test(item),
+  );
+  const hasTrialSnippetLine = filtered.some((item) =>
+    /(?:trial snippets provided|no trial snippets provided)/i.test(item),
+  );
+
+  if (!hasArticleSnippetLine) {
+    filtered.unshift(
+      articleSnippets > 0
+        ? `${articleSnippets} article snippets provided`
+        : "No literature snippets provided",
+    );
+  }
+  if (!hasTrialSnippetLine) {
+    filtered.splice(
+      Math.min(1, filtered.length),
+      0,
+      trialSnippets > 0 ? `${trialSnippets} trial snippets provided` : "No trial snippets provided",
+    );
+  }
+
+  return filtered.filter((item, index, all) => all.indexOf(item) === index);
+}
+
 function buildVerdictCitations(options: {
   selectedSymbol: string | null;
   evidenceTrace: Array<{
@@ -4293,6 +4351,7 @@ function generateBriefSections(options: {
       ? [`Degraded inputs during this run: ${degradedSources.join(", ")}.`] 
       : []),
   ];
+  const reconciledCaveats = reconcileSnippetCaveats(caveats, evidenceSummary);
 
   const nextActions = [
     `Validate perturbation of ${selectedTop?.symbol ?? "top target"} in pathway-relevant assay.`,
@@ -4365,7 +4424,7 @@ function generateBriefSections(options: {
     evidenceTrace,
     citations,
     evidenceSummary,
-    caveats,
+    caveats: reconciledCaveats,
     nextActions,
     queryAlignment,
   };
@@ -4809,14 +4868,33 @@ export async function GET(request: NextRequest) {
           .map((value) => trimDiseaseNoise(value))
           .filter((value) => value.length >= 3)
           .slice(0, 8);
-        const relationMentions = [
+        const relationMentionsSeed = [
           ...typedDiseaseMentions,
           ...llmRelationMentions,
           ...extractDiseaseAnchorMentions(query),
         ]
           .map((value) => trimDiseaseNoise(value))
           .filter((value) => value.length >= 3)
+          .filter((value, index, all) => all.indexOf(value) === index);
+        const llmDiseaseMentions = await suggestDiseaseResolverMentions({
+          query,
+          currentMentions: relationMentionsSeed,
+          maxMentions: 3,
+        }).catch(() => []);
+        const relationMentions = [...relationMentionsSeed, ...llmDiseaseMentions]
+          .map((value) => trimDiseaseNoise(value))
+          .filter((value) => value.length >= 3)
           .filter((value, index, all) => all.indexOf(value) === index)
+          .filter((value, _, all) => {
+            const tokenCount = value.split(/\s+/).filter(Boolean).length;
+            if (tokenCount !== 1) return true;
+            return !all.some(
+              (other) =>
+                other !== value &&
+                other.split(/\s+/).filter(Boolean).length > 1 &&
+                other.includes(value),
+            );
+          })
           .slice(0, 10);
         const mentionAnchoredMatches = allowMentionAnchoredDiseaseExpansion
           ? await resolveMentionAnchoredDiseases(relationMentions, 3)
@@ -4847,6 +4925,26 @@ export async function GET(request: NextRequest) {
             score: diseaseScoreById.get(item.id) ?? scoreDiseaseCandidate(query, item),
           }))
           .sort((a, b) => b.score - a.score);
+
+        const resolverLoop = await resolveDiseaseAlternativesLoop({
+          query,
+          candidates,
+          planDiseaseAnchors: (resolvedQueryPlan?.anchors ?? [])
+            .filter((anchor) => anchor.entityType === "disease")
+            .map((anchor) => ({
+              id: anchor.id,
+              name: anchor.name,
+              description: anchor.description,
+            }))
+            .filter(
+              (candidate) => scoreDiseaseCandidate(query, candidate) >= 0.95,
+            ),
+          relationMentions,
+          maxOptions: 3,
+        }).catch(() => null);
+        const verifierPrimaryCandidate = resolverLoop?.primary ?? null;
+        const verifierAlternativeCandidates = resolverLoop?.alternatives ?? [];
+        const verifierMustKeepCandidates = resolverLoop?.mustKeep ?? [];
 
         emit("resolver_candidates", {
           query,
@@ -5074,11 +5172,41 @@ export async function GET(request: NextRequest) {
           }
         }
 
+        if (chosen && verifierPrimaryCandidate && chosen.selected.id !== verifierPrimaryCandidate.id) {
+          const chosenScore =
+            diseaseScoreById.get(chosen.selected.id) ??
+            scoreDiseaseCandidate(query, chosen.selected);
+          const verifierScore =
+            diseaseScoreById.get(verifierPrimaryCandidate.id) ??
+            scoreDiseaseCandidate(query, verifierPrimaryCandidate);
+          const chosenIsSynthetic = /^QUERY_/i.test(chosen.selected.id);
+          const relationOrMultiAnchorQuery =
+            relationQuery || (resolvedQueryPlan?.anchors ?? []).length >= 2;
+          const shouldPreferVerifierPrimary =
+            chosenIsSynthetic ||
+            (relationOrMultiAnchorQuery &&
+              (verifierScore >= chosenScore - 0.55 ||
+                verifierMustKeepCandidates.some(
+                  (candidate) => candidate.id === verifierPrimaryCandidate.id,
+                )));
+          if (shouldPreferVerifierPrimary) {
+            chosen = {
+              selected: verifierPrimaryCandidate,
+              rationale:
+                resolverLoop?.rationale ??
+                "Primary disease anchor verified by compact LLM resolver loop.",
+            };
+          }
+        }
+
         emit("resolver_selected", {
           query,
           selected: chosen.selected,
           rationale: chosen.rationale,
           candidates,
+          alternatives: verifierAlternativeCandidates,
+          mustKeep: verifierMustKeepCandidates,
+          verificationRationale: resolverLoop?.rationale ?? null,
         });
         emit("plan_ready", {
           runId,
@@ -5168,7 +5296,7 @@ export async function GET(request: NextRequest) {
           });
         }
 
-        const plannedTargetSeeds = [
+        let plannedTargetSeeds = [
           ...(resolvedQueryPlan?.anchors ?? [])
             .filter((anchor) => anchor.entityType === "target")
             .map((anchor) => anchor.name.trim().toUpperCase())
@@ -5197,6 +5325,8 @@ export async function GET(request: NextRequest) {
             candidate.id !== chosen.selected.id &&
             !/^HP_/i.test(candidate.id),
         );
+        const strictExplicitAnchorMode =
+          relationQuery && explicitDiseaseAnchorsFromPlan.length >= 2;
         const allowMentionSecondaryCandidates = explicitDiseaseAnchorsFromPlan.length < 2;
         const mentionSecondaryCandidates = mentionAnchoredMatches
           .filter(
@@ -5207,17 +5337,189 @@ export async function GET(request: NextRequest) {
               !/^HP_/i.test(item.disease.id),
           )
           .map((item) => item.disease);
-        const secondaryDiseaseCandidates = (
-          relationQuery
-            ? dedupeDistinctDiseases(
-                mergeDiseaseCandidates(planSecondaryCandidatesScoped, mentionSecondaryCandidates),
-              )
-            : []
-        )
-          .filter((candidate) => !isSameDiseaseCandidate(candidate, chosen.selected))
-          .slice(0, 3);
+        const verifierSecondaryCandidates = [
+          ...verifierMustKeepCandidates,
+          ...verifierAlternativeCandidates,
+        ].filter(
+          (candidate) =>
+            candidate.id !== chosen.selected.id &&
+            !/^HP_/i.test(candidate.id),
+        );
+        const secondaryDiseaseCandidates = ((): DiseaseCandidate[] => {
+          if (!relationQuery) return [];
+          if (strictExplicitAnchorMode) {
+            return dedupeDistinctDiseases(planSecondaryCandidatesScoped)
+              .filter((candidate) => !isSameDiseaseCandidate(candidate, chosen.selected))
+              .slice(0, 3);
+          }
+          return dedupeDistinctDiseases(
+            mergeDiseaseCandidates(
+              mergeDiseaseCandidates(
+                planSecondaryCandidatesScoped,
+                mentionSecondaryCandidates,
+              ),
+              verifierSecondaryCandidates,
+            ),
+          )
+            .filter((candidate) => !isSameDiseaseCandidate(candidate, chosen.selected))
+            .slice(0, 3);
+        })();
+        const queryImpliedSecondaryDiseaseIds = new Set(
+          planSecondaryCandidatesScoped.map((candidate) => candidate.id),
+        );
+        const secondaryAnchorSeedCandidates = secondaryDiseaseCandidates.filter((candidate) =>
+          queryImpliedSecondaryDiseaseIds.has(candidate.id),
+        );
+        if (secondaryAnchorSeedCandidates.length > 0) {
+          const settled = await Promise.allSettled(
+            secondaryAnchorSeedCandidates.slice(0, 2).map(async (candidate) => {
+              const rows = await withTimeout(
+                getDiseaseTargetsSummary(candidate.id, 5),
+                Math.min(DISEASE_SEARCH_TIMEOUT_MS, 8_000),
+              );
+              return {
+                candidate,
+                rows: rows.slice(0, 5),
+                symbols: rows
+                  .map((row) => row.targetSymbol?.trim().toUpperCase())
+                  .filter((symbol): symbol is string => Boolean(symbol && symbol.length >= 2)),
+              };
+            }),
+          );
+          const seededSecondaryRows = settled
+            .flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
+            .slice(0, 2);
+          const secondaryAnchorTargetSeeds = settled
+            .flatMap((result) => (result.status === "fulfilled" ? result.value.symbols : []))
+            .filter((value, index, all) => all.indexOf(value) === index)
+            .slice(0, 8);
+          if (secondaryAnchorTargetSeeds.length > 0) {
+            plannedTargetSeeds = [
+              ...plannedTargetSeeds,
+              ...secondaryAnchorTargetSeeds,
+            ]
+              .filter((value, index, all) => all.indexOf(value) === index)
+              .slice(0, 16);
+          }
+          if (seededSecondaryRows.length > 0) {
+            const seedNodes: GraphNode[] = [];
+            const seedEdges: GraphEdge[] = [];
+            let seededEdgesCount = 0;
+            for (const seeded of seededSecondaryRows) {
+              const secondaryDiseaseNodeId = makeNodeId("disease", seeded.candidate.id);
+              const secondaryRole = queryImpliedSecondaryDiseaseIds.has(seeded.candidate.id)
+                ? "query_anchor_secondary"
+                : "query_candidate_secondary";
+              if (!nodeMap.has(secondaryDiseaseNodeId)) {
+                const secondaryDiseaseNode: GraphNode = {
+                  id: secondaryDiseaseNodeId,
+                  type: "disease",
+                  primaryId: seeded.candidate.id,
+                  label: compactName(seeded.candidate.name, 44),
+                  score: 0.44,
+                  size: 44,
+                  meta: {
+                    displayName: seeded.candidate.name,
+                    description: seeded.candidate.description,
+                    role: secondaryRole,
+                  },
+                };
+                nodeMap.set(secondaryDiseaseNode.id, secondaryDiseaseNode);
+                seedNodes.push(secondaryDiseaseNode);
+              }
 
-        const bridgePatch = buildCrossDiseaseBridgePatch(chosen.selected, secondaryDiseaseCandidates);
+              const seededTargetRows = seeded.rows.slice(0, 4);
+              const fallbackSeedSymbols = seeded.symbols
+                .filter((value, index, all) => all.indexOf(value) === index)
+                .slice(0, 4);
+              const seedTargetCandidates = (
+                seededTargetRows.length > 0
+                  ? seededTargetRows.map((targetRow) => ({
+                      targetId: targetRow.targetId,
+                      targetSymbol: targetRow.targetSymbol,
+                      targetName: targetRow.targetName,
+                      associationScore: targetRow.associationScore,
+                    }))
+                  : fallbackSeedSymbols.map((symbol) => ({
+                      targetId: `SEED_${symbol}`,
+                      targetSymbol: symbol,
+                      targetName: symbol,
+                      associationScore: 0.34,
+                    }))
+              ).slice(0, 4);
+
+              for (const seedTarget of seedTargetCandidates) {
+                const resolvedSymbol = String(seedTarget.targetSymbol ?? seedTarget.targetName ?? "")
+                  .trim()
+                  .toUpperCase();
+                if (!resolvedSymbol) continue;
+                const existingTargetNode = findTargetNodeBySymbol(nodeMap, resolvedSymbol);
+                const targetNodeId = existingTargetNode?.id ?? makeNodeId("target", seedTarget.targetId);
+                const targetScore = Math.max(
+                  0.22,
+                  Math.min(0.68, Number(seedTarget.associationScore ?? 0.34)),
+                );
+                if (!nodeMap.has(targetNodeId)) {
+                  const targetNode: GraphNode = {
+                    id: targetNodeId,
+                    type: "target",
+                    primaryId: seedTarget.targetId,
+                    label: compactName(resolvedSymbol || seedTarget.targetId, 24),
+                    score: targetScore,
+                    size: 24 + targetScore * 22,
+                    meta: {
+                      targetSymbol: resolvedSymbol,
+                      targetName: seedTarget.targetName,
+                      displayName: seedTarget.targetName || resolvedSymbol,
+                      openTargetsEvidence: targetScore,
+                      stage: "P1",
+                      source: "secondary_anchor_seed",
+                    },
+                  };
+                  nodeMap.set(targetNode.id, targetNode);
+                  seedNodes.push(targetNode);
+                }
+                const diseaseTargetEdgeId = makeEdgeId(
+                  secondaryDiseaseNodeId,
+                  targetNodeId,
+                  "disease_target",
+                );
+                if (edgeMap.has(diseaseTargetEdgeId)) continue;
+                const diseaseTargetEdge: GraphEdge = {
+                  id: diseaseTargetEdgeId,
+                  source: secondaryDiseaseNodeId,
+                  target: targetNodeId,
+                  type: "disease_target",
+                  weight: targetScore,
+                  meta: {
+                    source: "OpenTargets",
+                    status: "candidate",
+                    bridgeType: "disease_target",
+                    note: `Seeded target context for secondary anchor ${seeded.candidate.name} via ${resolvedSymbol}.`,
+                  },
+                };
+                edgeMap.set(diseaseTargetEdge.id, diseaseTargetEdge);
+                seedEdges.push(diseaseTargetEdge);
+                seededEdgesCount += 1;
+              }
+            }
+            if (seedNodes.length > 0 || seedEdges.length > 0) {
+              emitGraphDelta(seedNodes, seedEdges);
+            }
+            emit("agent_step", {
+              phase: "A",
+              title: "Secondary anchor targets seeded",
+              detail:
+                seededEdgesCount > 0
+                  ? `${seededEdgesCount} candidate disease-target links preloaded for additional query anchors.`
+                  : "Secondary anchors resolved, but no additional target links were available to preload.",
+            });
+          }
+        }
+
+        const bridgePatch = buildCrossDiseaseBridgePatch(chosen.selected, secondaryDiseaseCandidates, {
+          queryAnchorSecondaryIds: queryImpliedSecondaryDiseaseIds,
+        });
         if (bridgePatch.nodes.length > 0 || bridgePatch.edges.length > 0) {
           for (const node of bridgePatch.nodes) {
             nodeMap.set(node.id, node);
@@ -5253,7 +5555,7 @@ export async function GET(request: NextRequest) {
           literature: String(profile.literature),
         });
         if (plannedTargetSeeds.length > 0) {
-          internalParams.set("seedTargets", [...new Set(plannedTargetSeeds)].slice(0, 12).join(","));
+          internalParams.set("seedTargets", [...new Set(plannedTargetSeeds)].slice(0, 16).join(","));
         }
 
         preStreamHeartbeatMessage = "Connecting evidence graph stream";
@@ -5342,11 +5644,11 @@ export async function GET(request: NextRequest) {
             break;
           }
           if (!internalDoneReceived && remainingRunBudgetMs(startedAt, FINALIZATION_RESERVE_MS) <= 0) {
-            emit("run_error", {
-              phase: "stream_graph",
-              message:
-                "Exploration budget reached. Finalizing answer from accumulated evidence before hard timeout.",
-              recoverable: true,
+            emit("agent_step", {
+              phase: "A",
+              title: "Exploration window complete",
+              detail:
+                "Finalizing answer from accumulated evidence before hard timeout.",
             });
             warnRequestLog(log, "run_case.exploration_budget_reached", {
               elapsedMs: Date.now() - startedAt,
@@ -5493,11 +5795,6 @@ export async function GET(request: NextRequest) {
                     title: "Source degraded",
                     detail: errorPayload.message ?? "Recoverable degradation",
                   });
-                  emit("run_error", {
-                    phase: errorPayload.phase ?? "PX",
-                    message: errorPayload.message ?? "Recoverable degradation",
-                    recoverable: true,
-                  });
                   warnRequestLog(log, "run_case.internal_warning", {
                     phase: errorPayload.phase,
                     message: errorPayload.message,
@@ -5544,7 +5841,13 @@ export async function GET(request: NextRequest) {
                       score: number;
                     }> = [];
 
-                    const ensureDiseaseNode = (disease: DiseaseCandidate, role: "query_anchor_primary" | "query_anchor_secondary") => {
+                    const ensureDiseaseNode = (
+                      disease: DiseaseCandidate,
+                      role:
+                        | "query_anchor_primary"
+                        | "query_anchor_secondary"
+                        | "query_candidate_secondary",
+                    ) => {
                       const nodeId = makeNodeId("disease", disease.id);
                       if (nodeMap.has(nodeId)) return nodeId;
                       const node: GraphNode = {
@@ -5726,7 +6029,15 @@ export async function GET(request: NextRequest) {
 
                     ensureDiseaseNode(chosen.selected, "query_anchor_primary");
                     for (const outcome of outcomes) {
-                      const secondaryNodeId = ensureDiseaseNode(outcome.disease, "query_anchor_secondary");
+                      const secondaryRole = queryImpliedSecondaryDiseaseIds.has(
+                        outcome.disease.id,
+                      )
+                        ? "query_anchor_secondary"
+                        : "query_candidate_secondary";
+                      const secondaryNodeId = ensureDiseaseNode(
+                        outcome.disease,
+                        secondaryRole,
+                      );
                       const edgeId = makeEdgeId(primaryNodeId, secondaryNodeId, "disease_disease");
                       const existing = edgeMap.get(edgeId);
                       const sharedSymbols = outcome.sharedTargets
@@ -6498,6 +6809,7 @@ export async function GET(request: NextRequest) {
                     nodes: nodeMap.size,
                     edges: edgeMap.size,
                   },
+                  finalBrief: brief,
                   finalAnswer: discovererFinal,
                   llmCost,
                 });
@@ -6517,6 +6829,7 @@ export async function GET(request: NextRequest) {
                     nodes: nodeMap.size,
                     edges: edgeMap.size,
                   },
+                  finalBrief: brief,
                   finalAnswer: discovererFinal,
                   llmCost,
                 });
@@ -6763,6 +7076,7 @@ export async function GET(request: NextRequest) {
               nodes: nodeMap.size,
               edges: edgeMap.size,
             },
+            finalBrief: brief,
             finalAnswer: discovererFinal,
             llmCost,
           });
@@ -6781,6 +7095,7 @@ export async function GET(request: NextRequest) {
               nodes: nodeMap.size,
               edges: edgeMap.size,
             },
+            finalBrief: brief,
             finalAnswer: discovererFinal,
             llmCost,
           });

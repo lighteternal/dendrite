@@ -1536,6 +1536,7 @@ export async function runDeepDiscoverer({
   const runStartedAtMs = Date.now();
   const runDeadlineMs = runStartedAtMs + DISCOVERER_MAX_RUN_MS;
   let runBudgetWarningEmitted = false;
+  let pubmedBudgetNoticeEmitted = false;
   const msRemaining = () => runDeadlineMs - Date.now();
   const hasTimeBudget = (reserveMs = 0) => msRemaining() > reserveMs;
   const boundedTimeout = (maxMs: number, minMs = 8_000): number => {
@@ -1547,11 +1548,23 @@ export async function runDeepDiscoverer({
     if (runBudgetWarningEmitted) return;
     runBudgetWarningEmitted = true;
     push(
-      "warning",
-      "Run budget reached",
+      "insight",
+      "Budget guardrail engaged",
       detail,
       "agent",
       [],
+      "active",
+    );
+  };
+  const emitPubmedBudgetNotice = (detail: string, entities: DiscoverEntity[] = []) => {
+    if (pubmedBudgetNoticeEmitted) return;
+    pubmedBudgetNoticeEmitted = true;
+    push(
+      "insight",
+      "PubMed budget reached",
+      detail,
+      "pubmed",
+      entities,
       "candidate",
     );
   };
@@ -2603,16 +2616,12 @@ export async function runDeepDiscoverer({
       }
 
       if (state.pubmedSubqueriesUsed >= MAX_PUBMED_SUBQUERIES) {
-        push(
-          "warning",
-          "PubMed budget exhausted",
+        emitPubmedBudgetNotice(
           `Skipping pair query for ${disease} / ${target} because budget is ${MAX_PUBMED_SUBQUERIES}.`,
-          "pubmed",
           [
             { type: "disease", label: disease },
             { type: "target", label: target },
           ],
-          "discarded",
         );
         return JSON.stringify({ articles: [], budgetExhausted: true });
       }
@@ -2743,13 +2752,9 @@ export async function runDeepDiscoverer({
       }
 
       if (state.pubmedSubqueriesUsed >= MAX_PUBMED_SUBQUERIES) {
-        push(
-          "warning",
-          "PubMed budget exhausted",
+        emitPubmedBudgetNotice(
           `Skipping subquery \"${query}\" because budget is ${MAX_PUBMED_SUBQUERIES}.`,
-          "pubmed",
           [],
-          "discarded",
         );
         return JSON.stringify({ query, articleCount: 0, budgetExhausted: true });
       }

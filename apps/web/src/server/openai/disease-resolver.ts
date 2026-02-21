@@ -15,6 +15,13 @@ export type DiseaseAliasExpansion = {
   rationale: string;
 };
 
+export type DiseaseResolutionLoopResult = {
+  primary: DiseaseCandidate;
+  alternatives: DiseaseCandidate[];
+  mustKeep: DiseaseCandidate[];
+  rationale: string;
+};
+
 function getOpenAiClient() {
   return createTrackedOpenAIClient();
 }
@@ -398,6 +405,334 @@ export async function chooseBestDiseaseCandidate(
       selected: fallback.selected,
       rationale: "Semantic resolver unavailable; used lexical disease-intent fallback.",
     };
+  }
+}
+
+function dedupeDiseaseCandidates(candidates: DiseaseCandidate[]): DiseaseCandidate[] {
+  const byId = new Map<string, DiseaseCandidate>();
+  for (const candidate of candidates) {
+    if (!candidate?.id) continue;
+    if (!byId.has(candidate.id)) {
+      byId.set(candidate.id, candidate);
+    }
+  }
+  return [...byId.values()];
+}
+
+function buildResolutionLoopFallback(
+  query: string,
+  candidates: DiseaseCandidate[],
+  planDiseaseAnchors: DiseaseCandidate[],
+  maxOptions: number,
+): DiseaseResolutionLoopResult {
+  const ranked = lexicalRankDiseaseCandidates(query, candidates);
+  const rankedCandidates: DiseaseCandidate[] = ranked.map((item) => ({
+    id: item.id,
+    name: item.name,
+    ...(item.description ? { description: item.description } : {}),
+  }));
+  const rankedById = new Map<string, DiseaseCandidate>(
+    rankedCandidates.map((item) => [item.id, item]),
+  );
+  const scoreById = new Map(ranked.map((item) => [item.id, item.score]));
+  const primary = rankedCandidates[0]!;
+  const primaryScore = scoreById.get(primary.id) ?? 0;
+  const minSupportScore = Math.max(0.9, primaryScore - 1.2);
+  const keepIds = planDiseaseAnchors
+    .map((anchor) => anchor.id)
+    .filter((id) => rankedById.has(id))
+    .filter((id) => (scoreById.get(id) ?? -Infinity) >= minSupportScore)
+    .slice(0, 3);
+  const alternativeIds = [
+    ...keepIds.filter((id) => id !== primary.id),
+    ...ranked
+      .filter(
+        (candidate) =>
+          candidate.id !== primary.id && (scoreById.get(candidate.id) ?? -Infinity) >= minSupportScore,
+      )
+      .map((candidate) => candidate.id),
+  ]
+    .filter((id, index, all) => all.indexOf(id) === index)
+    .slice(0, Math.max(0, maxOptions - 1));
+  const alternatives = alternativeIds
+    .map((id) => rankedById.get(id))
+    .filter((item): item is DiseaseCandidate => Boolean(item));
+  const mustKeep = keepIds
+    .map((id) => rankedById.get(id))
+    .filter((item): item is DiseaseCandidate => Boolean(item));
+
+  return {
+    primary,
+    alternatives,
+    mustKeep,
+    rationale: "Selected via lexical disease-intent ranking fallback.",
+  };
+}
+
+export async function resolveDiseaseAlternativesLoop(input: {
+  query: string;
+  candidates: DiseaseCandidate[];
+  planDiseaseAnchors?: DiseaseCandidate[];
+  relationMentions?: string[];
+  maxOptions?: number;
+}): Promise<DiseaseResolutionLoopResult> {
+  const openai = getOpenAiClient();
+  const allCandidates = dedupeDiseaseCandidates(input.candidates);
+  const maxOptions = Math.max(2, Math.min(3, input.maxOptions ?? 3));
+  if (allCandidates.length === 0) {
+    throw new Error("No disease candidates available");
+  }
+
+  const planDiseaseAnchors = dedupeDiseaseCandidates(input.planDiseaseAnchors ?? []);
+  const fallback = buildResolutionLoopFallback(
+    input.query,
+    allCandidates,
+    planDiseaseAnchors,
+    maxOptions,
+  );
+
+  if (!openai || allCandidates.length <= 1 || isOpenAiRateLimited()) {
+    return fallback;
+  }
+
+  const ranked = lexicalRankDiseaseCandidates(input.query, allCandidates);
+  const shortlist = ranked
+    .slice(0, Math.max(6, maxOptions * 4))
+    .map((item) => ({
+      id: item.id,
+      name: item.name,
+      description: item.description,
+      lexicalScore: Number(item.score.toFixed(4)),
+    }));
+  const shortlistById = new Map<string, DiseaseCandidate>(
+    shortlist.map((item) => [
+      item.id,
+      {
+        id: item.id,
+        name: item.name,
+        ...(item.description ? { description: item.description } : {}),
+      },
+    ]),
+  );
+  const lexicalScoreById = new Map(shortlist.map((item) => [item.id, item.lexicalScore]));
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      primaryId: { type: "string" },
+      alternativeIds: { type: "array", items: { type: "string" } },
+      mustKeepIds: { type: "array", items: { type: "string" } },
+      rationale: { type: "string" },
+    },
+    required: ["primaryId", "alternativeIds", "mustKeepIds", "rationale"],
+  } as const;
+
+  const systemPrompt = [
+    "You verify biomedical disease entity resolution for a user query.",
+    "Choose a primary disease and up to two alternatives from the provided candidates only.",
+    "If the query has two disease anchors (relation/comparison), preserve both when present by returning them in mustKeepIds.",
+    "Prefer semantically exact disease matches and reject unrelated look-alikes sharing generic words.",
+    "Do not invent IDs and do not output entities not in candidate list.",
+    "Return strict JSON schema only.",
+  ].join(" ");
+
+  const userPrompt = JSON.stringify(
+    {
+      query: input.query,
+      normalizedDiseaseIntent: extractDiseaseIntent(input.query),
+      relationMentions: (input.relationMentions ?? []).slice(0, 8),
+      planDiseaseAnchors: planDiseaseAnchors.map((anchor) => ({
+        id: anchor.id,
+        name: anchor.name,
+      })),
+      candidates: shortlist,
+      maxOptions,
+    },
+    null,
+    2,
+  );
+
+  try {
+    const response = await Promise.race([
+      openai.responses.create({
+        model: appConfig.openai.smallModel,
+        reasoning: { effort: "minimal" },
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: systemPrompt }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: userPrompt }],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "disease_resolution_loop",
+            schema,
+            strict: true,
+          },
+        },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("disease resolution loop timeout")), 3_400),
+      ),
+    ]);
+
+    const parsed = JSON.parse(response.output_text) as {
+      primaryId?: string;
+      alternativeIds?: string[];
+      mustKeepIds?: string[];
+      rationale?: string;
+    };
+
+    const primary =
+      (typeof parsed.primaryId === "string" ? shortlistById.get(parsed.primaryId) : null) ??
+      fallback.primary;
+    const primaryScore = lexicalScoreById.get(primary.id) ?? lexicalScoreById.get(fallback.primary.id) ?? 0;
+    const minSupportScore = Math.max(0.9, primaryScore - 1.15);
+    const mustKeepIds = [
+      ...((Array.isArray(parsed.mustKeepIds) ? parsed.mustKeepIds : []).filter(
+        (id) =>
+          shortlistById.has(id) && (lexicalScoreById.get(id) ?? -Infinity) >= minSupportScore,
+      )),
+    ]
+      .filter((id, index, all) => all.indexOf(id) === index)
+      .slice(0, 3);
+    const alternativeIds = [
+      ...(Array.isArray(parsed.alternativeIds) ? parsed.alternativeIds : []),
+      ...mustKeepIds,
+      ...shortlist.map((item) => item.id),
+    ]
+      .filter(
+        (id) =>
+          id !== primary.id &&
+          shortlistById.has(id) &&
+          (lexicalScoreById.get(id) ?? -Infinity) >= minSupportScore,
+      )
+      .filter((id, index, all) => all.indexOf(id) === index)
+      .slice(0, Math.max(0, maxOptions - 1));
+
+    const lexicalTopId = shortlist[0]?.id ?? fallback.primary.id;
+    const lexicalTopScore = lexicalScoreById.get(lexicalTopId) ?? -Infinity;
+    const selectedScore = lexicalScoreById.get(primary.id) ?? -Infinity;
+    const preservePrimary = mustKeepIds.includes(primary.id);
+    const guardedPrimary =
+      !preservePrimary && lexicalTopScore - selectedScore > 1.25
+        ? fallback.primary
+        : primary;
+
+    return {
+      primary: guardedPrimary,
+      alternatives: alternativeIds
+        .map((id) => shortlistById.get(id))
+        .filter((item): item is DiseaseCandidate => Boolean(item)),
+      mustKeep: mustKeepIds
+        .map((id) => shortlistById.get(id))
+        .filter((item): item is DiseaseCandidate => Boolean(item)),
+      rationale:
+        typeof parsed.rationale === "string" && parsed.rationale.trim().length > 0
+          ? parsed.rationale.trim()
+          : "Selected via disease resolution verification loop.",
+    };
+  } catch (error) {
+    handleOpenAiRateLimit(error);
+    return fallback;
+  }
+}
+
+export async function suggestDiseaseResolverMentions(input: {
+  query: string;
+  currentMentions?: string[];
+  maxMentions?: number;
+}): Promise<string[]> {
+  const openai = getOpenAiClient();
+  const maxMentions = Math.max(1, Math.min(3, input.maxMentions ?? 3));
+  const fallback = [...new Set((input.currentMentions ?? []).map((value) => normalizeText(value)).filter(Boolean))]
+    .slice(0, maxMentions);
+
+  if (!openai || isOpenAiRateLimited()) {
+    return fallback;
+  }
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      mentions: {
+        type: "array",
+        items: { type: "string" },
+      },
+    },
+    required: ["mentions"],
+  } as const;
+
+  const systemPrompt = [
+    "Extract up to three disease/entity phrases from the user query that should be used for ontology disease search.",
+    "Prefer explicit disease mentions and disease outcomes; keep wording concise.",
+    "Do not invent entities and avoid generic scaffolding words.",
+    "Return only phrases useful for disease candidate lookup.",
+  ].join(" ");
+
+  try {
+    const response = await Promise.race([
+      openai.responses.create({
+        model: appConfig.openai.smallModel,
+        reasoning: { effort: "minimal" },
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: systemPrompt }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: JSON.stringify(
+                  {
+                    query: input.query,
+                    currentMentions: input.currentMentions ?? [],
+                    maxMentions,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "disease_resolver_mentions",
+            schema,
+            strict: true,
+          },
+        },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("disease mention extraction timeout")), 2_800),
+      ),
+    ]);
+
+    const parsed = JSON.parse(response.output_text) as {
+      mentions?: string[];
+    };
+
+    const mentions = [...new Set((parsed.mentions ?? [])
+      .map((value) => normalizeText(String(value ?? "")))
+      .filter((value) => value.length >= 3))]
+      .slice(0, maxMentions);
+
+    if (mentions.length === 0) return fallback;
+    return mentions;
+  } catch (error) {
+    handleOpenAiRateLimit(error);
+    return fallback;
   }
 }
 

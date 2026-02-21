@@ -40,7 +40,7 @@ import {
 import { withOpenAiApiKeyContext } from "@/server/openai/client";
 
 export const runtime = "nodejs";
-export const maxDuration = 800;
+export const maxDuration = 300;
 
 type PipelinePhase = "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6";
 
@@ -360,6 +360,38 @@ export async function GET(request: NextRequest) {
         try {
           emitStatus("P1", "Fetching target evidence from OpenTargets", 18);
           let targets: Awaited<ReturnType<typeof getDiseaseTargetsSummary>> = [];
+          const resolveSeedTargetRows = async (
+            symbols: string[],
+            fallbackAssociationScore: number,
+          ) =>
+            Promise.all(
+              symbols.map(async (symbol) => {
+                const resolved = await withTimeout(
+                  searchTargets(symbol, 4),
+                  Math.min(phaseTimeoutMs, 3_500),
+                ).catch(() => []);
+                const best =
+                  resolved.find((item) => item.name.toUpperCase() === symbol) ?? resolved[0];
+                if (!best) {
+                  return {
+                    targetId: `QUERY_TARGET_${symbol}`,
+                    targetSymbol: symbol,
+                    targetName: symbol,
+                    associationScore: fallbackAssociationScore,
+                  };
+                }
+
+                return {
+                  targetId: best.id,
+                  targetSymbol: symbol,
+                  targetName: best.name,
+                  associationScore: Math.max(
+                    fallbackAssociationScore,
+                    Math.min(0.56, fallbackAssociationScore + 0.08),
+                  ),
+                };
+              }),
+            );
           try {
             targets = await withTimeout(
               getDiseaseTargetsSummary(diseaseId, Math.min(40, Math.max(5, maxTargets))),
@@ -379,37 +411,46 @@ export async function GET(request: NextRequest) {
               },
               true,
             );
-
-            const seededTargetRows = await Promise.all(
-              seedTargets.slice(0, maxTargets).map(async (symbol) => {
-                const resolved = await withTimeout(
-                  searchTargets(symbol, 4),
-                  Math.min(phaseTimeoutMs, 3_500),
-                ).catch(() => []);
-                const best =
-                  resolved.find((item) => item.name.toUpperCase() === symbol) ?? resolved[0];
-                if (!best) {
-                  return {
-                    targetId: `QUERY_TARGET_${symbol}`,
-                    targetSymbol: symbol,
-                    targetName: symbol,
-                    associationScore: 0.38,
-                  };
-                }
-
-                return {
-                  targetId: best.id,
-                  targetSymbol: symbol,
-                  targetName: best.name,
-                  associationScore: 0.52,
-                };
-              }),
+            const seededTargetRows = await resolveSeedTargetRows(
+              seedTargets.slice(0, maxTargets),
+              0.38,
             );
             targets = seededTargetRows;
+          } else if (targets.length > 0 && seedTargets.length > 0) {
+            const existingSymbols = new Set(
+              targets
+                .map((target) => target.targetSymbol?.toUpperCase?.())
+                .filter((symbol): symbol is string => Boolean(symbol)),
+            );
+            const missingSeedSymbols = seedTargets
+              .map((symbol) => symbol.toUpperCase())
+              .filter((symbol) => !existingSymbols.has(symbol))
+              .slice(0, 6);
+            if (missingSeedSymbols.length > 0) {
+              emitStatus(
+                "P1",
+                "Merging secondary-anchor target hints",
+                24,
+                {
+                  targets: targets.length,
+                  seededTargets: missingSeedSymbols.length,
+                },
+                true,
+              );
+              const seededTargetRows = await resolveSeedTargetRows(
+                missingSeedSymbols,
+                0.34,
+              );
+              targets = [...targets, ...seededTargetRows];
+            }
           }
 
           const diseaseNodeId = makeNodeId("disease", diseaseId);
-          for (const batch of chunkArray(targets.slice(0, maxTargets), 5)) {
+          const targetSliceLimit = Math.min(
+            40,
+            maxTargets + Math.min(6, seedTargets.length),
+          );
+          for (const batch of chunkArray(targets.slice(0, targetSliceLimit), 5)) {
             const nodes: GraphNode[] = [];
             const edges: GraphEdge[] = [];
 

@@ -110,10 +110,15 @@ MEDICAL_MCP_ENABLE_JOURNAL_SCRAPE=0
 
 Recommended baseline:
 
-1. Import the repo directly (root). `vercel.json` is included with build/install commands for `apps/web`.
-2. Keep BYOK enabled in the UI for end users.
-3. If you want server-side fallback key support, also set `OPENAI_API_KEY`.
-4. Set explicit MCP URLs only if you host externally reachable MCP services.
+1. Import the repo and set **Root Directory** to `apps/web` in Vercel project settings.
+2. Use framework preset **Next.js** with:
+   - Install Command: `npm ci`
+   - Build Command: `npm run build`
+   - Dev Command: `npm run dev`
+   - Output Directory: `.next`
+3. Keep BYOK enabled in the UI for end users.
+4. If you want server-side fallback key support, also set `OPENAI_API_KEY`.
+5. Set explicit MCP URLs only if you host externally reachable MCP services.
 
 Notes:
 

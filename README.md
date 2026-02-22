@@ -144,3 +144,8 @@ npm --prefix apps/web run build
 ---
 
 Preclinical evidence synthesis only; not for clinical recommendation.
+
+## License
+
+The core Dendrite application (agent logic, UI, and repository-owned code) is licensed under the Apache License 2.0.
+MCP services under services/ are subject to their respective upstream licenses. See the individual service directories and upstream repositories for details.

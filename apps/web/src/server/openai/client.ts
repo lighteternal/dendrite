@@ -1,6 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import OpenAI from "openai";
-import { appConfig } from "@/server/config";
 import {
   getActiveOpenAiRunId,
   getOpenAiPromptCacheConfig,
@@ -22,7 +21,7 @@ export function withOpenAiApiKeyContext<T>(
 }
 
 export function getOpenAiApiKeyFromContext(): string | undefined {
-  return openAiApiKeyStore.getStore() ?? appConfig.openAiApiKey;
+  return openAiApiKeyStore.getStore();
 }
 
 function applyPromptCachingDefaults<T extends { model?: unknown }>(

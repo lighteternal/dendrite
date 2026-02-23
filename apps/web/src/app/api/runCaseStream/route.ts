@@ -275,7 +275,7 @@ async function readPostedApiKey(request: NextRequest): Promise<string | null> {
     }
   }
 
-  return request.nextUrl.searchParams.get("apiKey");
+  return null;
 }
 
 function encodeEvent(event: string, data: unknown) {

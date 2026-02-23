@@ -371,6 +371,9 @@ export function GraphCanvas({
     const edgeElements = validEdges.map((edge) => {
       const sourceGroup = getEdgeSourceGroup(edge);
       const sourceMeta = EDGE_SOURCE_GROUP_META[sourceGroup];
+      const anchorPathConnected =
+        edge.meta.anchorPathConnected === true ||
+        String(edge.meta.anchorPathConnected ?? "").toLowerCase() === "true";
       const showEdgeLabel =
         activeEdgeSet.has(edge.id) ||
         shortlistEdgeSet.has(edge.id) ||
@@ -388,6 +391,7 @@ export function GraphCanvas({
         washedEdgeIds?.has(edge.id) && !activeEdgeSet.has(edge.id) ? "is-washed" : "",
         showEdgeLabel ? "label-visible" : "",
         `source-${sourceGroup}`,
+        anchorPathConnected ? "is-anchor-path-connected" : "",
       ]
         .filter(Boolean)
         .join(" ");
@@ -418,6 +422,7 @@ export function GraphCanvas({
                     : "mechanism link"),
           weight: edge.weight ?? 0.4,
           color: sourceMeta.color ?? edgeColors[edge.type],
+          anchorPathConnected,
         },
         classes,
       } satisfies ElementDefinition;
@@ -721,8 +726,20 @@ export function GraphCanvas({
         style: {
           "line-style": "solid",
           opacity: 0.96,
-          "line-color": "#4f46e5",
-          "target-arrow-color": "#4f46e5",
+          "line-color": "#2a9561",
+          "target-arrow-color": "#2a9561",
+        },
+      },
+      {
+        selector: "edge.is-anchor-path-connected",
+        style: {
+          "line-style": "dashed",
+          "line-dash-pattern": [9, 4],
+          "line-dash-offset": dashOffset,
+          opacity: 0.99,
+          width: 2.4 + focusPulse * 1.35,
+          "line-color": "#169a5c",
+          "target-arrow-color": "#169a5c",
         },
       },
       {
@@ -741,6 +758,18 @@ export function GraphCanvas({
           "line-dash-offset": isRunning ? dashOffset : 0,
           "line-color": "#4f46e5",
           "target-arrow-color": "#4f46e5",
+        },
+      },
+      {
+        selector: "edge.is-focused.is-anchor-path-connected",
+        style: {
+          opacity: 1,
+          width: 2.9 + focusPulse * 1.45,
+          "line-style": "dashed",
+          "line-dash-pattern": [10, 4],
+          "line-dash-offset": dashOffset,
+          "line-color": "#149558",
+          "target-arrow-color": "#149558",
         },
       },
       {

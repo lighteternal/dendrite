@@ -31,7 +31,7 @@ export type BridgeAnalysis = {
   activePairId: string | null;
   activeConnectedPath: { nodeIds: string[]; edgeIds: string[]; summary: string } | null;
   queryTrailPath: { nodeIds: string[]; edgeIds: string[]; summary: string } | null;
-  status: "pending" | "connected" | "no_connection";
+  status: "pending" | "connected" | "partial" | "no_connection";
   summary: string;
 };
 
@@ -318,6 +318,14 @@ function dedupeAnchors(anchors: BridgeAnchor[]): BridgeAnchor[] {
 
   for (const anchor of anchors) {
     const keys = [semanticAnchorKey(anchor)];
+    const lexicalKey = normalizeAnchorLabelKey(anchor.label) || normalize(anchor.label);
+    if (lexicalKey) {
+      // Unknown/planner placeholders should collapse into typed anchors when the
+      // same concept is resolved later in the run.
+      if (anchor.entityType === "unknown" || Boolean(anchor.nodeId)) {
+        keys.push(`lexical:${lexicalKey}`);
+      }
+    }
     if (anchor.nodeId) keys.unshift(`node:${anchor.nodeId}`);
     if (anchor.virtualNodeId) keys.push(`virtual:${anchor.virtualNodeId}`);
 
@@ -334,9 +342,10 @@ function dedupeAnchors(anchors: BridgeAnchor[]): BridgeAnchor[] {
 
     const existing = out[existingIndex]!;
     const shouldReplace =
-      !existing.nodeId &&
-      Boolean(anchor.nodeId) &&
-      anchor.entityType !== "unknown";
+      (existing.entityType === "unknown" && anchor.entityType !== "unknown") ||
+      (!existing.nodeId &&
+        Boolean(anchor.nodeId) &&
+        anchor.entityType !== "unknown");
     if (shouldReplace) {
       out[existingIndex] = anchor;
     }
@@ -652,14 +661,20 @@ export function analyzeBridgeOutcomes(input: {
 
   let status: BridgeAnalysis["status"] = "pending";
   if (pairs.length > 0) {
-    status = connectedPairs.length > 0 ? "connected" : "no_connection";
+    if (connectedPairs.length === pairs.length) {
+      status = "connected";
+    } else if (connectedPairs.length > 0) {
+      status = "partial";
+    } else {
+      status = "no_connection";
+    }
   }
 
   const summary =
     status === "connected"
-      ? connectedPairs.length === pairs.length
-        ? `${connectedPairs.length}/${pairs.length} anchor pair(s) connected by an explicit multihop path.`
-        : `${connectedPairs.length}/${pairs.length} anchor pair(s) connected; remaining pairs are unresolved.`
+      ? `${connectedPairs.length}/${pairs.length} anchor pair(s) connected by an explicit multihop path.`
+      : status === "partial"
+        ? `${connectedPairs.length}/${pairs.length} anchor pair(s) connected; remaining pairs are unresolved.`
       : status === "no_connection"
         ? "No full anchor-to-anchor path found yet; unresolved anchor pairs remain visible."
         : "Anchor connectivity pending.";

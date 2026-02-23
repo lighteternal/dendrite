@@ -120,6 +120,7 @@ type RunParams = {
   diseaseQuery: string;
   diseaseIdHint?: string;
   question: string;
+  maxRunMs?: number;
   emitJourney: (entry: DiscoverJourneyEntry) => void;
 };
 
@@ -231,10 +232,10 @@ const clampTimeout = (value: number, min: number, max: number): number =>
 const DISCOVERER_MAX_RUN_MS = clampTimeout(
   appConfig.deepDiscover.maxRunMs,
   180_000,
-  600_000,
+  20 * 60 * 1000,
 );
 const AGENT_TIMEOUT_MS = Math.min(
-  clampTimeout(appConfig.deepDiscover.agentTimeoutMs, 90_000, 420_000),
+  clampTimeout(appConfig.deepDiscover.agentTimeoutMs, 90_000, 180_000),
   Math.max(90_000, DISCOVERER_MAX_RUN_MS - 25_000),
 );
 const TOOL_TIMEOUT_MS = Math.min(
@@ -242,15 +243,19 @@ const TOOL_TIMEOUT_MS = Math.min(
   Math.max(20_000, AGENT_TIMEOUT_MS - 10_000),
 );
 const MAX_PUBMED_SUBQUERIES = appConfig.deepDiscover.maxPubmedSubqueries;
+const SCIENTIFIC_ANSWER_WORD_BUDGET = Math.max(
+  700,
+  Math.min(2200, appConfig.run.scientificAnswerWordBudget),
+);
 const COORDINATOR_TIMEOUT_MS = clampTimeout(
-  Math.min(AGENT_TIMEOUT_MS, 180_000),
-  30_000,
-  180_000,
+  Math.min(AGENT_TIMEOUT_MS, 90_000),
+  25_000,
+  90_000,
 );
 const SUBAGENT_TIMEOUT_MS = clampTimeout(
-  Math.min(AGENT_TIMEOUT_MS, 240_000),
-  45_000,
-  240_000,
+  Math.min(AGENT_TIMEOUT_MS, 90_000),
+  25_000,
+  90_000,
 );
 
 const coordinatorPlanSchema = z.object({
@@ -333,6 +338,88 @@ function clamp(value: number, min: number, max: number): number {
 
 function clean(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function normalizeMentionKey(value: string): string {
+  return clean(value).toLowerCase();
+}
+
+function isExplicitTargetMention(mention: string): boolean {
+  const normalized = clean(mention);
+  if (!normalized) return false;
+  if (/[0-9]/.test(normalized)) return true;
+  if (/[-+]/.test(normalized)) return true;
+  if (/\b(gene|protein|receptor|kinase|enzyme|channel|target)\b/i.test(normalized)) return true;
+  return false;
+}
+
+function stabilizeQueryPlanAnchors(
+  plan: ResolvedQueryPlan | null,
+  diseaseQuery: string,
+  diseaseIdHint?: string,
+): ResolvedQueryPlan | null {
+  if (!plan) return plan;
+
+  const diseaseConfidenceByMention = new Map<string, number>();
+  for (const anchor of plan.anchors) {
+    if (anchor.entityType !== "disease") continue;
+    const key = normalizeMentionKey(anchor.mention || anchor.name);
+    if (!key) continue;
+    const existing = diseaseConfidenceByMention.get(key) ?? 0;
+    if (anchor.confidence > existing) {
+      diseaseConfidenceByMention.set(key, anchor.confidence);
+    }
+  }
+
+  const filteredAnchors = plan.anchors.filter((anchor) => {
+    if (anchor.entityType !== "target") return true;
+    const key = normalizeMentionKey(anchor.mention || anchor.name);
+    if (!key) return true;
+    const diseaseConfidence = diseaseConfidenceByMention.get(key) ?? 0;
+    if (diseaseConfidence < 0.82) return true;
+    return isExplicitTargetMention(anchor.mention);
+  });
+
+  const primaryDiseaseName = clean(diseaseQuery);
+  if (primaryDiseaseName) {
+    const diseaseNameNorm = normalizeMentionKey(primaryDiseaseName);
+    const hasPrimaryDiseaseAnchor = filteredAnchors.some((anchor) => {
+      if (anchor.entityType !== "disease") return false;
+      return (
+        normalizeMentionKey(anchor.name) === diseaseNameNorm ||
+        normalizeMentionKey(anchor.mention) === diseaseNameNorm
+      );
+    });
+    if (!hasPrimaryDiseaseAnchor) {
+      filteredAnchors.unshift({
+        mention: primaryDiseaseName,
+        requestedType: "disease",
+        entityType: "disease",
+        id: clean(diseaseIdHint || "") || `QUERY_DISEASE_${slugify(primaryDiseaseName, 40).toUpperCase()}`,
+        name: primaryDiseaseName,
+        confidence: 0.93,
+        source: "opentargets",
+      });
+    }
+  }
+
+  const deduped = new Map<string, QueryPlanAnchor>();
+  for (const anchor of filteredAnchors) {
+    const key = `${anchor.entityType}:${anchor.id}`;
+    if (!deduped.has(key)) {
+      deduped.set(key, anchor);
+      continue;
+    }
+    const existing = deduped.get(key)!;
+    if (anchor.confidence > existing.confidence) {
+      deduped.set(key, anchor);
+    }
+  }
+
+  return {
+    ...plan,
+    anchors: [...deduped.values()],
+  };
 }
 
 function canonicalScientificSectionHeading(label: string): RecognizedScientificHeading | null {
@@ -467,38 +554,114 @@ function countWords(value: string): number {
     .filter(Boolean).length;
 }
 
+function countWordsInText(value: string): number {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function splitTextIntoSentences(value: string): string[] {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return [];
+  const SegmenterCtor = (
+    globalThis as {
+      Intl?: {
+        Segmenter?: new (
+          locales?: string | string[],
+          options?: { granularity?: "grapheme" | "word" | "sentence" },
+        ) => {
+          segment: (input: string) => Iterable<{ segment: string }>;
+        };
+      };
+    }
+  ).Intl?.Segmenter;
+  if (SegmenterCtor) {
+    try {
+      const segmenter = new SegmenterCtor("en", { granularity: "sentence" });
+      const segments = Array.from(segmenter.segment(normalized))
+        .map((item) => item.segment.trim())
+        .filter(Boolean);
+      if (segments.length > 0) return segments;
+    } catch {
+      // fallback regex below
+    }
+  }
+  return (
+    normalized.match(/[^.!?]+[.!?](?:\s*\[\d+\])*/g)?.map((item) => item.trim()).filter(Boolean) ??
+    [normalized]
+  );
+}
+
+function trimProseToSentenceBudget(value: string, maxWords: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (countWordsInText(normalized) <= maxWords) return normalized;
+  const sentences = splitTextIntoSentences(normalized);
+  if (sentences.length === 0) {
+    return normalized.split(/\s+/).slice(0, maxWords).join(" ").trim();
+  }
+  const softCapWords = Math.max(maxWords, Math.round(maxWords * 1.22));
+  const selected: string[] = [];
+  let used = 0;
+  for (const sentence of sentences) {
+    const sentenceWords = countWordsInText(sentence);
+    if (sentenceWords === 0) continue;
+    if (selected.length === 0) {
+      if (sentenceWords <= softCapWords) {
+        selected.push(sentence);
+        used = sentenceWords;
+        continue;
+      }
+      return sentence.split(/\s+/).slice(0, maxWords).join(" ").trim();
+    }
+    if (used + sentenceWords > maxWords) break;
+    selected.push(sentence);
+    used += sentenceWords;
+  }
+  if (selected.length === 0) {
+    return normalized.split(/\s+/).slice(0, maxWords).join(" ").trim();
+  }
+  return selected.join(" ").replace(/\s+/g, " ").trim();
+}
+
 function trimSectionToWordBudget(section: string, maxWords: number): string {
+  const budget = Math.max(1, maxWords);
   const lines = section
     .split("\n")
     .map((line) => line.trimEnd())
     .filter((line) => line.trim().length > 0);
   if (lines.length === 0) return "";
-  const budget = Math.max(1, maxWords);
+
+  const hasBullets = lines.some((line) => /^[-*]\s+/.test(line));
+  if (!hasBullets) {
+    return trimProseToSentenceBudget(lines.join(" "), budget);
+  }
+
   const selected: string[] = [];
   let used = 0;
   for (const line of lines) {
     const stripped = line.replace(/^[-*]\s+/, "").trim();
-    const words = stripped.split(/\s+/).filter(Boolean).length;
-    if (words === 0) continue;
-    if (used + words <= budget) {
-      selected.push(line);
-      used += words;
-      continue;
-    }
+    if (!stripped) continue;
     const remaining = budget - used;
     if (remaining <= 0) break;
-    const tokens = stripped.split(/\s+/).filter(Boolean).slice(0, remaining);
-    if (tokens.length === 0) break;
-    const prefix = /^[-*]\s+/.test(line) ? "- " : "";
-    let truncated = tokens.join(" ").trim();
-    if (!/[.!?]$/.test(truncated)) truncated = `${truncated}.`;
-    selected.push(`${prefix}${truncated}`);
-    break;
+    const trimmed = trimProseToSentenceBudget(stripped, remaining);
+    const words = countWordsInText(trimmed);
+    if (words === 0) continue;
+    if (selected.length > 0 && used + words > budget) break;
+    selected.push(`- ${trimmed}`);
+    used += words;
+    if (used >= budget) break;
   }
-  return selected.join("\n").trim();
+  const merged = selected.join("\n").trim();
+  if (!merged) return trimProseToSentenceBudget(lines.join(" "), budget);
+  return merged;
 }
 
-function clampScientificTemplateWordBudget(answer: string, maxWords = 700): string {
+function clampScientificTemplateWordBudget(
+  answer: string,
+  maxWords = SCIENTIFIC_ANSWER_WORD_BUDGET,
+): string {
   const maxBudget = Math.max(320, maxWords);
   const templated = ensureScientificTemplate(answer, [], [], []);
   if (!templated || countWords(templated) <= maxBudget) return templated;
@@ -561,7 +724,13 @@ function ensureScientificTemplate(
   caveats: string[] = [],
   nextActions: string[] = [],
 ): string {
-  const normalized = stripInternalCritiqueSection(normalizeAnswerMarkdown(answer));
+  const normalizeHeadingBoundaries = (value: string): string =>
+    value
+      .replace(/\s+(#{2,6}\s+)/g, "\n\n$1")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  const normalizedRaw = stripInternalCritiqueSection(normalizeAnswerMarkdown(answer));
+  const normalized = normalizeHeadingBoundaries(normalizedRaw);
   if (!normalized) return normalized;
   const sections: Record<ScientificTemplateHeading, string[]> = {
     "Working conclusion": [],
@@ -589,20 +758,39 @@ function ensureScientificTemplate(
   const preambleText = clean(preamble.join(" "));
   if (preambleText) sections["Working conclusion"].unshift(preambleText);
 
-  const findings = keyFindings
-    .map((item) => clean(item))
-    .filter(Boolean)
-    .slice(0, 5);
-  const uncertainty = caveats
-    .map((item) => clean(item))
-    .filter(Boolean)
-    .slice(0, 2);
-  const actions = nextActions
-    .map((item) => clean(item))
-    .filter(Boolean)
-    .slice(0, 4);
+  const normalizeForDedupe = (value: string): string =>
+    value
+      .replace(/^[-*]\s+/, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  const dedupeRows = (rows: string[]): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of rows) {
+      const line = raw.trimEnd();
+      if (!line.trim()) {
+        out.push(line);
+        continue;
+      }
+      const key = normalizeForDedupe(line);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(line);
+    }
+    return out;
+  };
+  const findings = dedupeRows(
+    keyFindings.map((item) => clean(item)).filter(Boolean),
+  ).slice(0, 5);
+  const uncertainty = dedupeRows(
+    caveats.map((item) => clean(item)).filter(Boolean),
+  ).slice(0, 2);
+  const actions = dedupeRows(
+    nextActions.map((item) => clean(item)).filter(Boolean),
+  ).slice(0, 4);
 
-  const flatten = (rows: string[]) => rows.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const flatten = (rows: string[]) => dedupeRows(rows).join("\n").replace(/\n{3,}/g, "\n\n").trim();
   const asBullets = (rows: string[]) => rows.map((row) => `- ${row}`).join("\n");
   const working = flatten(sections["Working conclusion"]) || clean(answer);
   const evidence = flatten(sections["Evidence synthesis"]) || asBullets(findings.slice(0, 4)) || working;
@@ -633,6 +821,22 @@ function ensureScientificTemplate(
     .trim();
 }
 
+function hasAllScientificTemplateHeadings(answer: string): boolean {
+  const normalized = stripInternalCritiqueSection(normalizeAnswerMarkdown(answer))
+    .replace(/\s+(#{2,6}\s+)/g, "\n\n$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!normalized) return false;
+  const found = new Set<ScientificTemplateHeading>();
+  for (const line of normalized.split("\n")) {
+    const headingMatch = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (!headingMatch) continue;
+    const canonical = canonicalScientificSectionHeading(headingMatch[1] ?? "");
+    if (isScientificTemplateHeading(canonical)) found.add(canonical);
+  }
+  return SCIENTIFIC_TEMPLATE_HEADINGS.every((heading) => found.has(heading));
+}
+
 function enrichIfTooBrief(
   answer: string,
   keyFindings: string[],
@@ -642,6 +846,7 @@ function enrichIfTooBrief(
   const templated = ensureScientificTemplate(answer, keyFindings, caveats, nextActions);
   const normalized = stripInternalCritiqueSection(normalizeAnswerMarkdown(templated));
   if (!normalized) return normalized;
+  if (hasAllScientificTemplateHeadings(normalized)) return normalized;
   if (countWords(normalized) >= 420) return normalized;
   const findings = keyFindings
     .map((item) => clean(item))
@@ -742,6 +947,27 @@ function uniqueSymbols(symbols: string[]): string[] {
     ordered.push(normalized);
   }
   return ordered;
+}
+
+function stableSerialize(value: unknown): string {
+  const seen = new WeakSet<object>();
+  const normalize = (input: unknown): unknown => {
+    if (input === null || typeof input !== "object") return input;
+    if (Array.isArray(input)) return input.map((item) => normalize(item));
+    const asObject = input as Record<string, unknown>;
+    if (seen.has(asObject)) return "[circular]";
+    seen.add(asObject);
+    const sortedEntries = Object.entries(asObject)
+      .filter(([, rowValue]) => rowValue !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, rowValue]) => [key, normalize(rowValue)]);
+    return Object.fromEntries(sortedEntries);
+  };
+  try {
+    return JSON.stringify(normalize(value));
+  } catch {
+    return String(value);
+  }
 }
 
 function toAssistantText(content: unknown): string {
@@ -1049,7 +1275,10 @@ function chooseBridgePath(state: DiscoveryState): {
   unresolvedPairs: string[];
   anchorLabels: string[];
 } {
-  const anchors = (state.queryPlan?.anchors ?? []).slice(0, 4);
+  const plannedAnchors = state.queryPlan?.anchors ?? [];
+  const diseaseAnchors = plannedAnchors.filter((anchor) => anchor.entityType === "disease");
+  const anchorPool = diseaseAnchors.length >= 2 ? diseaseAnchors : plannedAnchors;
+  const anchors = anchorPool.slice(0, 4);
   const anchorNodeKeys = anchors
     .map((anchor) => entityKey(nodeEntityFromAnchor(anchor)))
     .filter((key) => state.nodes.has(key));
@@ -1162,30 +1391,41 @@ function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererF
     bridge.anchorLabels.length >= 2
       ? bridge.anchorLabels.join(" and ")
       : bridge.anchorLabels[0] ?? query;
+  const partialThreadParts = [thread.pathway, thread.target, thread.drug].filter(
+    (value) => value && value !== "not provided",
+  );
+  const partialThreadSummary =
+    partialThreadParts.length >= 2 ? partialThreadParts.join(" -> ") : "";
 
   const baseAnswer = bridge.connectedPath
     ? `For ${anchorScope}, current evidence supports the multihop mechanism path ${bridgeSummary}.`
-    : `For ${anchorScope}, a complete multihop mechanism path is not yet resolved; the strongest partial thread is ${thread.pathway} -> ${thread.target} -> ${thread.drug}.`;
+    : partialThreadSummary
+      ? `For ${anchorScope}, a complete multihop mechanism path is not yet resolved; the strongest partial thread is ${partialThreadSummary}.`
+      : `For ${anchorScope}, a complete multihop mechanism path is not yet resolved and no stable target-pathway-drug thread has been established yet.`;
 
   const caveats: string[] = [];
   if (!bridge.connectedPath) {
     caveats.push("No complete path across all query entities in this run.");
   }
-  if (thread.target === "not provided") caveats.push("Target evidence not provided.");
-  if (thread.pathway === "not provided") caveats.push("Pathway evidence not provided.");
-  if (thread.drug === "not provided") caveats.push("Drug evidence not provided.");
+  if (thread.target === "not provided") caveats.push("Target-level evidence could not be recovered.");
+  if (thread.pathway === "not provided") caveats.push("Pathway-level evidence could not be recovered.");
+  if (thread.drug === "not provided") caveats.push("Drug-hook evidence could not be recovered.");
   if (pubmedCount === 0) caveats.push("PubMed subqueries returned no articles.");
-  const hasConcreteThread =
-    thread.pathway !== "not provided" || thread.target !== "not provided" || thread.drug !== "not provided";
+  const strongestThreadFinding =
+    partialThreadParts.length >= 2
+      ? `Strongest thread: ${partialThreadParts.join(" -> ")}`
+      : partialThreadParts.length === 1
+        ? `Strongest available mechanistic signal: ${partialThreadParts[0]}`
+        : "";
   const mappedAnchorsLine =
-    bridge.anchorLabels.length <= 1
-      ? `Primary query entity mapped: ${bridge.anchorLabels[0] ?? "not provided"}`
-      : `Query entities mapped: ${bridge.anchorLabels.join(" | ")}`;
+    bridge.anchorLabels.length === 0
+      ? "Primary query entity could not be mapped to graph nodes."
+      : bridge.anchorLabels.length === 1
+        ? `Primary query entity mapped: ${bridge.anchorLabels[0]}`
+        : `Query entities mapped: ${bridge.anchorLabels.join(" | ")}`;
   const keyFindings = [
     mappedAnchorsLine,
-    ...(hasConcreteThread
-      ? [`Strongest thread: ${thread.pathway} -> ${thread.target} -> ${thread.drug}`]
-      : []),
+    ...(strongestThreadFinding ? [strongestThreadFinding] : []),
     `Nodes discovered: ${state.nodes.size}`,
     `Edges discovered: ${state.edges.size}`,
     `PubMed subqueries executed: ${state.pubmedSubqueriesUsed}/${MAX_PUBMED_SUBQUERIES}`,
@@ -1200,7 +1440,7 @@ function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererF
   const answer = capUncertaintyTail(
     clampScientificTemplateWordBudget(
       ensureScientificTemplate(baseAnswer, keyFindings, caveats, nextActions),
-      700,
+      SCIENTIFIC_ANSWER_WORD_BUDGET,
     ),
   );
 
@@ -1350,6 +1590,7 @@ async function compressSubagentSummary(
 async function synthesizeFreeformNarrative(
   model: ChatOpenAI,
   payload: FreeformSynthesisInput,
+  timeoutMs = AGENT_TIMEOUT_MS,
 ): Promise<string | null> {
   const response = await withOpenAiOperationContext(
     "deep_discover.final_freeform_synthesis",
@@ -1369,7 +1610,7 @@ async function synthesizeFreeformNarrative(
               "### What to test next",
               "### Residual uncertainty",
               "Open with a direct answer sentence that names the main mechanism relation and a practical next step.",
-              "Write a substantive answer (roughly 500-700 words), not a one-liner.",
+              "Write a substantive answer (roughly 600-1200 words), not a one-liner.",
               "Mention the key entities from the query and only the mechanism hops required to justify the recommendation.",
               "Balance mechanism detail with practical interpretation and include 2-3 concrete next-step actions with expected readouts.",
               "Never use generic templates or boilerplate prefixes.",
@@ -1422,7 +1663,7 @@ async function synthesizeFreeformNarrative(
             ),
           },
         ]),
-        AGENT_TIMEOUT_MS,
+        Math.max(2_000, timeoutMs),
         "freeform synthesis",
       ),
   );
@@ -1485,6 +1726,7 @@ export async function runDeepDiscoverer({
   diseaseQuery,
   diseaseIdHint,
   question,
+  maxRunMs,
   emitJourney,
 }: RunParams): Promise<DiscovererFinal> {
   const normalizedQuestion = clean(question || diseaseQuery);
@@ -1534,7 +1776,14 @@ export async function runDeepDiscoverer({
   };
 
   const runStartedAtMs = Date.now();
-  const runDeadlineMs = runStartedAtMs + DISCOVERER_MAX_RUN_MS;
+  const runBudgetMs = clampTimeout(
+    typeof maxRunMs === "number" && Number.isFinite(maxRunMs)
+      ? Math.floor(maxRunMs)
+      : DISCOVERER_MAX_RUN_MS,
+    120_000,
+    DISCOVERER_MAX_RUN_MS,
+  );
+  const runDeadlineMs = runStartedAtMs + runBudgetMs;
   let runBudgetWarningEmitted = false;
   let pubmedBudgetNoticeEmitted = false;
   const msRemaining = () => runDeadlineMs - Date.now();
@@ -1567,6 +1816,43 @@ export async function runDeepDiscoverer({
       entities,
       "candidate",
     );
+  };
+
+  const retrievalCache = new Map<string, unknown>();
+  const retrievalInFlight = new Map<string, Promise<unknown>>();
+  const retrievalStats = {
+    cacheHits: 0,
+    cacheMisses: 0,
+    sharedInFlight: 0,
+  };
+
+  const callRetrieval = async <T>(
+    operation: string,
+    input: unknown,
+    fetcher: () => Promise<T>,
+  ): Promise<T> => {
+    const cacheKey = `${operation}:${stableSerialize(input)}`;
+    if (retrievalCache.has(cacheKey)) {
+      retrievalStats.cacheHits += 1;
+      return retrievalCache.get(cacheKey) as T;
+    }
+    const active = retrievalInFlight.get(cacheKey);
+    if (active) {
+      retrievalStats.sharedInFlight += 1;
+      return (await active) as T;
+    }
+
+    retrievalStats.cacheMisses += 1;
+    const pending = fetcher()
+      .then((result) => {
+        retrievalCache.set(cacheKey, result as unknown);
+        return result as unknown;
+      })
+      .finally(() => {
+        retrievalInFlight.delete(cacheKey);
+      });
+    retrievalInFlight.set(cacheKey, pending);
+    return (await pending) as T;
   };
 
   const upsertTargetNode = (target: TargetInfo) => {
@@ -1871,7 +2157,11 @@ export async function runDeepDiscoverer({
           [leftEntity, rightEntity],
           "active",
         );
-        articles = await searchPubmedByQuery(subquery, 4).catch(() => []);
+        articles = await callRetrieval(
+          "pubmed.searchPubmedByQuery",
+          { query: subquery, limit: 4 },
+          () => searchPubmedByQuery(subquery, 4).catch(() => []),
+        );
         state.pubmedSubqueryHits.push({ query: subquery, articles });
         state.pubmedByQuery.set(subqueryKey, articles);
       }
@@ -1943,7 +2233,11 @@ export async function runDeepDiscoverer({
 
       const candidates: Array<{ id: string; name: string; type: string; source: string }> = [];
       if (expected === "disease" || expected === "unknown") {
-        const diseases = await searchDiseases(query, 8).catch(() => []);
+        const diseases = await callRetrieval(
+          "opentargets.searchDiseases",
+          { query, size: 8 },
+          () => searchDiseases(query, 8).catch(() => []),
+        );
         for (const disease of diseases) {
           if (!diseaseEntityPattern.test(disease.id)) continue;
           candidates.push({ id: disease.id, name: disease.name, type: "disease", source: "opentargets" });
@@ -1951,7 +2245,11 @@ export async function runDeepDiscoverer({
       }
 
       if (expected === "target" || expected === "unknown" || expected === "protein") {
-        const targets = await searchTargets(query, 8).catch(() => []);
+        const targets = await callRetrieval(
+          "opentargets.searchTargets",
+          { query, size: 8 },
+          () => searchTargets(query, 8).catch(() => []),
+        );
         for (const target of targets) {
           candidates.push({ id: target.id, name: target.name, type: "target", source: "opentargets" });
         }
@@ -1959,8 +2257,16 @@ export async function runDeepDiscoverer({
 
       if (expected === "drug" || expected === "unknown" || expected === "intervention") {
         const [drugs, chemblDrugs] = await Promise.all([
-          searchDrugs(query, 6).catch(() => []),
-          getTargetActivityDrugs(query, 4).catch(() => []),
+          callRetrieval(
+            "opentargets.searchDrugs",
+            { query, size: 6 },
+            () => searchDrugs(query, 6).catch(() => []),
+          ),
+          callRetrieval(
+            "chembl.getTargetActivityDrugs",
+            { symbol: query, limit: 4 },
+            () => getTargetActivityDrugs(query, 4).catch(() => []),
+          ),
         ]);
         for (const drug of drugs) {
           candidates.push({ id: drug.id, name: drug.name, type: "drug", source: "opentargets" });
@@ -2027,7 +2333,11 @@ export async function runDeepDiscoverer({
       let disease = state.diseaseById.get(query) ?? null;
       if (!disease) {
         if (diseaseEntityPattern.test(query)) {
-          const matches = await searchDiseases(query, 4).catch(() => []);
+          const matches = await callRetrieval(
+            "opentargets.searchDiseases",
+            { query, size: 4 },
+            () => searchDiseases(query, 4).catch(() => []),
+          );
           const exact = matches.find((row) => row.id === query);
           disease = {
             id: query,
@@ -2040,7 +2350,11 @@ export async function runDeepDiscoverer({
         }
       }
 
-      const rows = await getDiseaseTargetsSummary(disease.id, capped).catch(() => []);
+      const rows = await callRetrieval(
+        "opentargets.getDiseaseTargetsSummary",
+        { diseaseId: disease.id, limit: capped },
+        () => getDiseaseTargetsSummary(disease.id, capped).catch(() => []),
+      );
       const targets = rows.slice(0, capped).map((row) => ({
         id: row.targetId,
         symbol: row.targetSymbol,
@@ -2099,7 +2413,11 @@ export async function runDeepDiscoverer({
 
       let linkCount = 0;
       for (const symbol of effectiveSymbols) {
-        const rows = await findPathwaysByGene(symbol).catch(() => []);
+        const rows = await callRetrieval(
+          "reactome.findPathwaysByGene",
+          { symbol },
+          () => findPathwaysByGene(symbol).catch(() => []),
+        );
         const pathways = rows.slice(0, cappedPerTarget).map((row) => ({
           id: row.id,
           name: Array.isArray(row.name)
@@ -2176,8 +2494,18 @@ export async function runDeepDiscoverer({
           (row) => row.symbol.toUpperCase() === symbol.toUpperCase(),
         );
         const [known, activity] = await Promise.allSettled([
-          target ? getKnownDrugsForTarget(target.id, cappedPerTarget) : Promise.resolve([]),
-          getTargetActivityDrugs(symbol, cappedPerTarget),
+          target
+            ? callRetrieval(
+                "opentargets.getKnownDrugsForTarget",
+                { targetId: target.id, limit: cappedPerTarget },
+                () => getKnownDrugsForTarget(target.id, cappedPerTarget).catch(() => []),
+              )
+            : Promise.resolve([]),
+          callRetrieval(
+            "chembl.getTargetActivityDrugs",
+            { symbol, limit: cappedPerTarget },
+            () => getTargetActivityDrugs(symbol, cappedPerTarget).catch(() => []),
+          ),
         ]);
 
         const merged = new Map<string, DrugInfo>();
@@ -2267,10 +2595,15 @@ export async function runDeepDiscoverer({
         "active",
       );
 
-      const network = await getInteractionNetwork(effectiveSymbols, conf, maxN).catch(() => ({
-        nodes: [],
-        edges: [],
-      }));
+      const network = await callRetrieval(
+        "string.getInteractionNetwork",
+        { symbols: effectiveSymbols, confidence: conf, maxNeighbors: maxN },
+        () =>
+          getInteractionNetwork(effectiveSymbols, conf, maxN).catch(() => ({
+            nodes: [],
+            edges: [],
+          })),
+      );
 
       for (const node of network.nodes) {
         const symbol = clean(node.symbol).toUpperCase();
@@ -2350,8 +2683,13 @@ export async function runDeepDiscoverer({
         "active",
       );
 
-      const data = await getLiteratureAndTrials(disease, target, intervention || undefined).catch(
-        () => ({ articles: [], trials: [] }),
+      const data = await callRetrieval(
+        "biomcp.getLiteratureAndTrials",
+        { disease, target, intervention: intervention || "" },
+        () =>
+          getLiteratureAndTrials(disease, target, intervention || undefined).catch(
+            () => ({ articles: [], trials: [] }),
+          ),
       );
       state.bioMcpCounts.articles += data.articles.length;
       state.bioMcpCounts.trials += data.trials.length;
@@ -2472,15 +2810,28 @@ export async function runDeepDiscoverer({
         "active",
       );
 
-      const evidence = await collectMedicalEvidence({
-        query: resolvedQuery,
-        diseaseName: disease,
-        targetSymbol: target,
-        interventionHint: intervention,
-        maxLiterature,
-        maxDrug,
-        maxStats,
-      }).catch(() => ({ literature: [], drugs: [], stats: [] }));
+      const evidence = await callRetrieval(
+        "medical.collectMedicalEvidence",
+        {
+          query: resolvedQuery,
+          diseaseName: disease,
+          targetSymbol: target,
+          interventionHint: intervention,
+          maxLiterature,
+          maxDrug,
+          maxStats,
+        },
+        () =>
+          collectMedicalEvidence({
+            query: resolvedQuery,
+            diseaseName: disease,
+            targetSymbol: target,
+            interventionHint: intervention,
+            maxLiterature,
+            maxDrug,
+            maxStats,
+          }).catch(() => ({ literature: [], drugs: [], stats: [] })),
+      );
 
       state.medicalCounts.literature += evidence.literature.length;
       state.medicalCounts.drugs += evidence.drugs.length;
@@ -2639,7 +2990,11 @@ export async function runDeepDiscoverer({
         "active",
       );
 
-      const articles = await getPubmedArticles(disease, target, capped).catch(() => []);
+      const articles = await callRetrieval(
+        "pubmed.getPubmedArticles",
+        { disease, target, limit: capped },
+        () => getPubmedArticles(disease, target, capped).catch(() => []),
+      );
       state.pubmedSubqueryHits.push({ query: pairQuery, articles });
       state.pubmedByQuery.set(pairKey, articles);
 
@@ -2769,7 +3124,11 @@ export async function runDeepDiscoverer({
         "active",
       );
 
-      const articles = await searchPubmedByQuery(query, capped).catch(() => []);
+      const articles = await callRetrieval(
+        "pubmed.searchPubmedByQuery",
+        { query, limit: capped },
+        () => searchPubmedByQuery(query, capped).catch(() => []),
+      );
       state.pubmedSubqueryHits.push({ query, articles });
       state.pubmedByQuery.set(queryKey, articles);
 
@@ -2844,8 +3203,17 @@ export async function runDeepDiscoverer({
           "candidate",
         );
 
-        const network = await getInteractionNetwork(frontier, 0.72, clamp(perHopLimit * 6, 10, 60)).catch(
-          () => ({ nodes: [], edges: [] }),
+        const network = await callRetrieval(
+          "string.getInteractionNetwork",
+          {
+            symbols: frontier,
+            confidence: 0.72,
+            maxNeighbors: clamp(perHopLimit * 6, 10, 60),
+          },
+          () =>
+            getInteractionNetwork(frontier, 0.72, clamp(perHopLimit * 6, 10, 60)).catch(
+              () => ({ nodes: [], edges: [] }),
+            ),
         );
 
         const nextFrontier: string[] = [];
@@ -2863,7 +3231,11 @@ export async function runDeepDiscoverer({
 
         const newlyResolved: TargetInfo[] = [];
         for (const candidate of uniqueSymbols(nextFrontier).slice(0, perHopLimit)) {
-          const hits = await searchTargets(candidate, 3).catch(() => []);
+          const hits = await callRetrieval(
+            "opentargets.searchTargets",
+            { query: candidate, size: 3 },
+            () => searchTargets(candidate, 3).catch(() => []),
+          );
           const hit = hits[0];
           const target: TargetInfo = {
             id: hit?.id ?? `TARGET_${candidate}`,
@@ -2968,7 +3340,7 @@ export async function runDeepDiscoverer({
     model: subagentModelName,
     apiKey: activeOpenAiApiKey,
     callbacks: [usageCallback],
-    maxTokens: 700,
+    maxTokens: 1200,
     ...getLangChainPromptCacheConfig(
       "deep_discover.coordinator_model",
       subagentModelName,
@@ -3047,30 +3419,117 @@ export async function runDeepDiscoverer({
       rationale: "planner unavailable",
     };
   }
+  state.queryPlan = stabilizeQueryPlanAnchors(
+    state.queryPlan,
+    diseaseQuery || normalizedQuestion,
+    diseaseIdHint,
+  );
 
   resolveAnchorNodes();
 
-  const diseaseMentions = resolveDiseaseCandidatesFromPlan(state.queryPlan, diseaseQuery || normalizedQuestion);
-  for (const mention of diseaseMentions.slice(0, 3)) {
-    try {
-      const disease = await resolveDisease(state, mention, diseaseIdHint);
-      push(
-        "tool_result",
-        "Disease resolved",
-        `${disease.name} (${disease.id})`,
-        "opentargets",
-        [{ type: "disease", label: disease.name, primaryId: disease.id }],
-        "active",
-      );
-    } catch {
-      push(
-        "warning",
-        "Disease resolver degraded",
-        `Could not resolve disease mention: ${mention}`,
-        "opentargets",
-        [{ type: "disease", label: mention }],
-        "candidate",
-      );
+  const planAnchors = state.queryPlan?.anchors ?? [];
+  const diseaseAnchors = planAnchors.filter((anchor) => anchor.entityType === "disease");
+  const conceptAnchors = planAnchors.filter((anchor) => anchor.entityType !== "disease");
+
+  if (diseaseAnchors.length > 0) {
+    const diseaseMentions = resolveDiseaseCandidatesFromPlan(state.queryPlan, diseaseQuery || normalizedQuestion);
+    for (const mention of diseaseMentions.slice(0, 3)) {
+      try {
+        const disease = await resolveDisease(state, mention, diseaseIdHint);
+        push(
+          "tool_result",
+          "Disease resolved",
+          `${disease.name} (${disease.id})`,
+          "opentargets",
+          [{ type: "disease", label: disease.name, primaryId: disease.id }],
+          "active",
+        );
+      } catch {
+        push(
+          "warning",
+          "Disease resolver degraded",
+          `Could not resolve disease mention: ${mention}`,
+          "opentargets",
+          [{ type: "disease", label: mention }],
+          "candidate",
+        );
+      }
+    }
+  }
+
+  if (conceptAnchors.length > 0) {
+    const conceptTargetSeeds = uniqueSymbols(
+      conceptAnchors
+        .filter((anchor) => anchor.entityType === "target")
+        .map((anchor) => clean(anchor.name).toUpperCase())
+        .filter((value) => value.length >= 2),
+    ).slice(0, 8);
+    const conceptDrugSeeds = conceptAnchors
+      .filter((anchor) => anchor.entityType === "drug")
+      .map((anchor) => clean(anchor.name))
+      .filter(Boolean)
+      .slice(0, 3);
+
+    push(
+      "phase",
+      "Concept-centric expansion",
+      `Expanding non-disease anchors via target/pathway/drug/interaction tools (${conceptAnchors
+        .slice(0, 4)
+        .map((anchor) => anchor.name)
+        .join(", ")}).`,
+      "planner",
+      conceptAnchors.slice(0, 6).map(nodeEntityFromAnchor),
+      "active",
+    );
+
+    if (conceptTargetSeeds.length > 0 && hasTimeBudget(18_000)) {
+      await fetchPathwaysTool
+        .invoke({
+          targetSymbolsCsv: conceptTargetSeeds.join(", "),
+          perTarget: 3,
+        })
+        .catch(() => undefined);
+      await fetchDrugsTool
+        .invoke({
+          targetSymbolsCsv: conceptTargetSeeds.join(", "),
+          perTarget: 4,
+        })
+        .catch(() => undefined);
+      if (hasTimeBudget(10_000)) {
+        await fetchInteractionsTool
+          .invoke({
+            targetSymbolsCsv: conceptTargetSeeds.slice(0, 6).join(", "),
+            confidence: 0.68,
+            maxNeighbors: 24,
+          })
+          .catch(() => undefined);
+      }
+    }
+
+    if (hasTimeBudget(12_000)) {
+      await collectMedicalMcpEvidenceTool
+        .invoke({
+          query: normalizedQuestion,
+          diseaseName: "",
+          targetSymbol: conceptTargetSeeds[0] ?? "",
+          interventionHint: conceptDrugSeeds[0] ?? "",
+          maxLiterature: 4,
+          maxDrug: 2,
+          maxStats: 2,
+        })
+        .catch(() => undefined);
+    }
+
+    if (
+      hasTimeBudget(8_000) &&
+      state.pubmedSubqueriesUsed < MAX_PUBMED_SUBQUERIES
+    ) {
+      await searchPubmedSubqueryTool
+        .invoke({
+          subquery: normalizedQuestion,
+          limit: 3,
+        })
+        .catch(() => undefined);
     }
   }
 
@@ -3090,7 +3549,11 @@ export async function runDeepDiscoverer({
 
     const disease = [...state.diseaseById.values()][0];
     if (disease) {
-      const rows = await getDiseaseTargetsSummary(disease.id, 10).catch(() => []);
+      const rows = await callRetrieval(
+        "opentargets.getDiseaseTargetsSummary",
+        { diseaseId: disease.id, limit: 10 },
+        () => getDiseaseTargetsSummary(disease.id, 10).catch(() => []),
+      );
       const targets = rows.slice(0, 10).map((row) => ({
         id: row.targetId,
         symbol: row.targetSymbol,
@@ -3103,7 +3566,11 @@ export async function runDeepDiscoverer({
 
       const topSymbols = targets.slice(0, 4).map((target) => target.symbol);
       for (const symbol of topSymbols) {
-        const pathways = await findPathwaysByGene(symbol).catch(() => []);
+        const pathways = await callRetrieval(
+          "reactome.findPathwaysByGene",
+          { symbol },
+          () => findPathwaysByGene(symbol).catch(() => []),
+        );
         const compactPathways = pathways.slice(0, 2).map((row) => ({
           id: row.id,
           name: Array.isArray(row.name)
@@ -3115,7 +3582,11 @@ export async function runDeepDiscoverer({
           linkTargetPathway(symbol, pathway);
         }
 
-        const activity = await getTargetActivityDrugs(symbol, 2).catch(() => []);
+        const activity = await callRetrieval(
+          "chembl.getTargetActivityDrugs",
+          { symbol, limit: 2 },
+          () => getTargetActivityDrugs(symbol, 2).catch(() => []),
+        );
         const compounds = activity.slice(0, 2).map((row) => ({
           id: row.moleculeId,
           name: row.name,
@@ -3128,7 +3599,11 @@ export async function runDeepDiscoverer({
 
         if (state.pubmedSubqueriesUsed < MAX_PUBMED_SUBQUERIES) {
           state.pubmedSubqueriesUsed += 1;
-          const articles = await getPubmedArticles(disease.name, symbol, 2).catch(() => []);
+          const articles = await callRetrieval(
+            "pubmed.getPubmedArticles",
+            { disease: disease.name, target: symbol, limit: 2 },
+            () => getPubmedArticles(disease.name, symbol, 2).catch(() => []),
+          );
           const query = `${symbol} AND ${disease.name}`;
           state.pubmedSubqueryHits.push({ query, articles });
           state.pubmedByQuery.set(normalizePubmedQuery(query), articles);
@@ -3150,7 +3625,8 @@ export async function runDeepDiscoverer({
     return buildFallbackSummary(state, normalizedQuestion);
   }
 
-  if (isOpenAiRateLimited()) {
+  const startedDuringOpenAiCooldown = isOpenAiRateLimited();
+  if (startedDuringOpenAiCooldown) {
     push(
       "warning",
       "OpenAI temporarily unavailable",
@@ -3159,8 +3635,15 @@ export async function runDeepDiscoverer({
       [],
       "candidate",
     );
+    push(
+      "insight",
+      "Deterministic recovery",
+      "Running deterministic retrieval while keeping downstream synthesis eligible once cooldown expires.",
+      "agent",
+      [],
+      "candidate",
+    );
     await deterministicBackfill("openai-rate-limit");
-    return buildFallbackSummary(state, normalizedQuestion);
   }
 
   const coordinatorPlanner = coordinatorModel.withStructuredOutput(coordinatorPlanSchema);
@@ -3530,6 +4013,19 @@ export async function runDeepDiscoverer({
 
   let coordinatorTasks: CoordinatorTask[] = [];
   let initialPubmedSubqueries: string[] = [];
+  const plannerComplexity = {
+    anchors: state.queryPlan?.anchors.length ?? 0,
+    unresolved: state.queryPlan?.unresolvedMentions.length ?? 0,
+    constraints: state.queryPlan?.constraints.length ?? 0,
+    followups: state.queryPlan?.followups.length ?? 0,
+  };
+  const bypassCoordinatorPlanner =
+    plannerComplexity.anchors > 0 &&
+    plannerComplexity.anchors <= 3 &&
+    plannerComplexity.unresolved === 0 &&
+    plannerComplexity.constraints <= 2 &&
+    plannerComplexity.followups <= 2;
+  const forceDefaultPlanner = startedDuringOpenAiCooldown;
 
   push(
     "phase",
@@ -3541,7 +4037,19 @@ export async function runDeepDiscoverer({
   );
 
   try {
-    if (!hasTimeBudget(25_000)) {
+    if (bypassCoordinatorPlanner || forceDefaultPlanner) {
+      push(
+        "insight",
+        "Coordinator planning bypassed",
+        forceDefaultPlanner
+          ? "Using deterministic task graph during OpenAI cooldown; synthesis will retry model-assisted generation when available."
+          : `Using deterministic task graph for low-complexity query (anchors=${plannerComplexity.anchors}, constraints=${plannerComplexity.constraints}, unresolved=${plannerComplexity.unresolved}).`,
+        "planner",
+        [],
+        "candidate",
+      );
+      coordinatorTasks = buildDefaultTasks();
+    } else if (!hasTimeBudget(25_000)) {
       emitRunBudgetWarning(
         "Skipping coordinator replanning to reserve budget for answer synthesis.",
       );
@@ -3678,7 +4186,7 @@ export async function runDeepDiscoverer({
       );
     }
 
-    return routed.slice(0, 6).map(mergeTaskSeedsWithPrimaryAnchors);
+    return routed.slice(0, 4).map(mergeTaskSeedsWithPrimaryAnchors);
   };
 
   coordinatorTasks = applySupervisorRouting(coordinatorTasks);
@@ -3717,6 +4225,17 @@ export async function runDeepDiscoverer({
 
   const primaryTasks = coordinatorTasks.slice(0, 2);
   const secondaryTasks = coordinatorTasks.slice(2);
+  const shouldStopExpansion = (): boolean => {
+    const coverage = summarizeAnchorCoverage(state);
+    const evidenceBreadth =
+      Number(state.pathwayById.size > 0) +
+      Number(state.drugById.size > 0) +
+      Number(state.interactionSymbols.size > 0) +
+      Number(state.pubmedSubqueryHits.length > 0) +
+      Number(totalMedicalSnippets() > 0) +
+      Number(state.bioMcpCounts.articles + state.bioMcpCounts.trials > 0);
+    return coverage.totalPairCount > 0 && coverage.coverageScore >= 1 && evidenceBreadth >= 4;
+  };
 
   const reports: SubagentReport[] = [];
   const primarySettled = await Promise.allSettled(primaryTasks.map((task) => runSubagentTask(task)));
@@ -3724,7 +4243,20 @@ export async function runDeepDiscoverer({
     if (row.status === "fulfilled") reports.push(row.value);
   }
 
+  const stopAfterPrimary = shouldStopExpansion();
+  if (stopAfterPrimary) {
+    push(
+      "insight",
+      "Expansion converged",
+      "Anchor coverage and evidence breadth are already sufficient; skipping lower-yield secondary subagent tasks.",
+      "agent",
+      [],
+      "candidate",
+    );
+  }
+
   for (const task of secondaryTasks) {
+    if (stopAfterPrimary) break;
     if (!hasTimeBudget(35_000)) {
       emitRunBudgetWarning(
         "Secondary task execution trimmed to preserve synthesis budget.",
@@ -3751,7 +4283,18 @@ export async function runDeepDiscoverer({
   ];
   const dedupedFollowups = [...new Set(followupQueue.map((row) => clean(row)).filter(Boolean))].slice(0, 4);
 
-  for (const followup of dedupedFollowups.slice(0, 2)) {
+  for (const followup of dedupedFollowups.slice(0, 1)) {
+    if (shouldStopExpansion()) {
+      push(
+        "insight",
+        "Follow-up expansion converged",
+        "Skipping extra follow-up branches because anchor coverage is already connected with broad evidence support.",
+        "agent",
+        [],
+        "candidate",
+      );
+      break;
+    }
     if (!hasTimeBudget(28_000)) {
       emitRunBudgetWarning(
         "Follow-up branch expansion trimmed to close with a complete answer.",
@@ -3786,6 +4329,17 @@ export async function runDeepDiscoverer({
 
   if (state.targetById.size === 0 || state.edges.size === 0) {
     await deterministicBackfill("empty-agent-state");
+  }
+
+  if (retrievalStats.cacheHits > 0 || retrievalStats.sharedInFlight > 0) {
+    push(
+      "insight",
+      "Retrieval dedup active",
+      `Cache hits ${retrievalStats.cacheHits}, shared in-flight ${retrievalStats.sharedInFlight}, cold fetches ${retrievalStats.cacheMisses}.`,
+      "agent",
+      [],
+      "candidate",
+    );
   }
 
   const bridge = chooseBridgePath(state);
@@ -3837,7 +4391,7 @@ export async function runDeepDiscoverer({
       "### What to test next",
       "### Residual uncertainty",
       "The first sentence must be a direct biomedical answer to the query and include a practical next step.",
-      "Write a substantive answer (roughly 500-700 words), not a one-liner.",
+      "Write a substantive answer (roughly 600-1200 words), not a one-liner.",
       "Name the query entities and the strongest supported mechanism path.",
       "Never return generic disease-centric text if query asks cross-anchor relations.",
       "If no complete mechanism path is found across the query entities, state that gap in plain biomedical language and list key intermediates that were tested.",
@@ -3880,11 +4434,74 @@ export async function runDeepDiscoverer({
     subagentSummaries: reports.slice(0, 8).map((row) => row.summary),
   };
 
+  let anytimeFinalNoticeEmitted = false;
+  const finalizeAnytime = async (params: {
+    reason: string;
+    preferredAnswer?: string | null;
+  }): Promise<DiscovererFinal> => {
+    const fallback = buildFallbackSummary(state, normalizedQuestion);
+    let anytimeAnswer = normalizeAnswerMarkdown(params.preferredAnswer ?? "");
+    const remainingMs = msRemaining();
+    if (!anytimeAnswer && remainingMs > 2_500 && !isOpenAiRateLimited()) {
+      const narrativeTimeoutMs = Math.min(
+        12_000,
+        Math.max(2_500, remainingMs - 1_500),
+      );
+      anytimeAnswer =
+        (await synthesizeFreeformNarrative(
+          strategicModel,
+          synthesisInput,
+          narrativeTimeoutMs,
+        ).catch(() => null)) ?? "";
+    }
+    const selectedAnswer = capUncertaintyTail(
+      clampScientificTemplateWordBudget(
+        enrichIfTooBrief(
+          normalizeAnswerMarkdown(anytimeAnswer || fallback.answer),
+          fallback.keyFindings,
+          fallback.caveats,
+          fallback.nextActions,
+        ),
+        SCIENTIFIC_ANSWER_WORD_BUDGET,
+      ),
+    );
+
+    if (!anytimeFinalNoticeEmitted) {
+      anytimeFinalNoticeEmitted = true;
+      push(
+        "warning",
+        "Anytime finalization",
+        `Closing with the best available synthesis snapshot (${params.reason}).`,
+        "agent",
+        [],
+        "candidate",
+      );
+    }
+
+    return {
+      answer: selectedAnswer,
+      biomedicalCase: inferBiomedicalCase(normalizedQuestion),
+      focusThread: bridge.connectedPath
+        ? {
+            pathway: bridgeSummary,
+            target: thread.target,
+            drug: thread.drug,
+          }
+        : thread,
+      keyFindings: fallback.keyFindings,
+      caveats: fallback.caveats,
+      nextActions: fallback.nextActions,
+      evidenceBundle: buildEvidenceBundle(state),
+    };
+  };
+
   if (!hasTimeBudget(8_000)) {
     emitRunBudgetWarning(
-      "Synthesis budget was exhausted; returning deterministic summary.",
+      "Synthesis budget was exhausted; closing with best available synthesis state.",
     );
-    return buildFallbackSummary(state, normalizedQuestion);
+    return finalizeAnytime({
+      reason: "run deadline approached before full structured synthesis",
+    });
   }
 
   try {
@@ -3961,7 +4578,11 @@ export async function runDeepDiscoverer({
     const rescueAnswer = structuredAnswer
       ? null
       : hasTimeBudget(7_000)
-        ? await synthesizeFreeformNarrative(strategicModel, synthesisInput).catch(() => null)
+        ? await synthesizeFreeformNarrative(
+            strategicModel,
+            synthesisInput,
+            boundedTimeout(Math.min(AGENT_TIMEOUT_MS, 16_000), 2_500),
+          ).catch(() => null)
         : null;
     const fallbackFindings = fallback.keyFindings.filter((item) => !/\bnot provided\b/i.test(item));
     const structuredFindings = (structured?.keyFindings ?? []).filter(Boolean).slice(0, 6);
@@ -3984,7 +4605,7 @@ export async function runDeepDiscoverer({
           structuredCaveats.length > 0 ? structuredCaveats : fallback.caveats,
           structuredNextActions.length > 0 ? structuredNextActions : fallback.nextActions,
         ),
-        700,
+        SCIENTIFIC_ANSWER_WORD_BUDGET,
       ),
     );
 
@@ -4020,29 +4641,24 @@ export async function runDeepDiscoverer({
     push(
       "warning",
       "Final synthesis degraded",
-      `Returning deterministic summary (${reason}).`,
+      `Switching to anytime synthesis (${reason}).`,
       "agent",
       [],
       "candidate",
     );
+    let rescued: string | null = null;
     if (reason !== "OpenAI rate-limited") {
-      const rescued = hasTimeBudget(7_000)
-        ? await synthesizeFreeformNarrative(strategicModel, synthesisInput).catch(() => null)
+      rescued = hasTimeBudget(2_500)
+        ? await synthesizeFreeformNarrative(
+            strategicModel,
+            synthesisInput,
+            boundedTimeout(Math.min(AGENT_TIMEOUT_MS, 14_000), 2_500),
+          ).catch(() => null)
         : null;
-      if (rescued) {
-        const fallback = buildFallbackSummary(state, normalizedQuestion);
-        return {
-          ...fallback,
-          answer: capUncertaintyTail(
-            clampScientificTemplateWordBudget(
-              enrichIfTooBrief(rescued, fallback.keyFindings, fallback.caveats, fallback.nextActions),
-              700,
-            ),
-          ),
-          evidenceBundle: buildEvidenceBundle(state),
-        };
-      }
     }
-    return buildFallbackSummary(state, normalizedQuestion);
+    return finalizeAnytime({
+      reason,
+      preferredAnswer: rescued,
+    });
   }
 }

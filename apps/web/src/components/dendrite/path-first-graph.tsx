@@ -49,6 +49,290 @@ function emptySourceCountMap(): SourceCountMap {
   );
 }
 
+const AGENT_DERIVED_SOURCE_HINTS = [
+  "agent",
+  "planner",
+  "query_bridge",
+  "agent_discovery",
+  "derived",
+  "virtual",
+] as const;
+
+const CURATED_SOURCE_HINTS = [
+  "opentargets",
+  "reactome",
+  "chembl",
+  "string",
+  "pubmed",
+  "biomcp",
+  "medical",
+] as const;
+
+function normalizeConceptKey(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function nodeSourceHints(node: GraphNode): string[] {
+  const values = [
+    node.meta.source,
+    node.meta.sourceName,
+    node.meta.provider,
+    node.meta.sourceTag,
+  ];
+  return values
+    .flatMap((value) =>
+      typeof value === "string"
+        ? [value]
+        : Array.isArray(value)
+          ? value.filter((item): item is string => typeof item === "string")
+          : [],
+    )
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isAgentDerivedNode(node: GraphNode): boolean {
+  if (node.meta.virtual === true) return true;
+  const hints = nodeSourceHints(node);
+  if (
+    hints.some((hint) =>
+      AGENT_DERIVED_SOURCE_HINTS.some((candidate) => hint.includes(candidate)),
+    )
+  ) {
+    return true;
+  }
+  if (
+    hints.some((hint) =>
+      CURATED_SOURCE_HINTS.some((candidate) => hint.includes(candidate)),
+    )
+  ) {
+    return false;
+  }
+  return node.type === "interaction";
+}
+
+function isSyntheticPrimaryId(value: string): boolean {
+  const normalized = normalizeConceptKey(value);
+  if (!normalized) return true;
+  if (/^(unknown|n a|na)$/.test(normalized)) return true;
+  if (/^(virtual|query|seed|evid|tmp|placeholder|node)\b/.test(normalized)) return true;
+  return false;
+}
+
+function nodeIdentityTokens(node: GraphNode): Set<string> {
+  const tokens = new Set<string>();
+  const primary = String(node.primaryId ?? "").trim();
+  if (primary && !isSyntheticPrimaryId(primary)) {
+    tokens.add(`primary:${normalizeConceptKey(primary)}`);
+  }
+  const targetSymbol = String(node.meta.targetSymbol ?? "").trim();
+  if (targetSymbol) {
+    tokens.add(`symbol:${normalizeConceptKey(targetSymbol)}`);
+  }
+  const externalId = String(node.meta.id ?? "").trim();
+  if (externalId && !isSyntheticPrimaryId(externalId)) {
+    tokens.add(`external:${normalizeConceptKey(externalId)}`);
+  }
+  return tokens;
+}
+
+function nodeDisplayKey(node: GraphNode): string {
+  const preferred =
+    (typeof node.meta.displayName === "string" ? node.meta.displayName : "") ||
+    (typeof node.meta.targetName === "string" ? node.meta.targetName : "") ||
+    node.label;
+  return normalizeConceptKey(preferred);
+}
+
+function hasTokenIntersection(left: Set<string>, right: Set<string>): boolean {
+  if (left.size === 0 || right.size === 0) return false;
+  for (const token of left) {
+    if (right.has(token)) return true;
+  }
+  return false;
+}
+
+function hasNeighborOverlap(
+  leftNodeId: string,
+  rightNodeId: string,
+  adjacency: Map<string, Set<string>>,
+): boolean {
+  const leftNeighbors = adjacency.get(leftNodeId);
+  const rightNeighbors = adjacency.get(rightNodeId);
+  if (!leftNeighbors || !rightNeighbors) return false;
+  for (const nodeId of leftNeighbors) {
+    if (rightNeighbors.has(nodeId)) return true;
+  }
+  return false;
+}
+
+function nodeRank(node: GraphNode): number {
+  let rank = 0;
+  if (!isAgentDerivedNode(node)) rank += 6;
+  if (node.meta.virtual !== true) rank += 2;
+  if (node.type !== "interaction") rank += 1;
+  if (!isSyntheticPrimaryId(String(node.primaryId ?? ""))) rank += 1;
+  rank += (node.score ?? 0) * 2;
+  return rank;
+}
+
+function collapseEquivalentConceptNodes(input: {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}): {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+} {
+  const { nodes, edges } = input;
+  if (nodes.length === 0) return { nodes, edges };
+
+  const adjacency = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    if (!adjacency.has(edge.source)) adjacency.set(edge.source, new Set());
+    if (!adjacency.has(edge.target)) adjacency.set(edge.target, new Set());
+    adjacency.get(edge.source)?.add(edge.target);
+    adjacency.get(edge.target)?.add(edge.source);
+  }
+
+  const aliasByNodeId = new Map<string, string>();
+  const provisionalNodes = nodes
+    .filter((node) => isAgentDerivedNode(node))
+    .sort((left, right) => Number(right.meta.virtual === true) - Number(left.meta.virtual === true));
+
+  for (const provisional of provisionalNodes) {
+    if (aliasByNodeId.has(provisional.id)) continue;
+    const provisionalTokens = nodeIdentityTokens(provisional);
+    const provisionalLabel = nodeDisplayKey(provisional);
+    const isFlexibleType = provisional.type === "interaction" || provisional.meta.virtual === true;
+
+    let bestCandidate: GraphNode | null = null;
+    let bestScore = -1;
+
+    for (const candidate of nodes) {
+      if (candidate.id === provisional.id) continue;
+      if (isAgentDerivedNode(candidate)) continue;
+      if (!isFlexibleType && candidate.type !== provisional.type) continue;
+      if (isFlexibleType && candidate.type === "interaction") continue;
+
+      const candidateTokens = nodeIdentityTokens(candidate);
+      const tokenOverlap = hasTokenIntersection(provisionalTokens, candidateTokens);
+      const labelOverlap =
+        provisionalLabel.length >= 3 && provisionalLabel === nodeDisplayKey(candidate);
+      const neighborOverlap = hasNeighborOverlap(provisional.id, candidate.id, adjacency);
+
+      // Never merge based on label alone; require either identifier overlap,
+      // or matching labels plus shared graph neighborhood context.
+      if (!tokenOverlap && !(labelOverlap && neighborOverlap)) continue;
+
+      const score =
+        (tokenOverlap ? 5 : 0) +
+        (labelOverlap ? 1 : 0) +
+        (neighborOverlap ? 2 : 0) +
+        (candidate.type !== "interaction" ? 1 : 0) +
+        (candidate.meta.virtual !== true ? 1 : 0);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCandidate = candidate;
+      }
+    }
+
+    if (bestCandidate) {
+      aliasByNodeId.set(provisional.id, bestCandidate.id);
+    }
+  }
+
+  if (aliasByNodeId.size === 0) {
+    return { nodes, edges };
+  }
+
+  const resolveAlias = (nodeId: string): string => {
+    let current = nodeId;
+    const visited = new Set<string>();
+    while (aliasByNodeId.has(current) && !visited.has(current)) {
+      visited.add(current);
+      current = aliasByNodeId.get(current)!;
+    }
+    return current;
+  };
+
+  const groupedByCanonicalId = new Map<string, GraphNode[]>();
+  for (const node of nodes) {
+    const canonicalId = resolveAlias(node.id);
+    if (!groupedByCanonicalId.has(canonicalId)) {
+      groupedByCanonicalId.set(canonicalId, []);
+    }
+    groupedByCanonicalId.get(canonicalId)?.push(node);
+  }
+
+  const mergedNodes: GraphNode[] = [];
+  for (const [canonicalId, grouped] of groupedByCanonicalId.entries()) {
+    const winner =
+      [...grouped].sort((left, right) => nodeRank(right) - nodeRank(left))[0] ?? grouped[0];
+    if (!winner) continue;
+
+    const mergedMeta = grouped.reduce<Record<string, unknown>>(
+      (acc, node) => ({ ...acc, ...node.meta }),
+      {},
+    );
+    const mergedAliasIds = grouped
+      .map((node) => node.id)
+      .filter((id) => id !== canonicalId);
+    if (mergedAliasIds.length > 0) {
+      mergedMeta.mergedConceptAliases = mergedAliasIds.slice(0, 12);
+      mergedMeta.dedupMerged = true;
+    }
+
+    const hasScoredNode = grouped.some((node) => typeof node.score === "number");
+    const hasSizedNode = grouped.some((node) => typeof node.size === "number");
+    const mergedScore = hasScoredNode
+      ? Math.max(...grouped.map((node) => node.score ?? 0))
+      : winner.score;
+    const mergedSize = hasSizedNode
+      ? Math.max(...grouped.map((node) => node.size ?? 0))
+      : winner.size;
+
+    mergedNodes.push({
+      ...winner,
+      id: canonicalId,
+      score: mergedScore,
+      size: mergedSize,
+      meta: {
+        ...mergedMeta,
+        ...winner.meta,
+      },
+    });
+  }
+
+  const remappedEdges = edges
+    .map((edge) => {
+      const source = resolveAlias(edge.source);
+      const target = resolveAlias(edge.target);
+      if (source === target) return null;
+      if (source === edge.source && target === edge.target) return edge;
+      return {
+        ...edge,
+        source,
+        target,
+        meta: {
+          ...edge.meta,
+          dedupRemapped: true,
+        },
+      } satisfies GraphEdge;
+    })
+    .filter((edge): edge is GraphEdge => Boolean(edge));
+
+  return {
+    nodes: mergedNodes,
+    edges: remappedEdges,
+  };
+}
+
 export function PathFirstGraph({
   query,
   queryPlan = null,
@@ -84,9 +368,30 @@ export function PathFirstGraph({
     }));
   }, []);
 
+  const unhideAllSourceGroups = useCallback(() => {
+    setSourceFilter(
+      EDGE_SOURCE_GROUPS.reduce(
+        (acc, group) => {
+          acc[group] = true;
+          return acc;
+        },
+        {} as Record<EdgeSourceGroup, boolean>,
+      ),
+    );
+  }, []);
+
   const allSourceGroupsEnabled = useMemo(
     () => EDGE_SOURCE_GROUPS.every((group) => sourceFilter[group]),
     [sourceFilter],
+  );
+
+  const dedupedGraph = useMemo(
+    () =>
+      collapseEquivalentConceptNodes({
+        nodes,
+        edges,
+      }),
+    [edges, nodes],
   );
 
   const bridgeAnalysis = useMemo(
@@ -94,10 +399,10 @@ export function PathFirstGraph({
       analyzeBridgeOutcomes({
         query,
         queryPlan,
-        nodes,
-        edges,
+        nodes: dedupedGraph.nodes,
+        edges: dedupedGraph.edges,
       }),
-    [edges, nodes, query, queryPlan],
+    [dedupedGraph.edges, dedupedGraph.nodes, query, queryPlan],
   );
 
   useEffect(() => {
@@ -112,14 +417,41 @@ export function PathFirstGraph({
       return source === "query_anchor" || source === "query_gap";
     };
 
-    const allNodes = [...nodes];
+    const allNodes = [...dedupedGraph.nodes];
     for (const virtualNode of bridgeAnalysis.virtualNodes) {
       if (!allNodes.some((node) => node.id === virtualNode.id)) {
         allNodes.push(virtualNode);
       }
     }
 
-    const allEdges = [...edges];
+    const allAnchorPairsConnected =
+      bridgeAnalysis.pairs.length > 0 &&
+      bridgeAnalysis.pairs.every((pair) => pair.status === "connected");
+    const connectedAnchorEdgeIds = new Set<string>();
+    if (allAnchorPairsConnected) {
+      for (const pair of bridgeAnalysis.pairs) {
+        for (const edgeId of pair.edgeIds) connectedAnchorEdgeIds.add(edgeId);
+      }
+      for (const edgeId of bridgeAnalysis.activeConnectedPath?.edgeIds ?? []) {
+        connectedAnchorEdgeIds.add(edgeId);
+      }
+    }
+
+    const allEdges = dedupedGraph.edges.map((edge) =>
+      connectedAnchorEdgeIds.has(edge.id)
+        ? {
+            ...edge,
+            meta: {
+              ...edge.meta,
+              status:
+                String(edge.meta.status ?? "").toLowerCase() === "no_connection"
+                  ? "connected"
+                  : edge.meta.status ?? "connected",
+              anchorPathConnected: true,
+            },
+          }
+        : edge,
+    );
     for (const virtualEdge of bridgeAnalysis.virtualEdges) {
       if (!allEdges.some((edge) => edge.id === virtualEdge.id)) {
         allEdges.push(virtualEdge);
@@ -371,14 +703,28 @@ export function PathFirstGraph({
     };
 
     const maxEdges = showInteractionContext ? 180 : 140;
-    const selectedEdges = allEdges
+    const prioritizedSelectedEdges = allEdges
       .filter((edge) => selectedEdgeIds.has(edge.id))
       .sort((a, b) => {
         const p = priority(b) - priority(a);
         if (p !== 0) return p;
         return (b.weight ?? 0) - (a.weight ?? 0);
-      })
-      .slice(0, maxEdges);
+      });
+
+    const selectedEdgeMap = new Map<string, GraphEdge>();
+    for (const edge of prioritizedSelectedEdges.slice(0, maxEdges)) {
+      selectedEdgeMap.set(edge.id, edge);
+    }
+    for (const edge of prioritizedSelectedEdges) {
+      if (!focusEdgeIds.has(edge.id)) continue;
+      selectedEdgeMap.set(edge.id, edge);
+    }
+    const selectedEdges = [...selectedEdgeMap.values()];
+    const laneTotalsBySource = emptySourceCountMap();
+    for (const edge of selectedEdges) {
+      const sourceGroup = edgeSourceById.get(edge.id) ?? "other";
+      laneTotalsBySource[sourceGroup] += 1;
+    }
 
     const visibleCountsBySource = emptySourceCountMap();
     const visibleEdges = selectedEdges.filter((edge) => {
@@ -479,7 +825,8 @@ export function PathFirstGraph({
       hiddenEdges,
       hiddenNodes,
       sourceCounts: {
-        total: totalEdgeCountsBySource,
+        total: laneTotalsBySource,
+        global: totalEdgeCountsBySource,
         visible: visibleCountsBySource,
       },
       sourceFilterMuted: filteredOutEdges,
@@ -498,8 +845,8 @@ export function PathFirstGraph({
     };
   }, [
     bridgeAnalysis,
-    edges,
-    nodes,
+    dedupedGraph.edges,
+    dedupedGraph.nodes,
     pathUpdate?.edgeIds,
     pathUpdate?.nodeIds,
     pathUpdate?.summary,
@@ -528,16 +875,20 @@ export function PathFirstGraph({
             className={
               computed.bridgeStatus === "connected"
                 ? "bg-[#ecf7f2] text-[#1f7a4f]"
+                : computed.bridgeStatus === "partial"
+                  ? "bg-[#fff4e8] text-[#9a5a0f]"
                 : computed.bridgeStatus === "no_connection"
                   ? "bg-[#f4efff] text-[#6a43be]"
                   : "bg-[#eef1f7] text-[#57607b]"
             }
           >
             {computed.bridgeStatus === "connected"
-              ? "Anchor path connected"
+              ? "Bridge connected"
+              : computed.bridgeStatus === "partial"
+                ? "Bridge partial"
               : computed.bridgeStatus === "no_connection"
-                ? "Anchor gap"
-                : "Anchor pending"}{" "}
+                ? "Bridge gap"
+                : "Bridge pending"}{" "}
             {computed.bridgePairCount > 0 ? `(${computed.bridgePairCount})` : ""}
           </Badge>
           {computed.sourceFilterMuted > 0 ? (
@@ -593,10 +944,12 @@ export function PathFirstGraph({
 
       <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
         <span className="font-semibold text-[#3f4a8f]">Evidence lanes:</span>
+        <span className="text-[10px] text-[#6b7399]">shown/available in current view</span>
         {EDGE_SOURCE_GROUPS.map((group) => {
           const total = computed.sourceCounts.total[group] ?? 0;
           if (total === 0) return null;
           const visible = computed.sourceCounts.visible[group] ?? 0;
+          const globalTotal = computed.sourceCounts.global[group] ?? total;
           const enabled = sourceFilter[group];
           const meta = EDGE_SOURCE_GROUP_META[group];
           return (
@@ -609,7 +962,7 @@ export function PathFirstGraph({
                   ? "border-[#c8cff6] bg-[#eef1ff] text-[#3f4a8f]"
                   : "border-[#d8dded] bg-[#f6f7fb] text-[#7b83a4]"
               }`}
-              title={`${meta.label} edges`}
+              title={`${meta.label}: ${visible}/${total} shown in current view (${globalTotal} in full graph)`}
             >
               <span
                 className="inline-block h-1.5 w-1.5 rounded-full"
@@ -623,23 +976,22 @@ export function PathFirstGraph({
           );
         })}
         {!allSourceGroupsEnabled ? (
-          <button
-            type="button"
-            onClick={() => {
-              setSourceFilter(
-                EDGE_SOURCE_GROUPS.reduce(
-                  (acc, group) => {
-                    acc[group] = true;
-                    return acc;
-                  },
-                  {} as Record<EdgeSourceGroup, boolean>,
-                ),
-              );
-            }}
-            className="rounded-full border border-[#d7dcf5] bg-[#f5f6ff] px-2 py-0.5 text-[10px] font-medium text-[#4e59a0]"
-          >
-            Reset
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={unhideAllSourceGroups}
+              className="rounded-full border border-[#d7dcf5] bg-[#f5f6ff] px-2 py-0.5 text-[10px] font-medium text-[#4e59a0]"
+            >
+              Unhide all
+            </button>
+            <button
+              type="button"
+              onClick={unhideAllSourceGroups}
+              className="rounded-full border border-[#d7dcf5] bg-[#f5f6ff] px-2 py-0.5 text-[10px] font-medium text-[#4e59a0]"
+            >
+              Reset
+            </button>
+          </>
         ) : null}
       </div>
 

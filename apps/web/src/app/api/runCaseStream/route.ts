@@ -45,7 +45,7 @@ import {
 } from "@/server/replay/example-replays";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 1200;
 
 type RunMode = "multihop";
 
@@ -91,7 +91,7 @@ const INTERNAL_STREAM_CONNECT_TIMEOUT_MS = 35_000;
 const SESSION_RUN_STALE_MS = 15 * 60 * 1000;
 const SESSION_API_KEY_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_JOURNEY_EVENTS = 300;
-const RUN_HARD_BUDGET_LIMIT_MS = 10 * 60 * 1000;
+const RUN_HARD_BUDGET_LIMIT_MS = 20 * 60 * 1000;
 const MAX_ANCHOR_PATH_INPUTS = 10;
 const SECONDARY_ANCHOR_TARGET_LIMIT = 10;
 const SECONDARY_ANCHOR_SEED_ROWS = 10;
@@ -113,7 +113,10 @@ const DISCOVERER_TIMEOUT_CEILING_MS = Math.max(
 );
 const MAX_DISCOVERER_FINAL_WAIT_MS = Math.max(
   30_000,
-  Math.min(appConfig.run.discovererFinalWaitMs, FINALIZATION_RESERVE_MS),
+  Math.min(
+    appConfig.run.discovererFinalWaitMs,
+    Math.max(30_000, RUN_HARD_BUDGET_MS - 15_000),
+  ),
 );
 const FALLBACK_SYNTHESIS_TIMEOUT_MS = Math.max(
   20_000,
@@ -122,6 +125,10 @@ const FALLBACK_SYNTHESIS_TIMEOUT_MS = Math.max(
 const FINAL_GROUNDING_TIMEOUT_MS = Math.max(
   20_000,
   appConfig.run.finalGroundingTimeoutMs,
+);
+const SCIENTIFIC_ANSWER_WORD_BUDGET = Math.max(
+  700,
+  Math.min(2200, appConfig.run.scientificAnswerWordBudget),
 );
 
 type FinalBriefSnapshot = {
@@ -294,6 +301,27 @@ function toRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+function normalizeReplayFinalAnswerPayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (typeof payload.answer !== "string") return payload;
+  return {
+    ...payload,
+    answer: normalizeAnswerEnding(payload.answer),
+  };
+}
+
+function normalizeReplayTerminalPayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const finalAnswer = toRecord(payload.finalAnswer);
+  if (!finalAnswer) return payload;
+  return {
+    ...payload,
+    finalAnswer: normalizeReplayFinalAnswerPayload(finalAnswer),
+  };
+}
+
 function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   if (signal.aborted) return Promise.reject(new Error("replay aborted"));
@@ -456,7 +484,7 @@ function patchReplayEventData(
   }
 
   if (eventName === "run_completed" || eventName === "done") {
-    const row = toRecord(eventData) ?? {};
+    const row = normalizeReplayTerminalPayload(toRecord(eventData) ?? {});
     return {
       skip: false,
       data: {
@@ -471,7 +499,7 @@ function patchReplayEventData(
   }
 
   if (eventName === "final_answer") {
-    const row = toRecord(eventData) ?? {};
+    const row = normalizeReplayFinalAnswerPayload(toRecord(eventData) ?? {});
     return {
       skip: false,
       data: {
@@ -1241,7 +1269,10 @@ function trimSectionToWordBudget(section: string, maxWords: number): string {
   return merged;
 }
 
-function clampScientificTemplateWordBudget(text: string, maxWords = 700): string {
+function clampScientificTemplateWordBudget(
+  text: string,
+  maxWords = SCIENTIFIC_ANSWER_WORD_BUDGET,
+): string {
   const maxBudget = Math.max(320, maxWords);
   const normalized = enforceScientificTemplate(text);
   if (countWordsInText(normalized) <= maxBudget) return normalized;
@@ -1310,12 +1341,27 @@ function expandInlineCitationRanges(text: string): string {
 }
 
 function normalizeAnswerEnding(text: string): string {
+  const trimDanglingTail = (value: string): string => {
+    const normalizedValue = value.trim();
+    if (!normalizedValue) return normalizedValue;
+    const danglingTail = /\b(?:may|might|could|would|should|and|or|but)\.$/i;
+    if (!danglingTail.test(normalizedValue)) return normalizedValue;
+    const sentences = splitTextIntoSentences(normalizedValue);
+    if (sentences.length <= 1) {
+      return normalizedValue.replace(danglingTail, "is uncertain.");
+    }
+    const lastSentence = sentences[sentences.length - 1]?.trim() ?? "";
+    if (!danglingTail.test(lastSentence)) return normalizedValue;
+    const shortened = sentences.slice(0, -1).join(" ").trim();
+    return shortened || normalizedValue.replace(danglingTail, "is uncertain.");
+  };
+
   const normalized = stripInternalCritiqueSection(
     cleanAnswerMarkdown(expandInlineCitationRanges(text)),
   );
   if (!normalized) return normalized;
   if (/[.!?](?:\s*\[\d+\])*\s*$/.test(normalized)) {
-    return normalized;
+    return trimDanglingTail(normalized);
   }
   const punctuationMatches = [...normalized.matchAll(/[.!?](?:\s*\[\d+\])*/g)];
   if (punctuationMatches.length > 0) {
@@ -1323,10 +1369,10 @@ function normalizeAnswerEnding(text: string): string {
     const boundary = (last.index ?? 0) + last[0].length;
     const tail = normalized.slice(boundary).trim();
     if (tail && countWordsInText(tail) <= 14) {
-      return normalized.slice(0, boundary).trim();
+      return trimDanglingTail(normalized.slice(0, boundary).trim());
     }
   }
-  return `${normalized}.`;
+  return trimDanglingTail(`${normalized}.`);
 }
 
 function hasInlineCitationMarker(text: string): boolean {
@@ -1594,16 +1640,21 @@ function ensureInlineCitations(
   citations: NonNullable<FinalBriefSnapshot["citations"]>,
   hints?: ScientificTemplateHints,
 ): string {
+  const normalizeHeadingBreaks = (value: string): string =>
+    value
+      .replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n\n$2")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   const normalized = capUncertaintySection(
     clampScientificTemplateWordBudget(
       enforceScientificTemplate(normalizeAnswerEnding(text), hints),
-      700,
+      SCIENTIFIC_ANSWER_WORD_BUDGET,
     ),
   );
   if (!normalized) return normalized;
-  const scrubbed = scrubInternalNarrativeTokens(
+  const scrubbed = normalizeHeadingBreaks(scrubInternalNarrativeTokens(
     normalizeCitationMarkersAgainstLedger(normalized, citations),
-  );
+  ));
   if (!scrubbed) return scrubbed;
   if (hasInlineCitationMarker(scrubbed)) return scrubbed;
   const refs = citations
@@ -2082,7 +2133,7 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
         threadCandidates: input.threadCandidates ?? [],
       }),
     ),
-    700,
+    SCIENTIFIC_ANSWER_WORD_BUDGET,
   );
   if (!synthesisClient) return normalizedAnswer;
   const totalBudgetMs = Math.max(10_000, Math.min(55_000, input.timeoutMs));
@@ -2346,7 +2397,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
                       "Use only citation indices present in the ledger; do not invent citation numbers.",
                       "Do not output section headings outside the required template.",
                       "Open with a recommendation/interpretation in at most 130 words, including 2-3 concrete next-step actions.",
-                      "Target a final length of roughly 500-700 words.",
+                      "Target a final length of roughly 600-1200 words.",
                       "Include evidence-supported mechanism bullets only where they change interpretation or action, with citations.",
                       "Include a short 'what to test next' subsection with 2-3 prioritized experiments (or analyses), expected readouts, and what result would strengthen/weaken the hypothesis.",
                       "End with exactly 1-2 closing sentences on unresolved links, missing data, or contradictions.",
@@ -2666,7 +2717,7 @@ async function synthesizeFallbackFinalAnswer(input: {
                       "Start with a direct answer sentence to the query and include a practical next step.",
                       "When path focus is connected across anchors, center the answer on that target/pathway thread.",
                       "If threadCandidates includes multiple plausible routes, summarize 2-3 graph-supported threads (one primary plus alternatives).",
-                      "Write a substantive summary (~500-700 words), not a one-liner.",
+                      "Write a substantive summary (~600-1200 words), not a one-liner.",
                       "Use concrete biomedical entities and keep mechanism detail proportional to its decision value.",
                       "Balance mechanism with directly useful interpretation; include 2-3 concrete experimental or translational next actions with expected readouts.",
                       "Keep mechanism entities constrained to the allowed graph entity labels.",
@@ -2769,7 +2820,7 @@ async function synthesizeFallbackFinalAnswer(input: {
             normalizeAnswerEnding(String(response.output_text ?? "")),
             templateHints,
           ),
-          700,
+          SCIENTIFIC_ANSWER_WORD_BUDGET,
         ),
       ),
       input.brief.citations ?? [],
@@ -5609,7 +5660,7 @@ export async function GET(request: NextRequest) {
         const hasInterventionConceptEarly = (resolvedQueryPlan?.anchors ?? []).some(
           (anchor) => anchor.requestedType === "intervention" || anchor.entityType === "drug",
         );
-        preStreamHeartbeatMessage = "Selecting primary disease anchor";
+        preStreamHeartbeatMessage = "Selecting primary anchor context";
         preStreamHeartbeatPct = 13;
         const hasDiseaseAnchorInPlan = (resolvedQueryPlan?.anchors ?? []).some(
           (anchor) => anchor.entityType === "disease",
@@ -5617,6 +5668,11 @@ export async function GET(request: NextRequest) {
         const hasNonDiseaseAnchorInPlan = (resolvedQueryPlan?.anchors ?? []).some(
           (anchor) => anchor.entityType !== "disease",
         );
+        const primaryNonDiseaseAnchor =
+          (resolvedQueryPlan?.anchors ?? []).find((anchor) => anchor.entityType !== "disease") ??
+          null;
+        const forceConceptCentricMode =
+          !diseaseIdHint && hasNonDiseaseAnchorInPlan && !hasDiseaseAnchorInPlan;
         const planDiseaseAnchors = (resolvedQueryPlan?.anchors ?? []).filter(
           (anchor) => anchor.entityType === "disease",
         );
@@ -5669,6 +5725,21 @@ export async function GET(request: NextRequest) {
               rationale: string;
             }
           | undefined;
+
+        if (forceConceptCentricMode) {
+          const conceptAnchorName =
+            primaryNonDiseaseAnchor?.name?.trim() ||
+            primaryNonDiseaseAnchor?.mention?.trim() ||
+            query;
+          chosen = {
+            selected: {
+              id: querySyntheticDiseaseId(query),
+              name: conceptAnchorName,
+            },
+            rationale:
+              "No disease anchor was explicitly resolved; using concept-centric anchor routing for multihop expansion.",
+          };
+        }
 
         if (diseaseIdHint) {
           const pinned =
@@ -5795,7 +5866,12 @@ export async function GET(request: NextRequest) {
           }
         }
 
-        if (chosen && literalDiseaseCandidate && chosen.selected.id !== literalDiseaseCandidate.id) {
+        if (
+          !forceConceptCentricMode &&
+          chosen &&
+          literalDiseaseCandidate &&
+          chosen.selected.id !== literalDiseaseCandidate.id
+        ) {
           const chosenScore =
             diseaseScoreById.get(chosen.selected.id) ??
             scoreDiseaseCandidate(query, chosen.selected);
@@ -5817,7 +5893,12 @@ export async function GET(request: NextRequest) {
           }
         }
 
-        if (chosen && verifierPrimaryCandidate && chosen.selected.id !== verifierPrimaryCandidate.id) {
+        if (
+          !forceConceptCentricMode &&
+          chosen &&
+          verifierPrimaryCandidate &&
+          chosen.selected.id !== verifierPrimaryCandidate.id
+        ) {
           const chosenScore =
             diseaseScoreById.get(chosen.selected.id) ??
             scoreDiseaseCandidate(query, chosen.selected);
@@ -5827,13 +5908,20 @@ export async function GET(request: NextRequest) {
           const chosenIsSynthetic = /^QUERY_/i.test(chosen.selected.id);
           const relationOrMultiAnchorQuery =
             relationQuery || (resolvedQueryPlan?.anchors ?? []).length >= 2;
+          const preservePlanDiseaseAnchor = Boolean(
+            topPlanDiseaseAnchor &&
+              chosen.selected.id === topPlanDiseaseAnchor.id &&
+              (topPlanDiseaseAnchor.confidence ?? 0) >=
+                (relationQuery || hasNonDiseaseAnchorInPlan ? 0.45 : 0.65),
+          );
           const shouldPreferVerifierPrimary =
-            chosenIsSynthetic ||
-            (relationOrMultiAnchorQuery &&
-              (verifierScore >= chosenScore - 0.55 ||
-                verifierMustKeepCandidates.some(
-                  (candidate) => candidate.id === verifierPrimaryCandidate.id,
-                )));
+            !preservePlanDiseaseAnchor &&
+            (chosenIsSynthetic ||
+              (relationOrMultiAnchorQuery &&
+                (verifierScore >= chosenScore - 0.55 ||
+                  verifierMustKeepCandidates.some(
+                    (candidate) => candidate.id === verifierPrimaryCandidate.id,
+                  ))));
           if (shouldPreferVerifierPrimary) {
             chosen = {
               selected: verifierPrimaryCandidate,
@@ -5895,11 +5983,19 @@ export async function GET(request: NextRequest) {
           },
         );
         if (discovererTimeoutMs > 0) {
+          const discovererRunBudgetMs = Math.max(
+            120_000,
+            Math.min(
+              Math.max(120_000, discovererTimeoutMs - 12_000),
+              MAX_DISCOVERER_FINAL_WAIT_MS,
+            ),
+          );
           discovererPromise = withTimeout(
             runDeepDiscoverer({
               diseaseQuery: chosen.selected.name,
               diseaseIdHint: chosen.selected.id,
               question: query,
+              maxRunMs: discovererRunBudgetMs,
               emitJourney,
             }),
             discovererTimeoutMs,
@@ -5909,6 +6005,9 @@ export async function GET(request: NextRequest) {
               return final;
             })
             .catch((error) => {
+              if (streamAbort.signal.aborted || streamState.closed) {
+                return null;
+              }
               const message =
                 error instanceof Error ? error.message : "agent discoverer failed";
               warnRequestLog(log, "run_case.agent_discoverer_failed", {
@@ -5991,6 +6090,7 @@ export async function GET(request: NextRequest) {
             !/^HP_/i.test(candidate.id),
         );
         const secondaryDiseaseCandidates = ((): DiseaseCandidate[] => {
+          if (forceConceptCentricMode) return [];
           if (!relationQuery) return [];
           if (strictExplicitAnchorMode) {
             return dedupeDistinctDiseases(planSecondaryCandidatesScoped)

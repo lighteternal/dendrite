@@ -515,7 +515,7 @@ function extractStructuredMentions(query: string): string[] {
   }
 
   const connectMatch = cleaned.match(
-    /\b(?:connect|connection|relationship|link|overlap|related|relates)\s+(?:between\s+)?(.+?)\s+(?:to|with|and|vs|versus)\s+(.+?)(?:\s+(?:through|via|using|with)\s+(.+))?$/i,
+    /\b(?:connect(?:ed|ing|s)?|connection|relationship|link(?:ed|ing)?|overlap|related|relates)\s+(?:between\s+)?(.+?)\s+(?:to|with|and|vs|versus)\s+(.+?)(?:\s+(?:through|via|using|with)\s+(.+))?$/i,
   );
   if (connectMatch) {
     addMention(connectMatch[1] ?? "");
@@ -524,7 +524,7 @@ function extractStructuredMentions(query: string): string[] {
   }
 
   const connectPrecedingMatch = cleaned.match(
-    /(.+?)\s+(?:connect|connection|relationship|link|overlap|related|relates)\s+(?:to|with|and|vs|versus)\s+(.+?)(?:\s+(?:through|via|using|with)\s+(.+))?$/i,
+    /(.+?)\s+(?:connect(?:ed|ing|s)?|connection|relationship|link(?:ed|ing)?|overlap|related|relates)\s+(?:to|with|and|vs|versus)\s+(.+?)(?:\s+(?:through|via|using|with)\s+(.+))?$/i,
   );
   if (connectPrecedingMatch) {
     addMention(connectPrecedingMatch[1] ?? "");
@@ -631,7 +631,7 @@ function splitFallbackMentions(query: string): Array<{ mention: string; type: Me
     .filter((mention) => mention.length >= 3)
     .filter((mention) => /[a-z0-9]/i.test(mention))
     .filter((mention) => !/^(?:what|which|how|why)\b/i.test(mention))
-    .filter((mention) => !/\b(connect|connection|relationship|related|relates|compare|between)\b/i.test(mention))
+    .filter((mention) => !/\b(connect(?:ed|ing|s)?|connection|relationship|related|relates|compare|between)\b/i.test(mention))
     .filter((mention) => !isGenericMechanismMention(mention))
     .sort((a, b) => mentionScore(b) - mentionScore(a))
     .map((mention) => ({
@@ -665,7 +665,7 @@ function rescueFallbackMentions(query: string): Array<{ mention: string; type: M
     .map((value) => sanitizeFallbackMention(value))
     .filter((value) => value.length >= 3)
     .filter((value) => !/^(?:what|which|how|why)\b/i.test(value))
-    .filter((value) => !/\b(connect|connection|relationship|related|relates|compare|between|versus|vs)\b/i.test(value))
+    .filter((value) => !/\b(connect(?:ed|ing|s)?|connection|relationship|related|relates|compare|between|versus|vs)\b/i.test(value))
     .filter((value) => !isGenericMechanismMention(value))
     .sort((a, b) => b.length - a.length)
     .slice(0, 8)
@@ -927,6 +927,37 @@ function symbolHintFromMention(mention: string): string | null {
   const compactMention = alnumCompact(mechanismTrimmed || mention);
   if (!/^[a-z]{2,6}\d{1,3}[a-z]?$/i.test(compactMention)) return null;
   return compactMention.toUpperCase();
+}
+
+function isExplicitTargetLexeme(mention: string): boolean {
+  const normalized = mention.trim();
+  if (!normalized) return false;
+  if (/[0-9]/.test(normalized)) return true;
+  if (/[-+]/.test(normalized)) return true;
+  if (/\b(gene|protein|receptor|kinase|enzyme|channel|target)\b/i.test(normalized)) return true;
+  return false;
+}
+
+function isHighSignalDrugTargetHint(
+  name: string,
+  description?: string,
+): boolean {
+  const normalizedName = clean(name);
+  if (!normalizedName) return false;
+  const upper = normalizedName.toUpperCase();
+  const details = clean(description ?? "").toLowerCase();
+  const combined = `${normalizedName} ${details}`.toLowerCase();
+  if (
+    /cell\s*line|resistan|cytotox|xenograft|assay|screen/i.test(combined) ||
+    /\/|\\/.test(normalizedName)
+  ) {
+    return false;
+  }
+  if (isLikelySymbolMention(upper)) return true;
+  if (/protein|enzyme|receptor|ion channel|kinase|transporter|gpcr/i.test(details)) {
+    return true;
+  }
+  return false;
 }
 
 async function expandMentionSearchQueries(
@@ -1201,7 +1232,7 @@ async function resolveMentionCandidates(
       row.entityType === "disease"
         ? mentionTokenCount <= 1
           ? lowerAlphaSingleToken
-            ? 0.66
+            ? 0.58
             : 0.5
           : genericMechanisticMention
             ? 0.7
@@ -1426,6 +1457,7 @@ export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
     const drug = drugAnchors[i];
     if (!drug) continue;
     for (const target of hint.value) {
+      if (!isHighSignalDrugTargetHint(target.name, target.description)) continue;
       const key = `target:${target.id}`;
       if (selectedAnchors.has(key)) continue;
       selectedAnchors.set(key, {
@@ -1466,16 +1498,37 @@ export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
   const canonicalAnchors = dedupeAnchorsSemantically(canonicalTargetAnchors)
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, 16);
-  const followups = deriveFollowups(canonicalAnchors, extracted.constraints);
+  const diseaseConfidenceByMention = new Map<string, number>();
+  for (const anchor of canonicalAnchors) {
+    if (anchor.entityType !== "disease") continue;
+    const key = normalize(anchor.mention || anchor.name);
+    if (!key) continue;
+    const existing = diseaseConfidenceByMention.get(key) ?? 0;
+    if (anchor.confidence > existing) {
+      diseaseConfidenceByMention.set(key, anchor.confidence);
+    }
+  }
+  const mentionDisambiguatedAnchors = canonicalAnchors.filter((anchor) => {
+    if (anchor.entityType !== "target") return true;
+    const key = normalize(anchor.mention || anchor.name);
+    if (!key) return true;
+    const diseaseConfidence = diseaseConfidenceByMention.get(key) ?? 0;
+    if (diseaseConfidence < 0.82) return true;
+    if (isExplicitTargetLexeme(anchor.mention)) return true;
+    // When the same surface mention maps strongly to both disease and target,
+    // prefer the disease interpretation unless the target intent is explicit.
+    return false;
+  });
+  const followups = deriveFollowups(mentionDisambiguatedAnchors, extracted.constraints);
   const filteredUnresolvedMentions = filterResolvedUnresolvedMentions(
     [...unresolvedMentions],
-    canonicalAnchors,
+    mentionDisambiguatedAnchors,
   );
 
   const plan: ResolvedQueryPlan = {
     query: normalizedQuery,
     intent: extracted.intent || "multihop-discovery",
-    anchors: canonicalAnchors,
+    anchors: mentionDisambiguatedAnchors,
     constraints: extracted.constraints.slice(0, 10),
     unresolvedMentions: filteredUnresolvedMentions.slice(0, 8),
     followups,

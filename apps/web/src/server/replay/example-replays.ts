@@ -1,6 +1,7 @@
 import rawObesityT2dEvents from "@/server/replay/fixtures/example-obesity-t2d-v1.events.json";
 import rawAlsOxidativeEvents from "@/server/replay/fixtures/example-als-oxidative-v1.events.json";
 import rawT2dCkdEvents from "@/server/replay/fixtures/example-t2d-ckd-v1.events.json";
+import rawCannabisAnorexiaEvents from "@/server/replay/fixtures/example-cannabis-anorexia-v1.events.json";
 import { EXAMPLE_REPLAY_OPTIONS } from "@/lib/example-replay";
 
 export type ReplayEvent = {
@@ -25,6 +26,7 @@ const replayEventsById: Record<string, ReplayEvent[]> = {
   "example-obesity-t2d-v1": (rawObesityT2dEvents as ReplayEvent[]) ?? [],
   "example-als-oxidative-v1": (rawAlsOxidativeEvents as ReplayEvent[]) ?? [],
   "example-t2d-ckd-v1": (rawT2dCkdEvents as ReplayEvent[]) ?? [],
+  "example-cannabis-anorexia-v1": (rawCannabisAnorexiaEvents as ReplayEvent[]) ?? [],
 };
 
 const replayMetaById: Record<
@@ -37,10 +39,10 @@ const replayMetaById: Record<
   "example-obesity-t2d-v1": {
     durationMs: 75_000,
     evidenceReview: {
-      checkedAt: "2026-02-20",
+      checkedAt: "2026-02-23",
       reviewer: "dendrite-maintainer",
       rationale:
-        "Replay selected from a completed run that resolves obesity to T2D through PPARG/GLP1R-centered metabolic and inflammatory mechanisms with supporting references.",
+        "Replay refreshed from a full completed run linking obesity and type 2 diabetes through adiposity-driven insulin resistance and beta-cell compensation limits with explicit evidence/caveat handling.",
       sources: [
         "https://www.niddk.nih.gov/health-information/diabetes/overview/what-is-diabetes/type-2-diabetes",
         "https://www.nature.com/articles/nature05482",
@@ -51,10 +53,10 @@ const replayMetaById: Record<
   "example-als-oxidative-v1": {
     durationMs: 75_000,
     evidenceReview: {
-      checkedAt: "2026-02-20",
+      checkedAt: "2026-02-23",
       reviewer: "dendrite-maintainer",
       rationale:
-        "Replay uses a completed ALS/oxidative-stress run whose final synthesis aligns with established mechanisms linking SQSTM1/NFE2L2 antioxidant regulation to oxidative stress in ALS.",
+        "Replay refreshed from a full completed run describing ALS-oxidative-stress coupling via SOD1-centered antioxidant and proteostasis mechanisms with alternative threads and uncertainty notes.",
       sources: [
         "https://www.ninds.nih.gov/health-information/disorders/amyotrophic-lateral-sclerosis-als",
         "https://reactome.org/PathwayBrowser/#/R-HSA-3299685",
@@ -65,14 +67,28 @@ const replayMetaById: Record<
   "example-t2d-ckd-v1": {
     durationMs: 75_000,
     evidenceReview: {
-      checkedAt: "2026-02-21",
+      checkedAt: "2026-02-23",
       reviewer: "dendrite-maintainer",
       rationale:
-        "Replay selected from a completed run linking type 2 diabetes mellitus and chronic kidney disease through shared ACE-centered renin-angiotensin and vascular injury mechanisms with literature support.",
+        "Replay refreshed from a full completed run connecting type 2 diabetes and CKD through ACE/renin-angiotensin and vascular injury mechanisms with intervention-oriented next-step framing.",
       sources: [
         "https://www.kidney.org/kidney-topics/diabetes-and-chronic-kidney-disease",
         "https://www.niddk.nih.gov/health-information/diabetes/overview/preventing-problems/kidney-disease-nephropathy",
         "https://reactome.org/content/detail/R-HSA-202040",
+      ],
+    },
+  },
+  "example-cannabis-anorexia-v1": {
+    durationMs: 75_000,
+    evidenceReview: {
+      checkedAt: "2026-02-23",
+      reviewer: "dendrite-maintainer",
+      rationale:
+        "Replay refreshed from a full completed run mapping cannabis-anorexia evidence to dopaminergic and feeding-circuit hypotheses with explicit uncertainty boundaries.",
+      sources: [
+        "https://www.nature.com/articles/npp2017173",
+        "https://www.ncbi.nlm.nih.gov/books/NBK459145/",
+        "https://reactome.org/content/detail/R-HSA-418457",
       ],
     },
   },

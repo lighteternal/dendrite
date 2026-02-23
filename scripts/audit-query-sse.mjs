@@ -97,9 +97,10 @@ const summary = {
 };
 
 const rawEvents = [];
+let shouldStop = false;
 
 try {
-  for await (const chunk of response.body) {
+  outer: for await (const chunk of response.body) {
     buffer += decoder.decode(chunk, { stream: true });
     let idx;
     while ((idx = buffer.indexOf("\n\n")) !== -1) {
@@ -235,9 +236,11 @@ try {
           summary.finalEdgeCount = data.counts.edges ?? null;
         }
         clearTimeout(timer);
-        controller.abort("done");
+        shouldStop = true;
+        break;
       }
     }
+    if (shouldStop) break outer;
   }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);

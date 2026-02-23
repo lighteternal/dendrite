@@ -134,7 +134,7 @@ export const appConfig = {
     maxLiteratureTargets: parseNumber(process.env.STREAM_MAX_LITERATURE_TARGETS, 5),
   },
   run: {
-    hardBudgetMs: parseNumber(process.env.RUN_HARD_BUDGET_MS, 10 * 60 * 1000),
+    hardBudgetMs: parseNumber(process.env.RUN_HARD_BUDGET_MS, 20 * 60 * 1000),
     finalizationReserveMs: parseNumber(
       process.env.RUN_FINALIZATION_RESERVE_MS,
       90_000,
@@ -149,13 +149,17 @@ export const appConfig = {
     ),
     discovererFinalWaitMs: parseNumber(
       process.env.RUN_DISCOVERER_FINAL_WAIT_MS,
-      150_000,
+      600_000,
+    ),
+    scientificAnswerWordBudget: parseNumber(
+      process.env.RUN_SCIENTIFIC_ANSWER_WORD_BUDGET,
+      1200,
     ),
   },
   deepDiscover: {
     agentTimeoutMs: parseNumber(process.env.DEEP_DISCOVER_AGENT_TIMEOUT_MS, 600_000),
     toolTimeoutMs: parseNumber(process.env.DEEP_DISCOVER_TOOL_TIMEOUT_MS, 120_000),
-    maxRunMs: parseNumber(process.env.DEEP_DISCOVER_MAX_RUN_MS, 600_000),
+    maxRunMs: parseNumber(process.env.DEEP_DISCOVER_MAX_RUN_MS, 20 * 60 * 1000),
     maxPubmedSubqueries: Math.max(
       1,
       Math.floor(parseNumber(process.env.DEEP_DISCOVER_MAX_PUBMED_SUBQUERIES, 20)),

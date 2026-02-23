@@ -498,6 +498,38 @@ function targetSymbolHintFromMention(mention: string): string | null {
   return compactMention.toUpperCase();
 }
 
+function isExplicitTargetLexeme(mention: string): boolean {
+  const normalized = sanitizeMention(mention);
+  if (!normalized) return false;
+  if (/[0-9]/.test(normalized)) return true;
+  if (/[-+]/.test(normalized)) return true;
+  if (/\b(gene|protein|receptor|kinase|enzyme|channel|target)\b/i.test(normalized)) return true;
+  return false;
+}
+
+function disambiguateMentionTargetDiseaseCollisions(anchors: QueryPlanAnchor[]): QueryPlanAnchor[] {
+  const diseaseConfidenceByMention = new Map<string, number>();
+  for (const anchor of anchors) {
+    if (anchor.entityType !== "disease") continue;
+    const key = normalize(anchor.mention || anchor.name);
+    if (!key) continue;
+    const existing = diseaseConfidenceByMention.get(key) ?? 0;
+    if (anchor.confidence > existing) {
+      diseaseConfidenceByMention.set(key, anchor.confidence);
+    }
+  }
+
+  return anchors.filter((anchor) => {
+    if (anchor.entityType !== "target") return true;
+    const key = normalize(anchor.mention || anchor.name);
+    if (!key) return true;
+    const diseaseConfidence = diseaseConfidenceByMention.get(key) ?? 0;
+    if (diseaseConfidence < 0.82) return true;
+    if (isExplicitTargetLexeme(anchor.mention)) return true;
+    return false;
+  });
+}
+
 function mentionsFromQueryPlan(
   query: string,
   queryPlan: ResolvedQueryPlan | null,
@@ -1381,10 +1413,12 @@ export async function resolveQueryEntitiesBundle(query: string): Promise<QueryEn
   );
   merged.queryPlan = {
     ...merged.queryPlan,
-    anchors: dedupeAnchorsSemantically(
-      canonicalAnchors
-        .filter((anchor): anchor is QueryPlanAnchor => Boolean(anchor))
-        .filter((anchor) => keepDiseaseAnchor(anchor)),
+    anchors: disambiguateMentionTargetDiseaseCollisions(
+      dedupeAnchorsSemantically(
+        canonicalAnchors
+          .filter((anchor): anchor is QueryPlanAnchor => Boolean(anchor))
+          .filter((anchor) => keepDiseaseAnchor(anchor)),
+      ),
     ),
   };
   if (

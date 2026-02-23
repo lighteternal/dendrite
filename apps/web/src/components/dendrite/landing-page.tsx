@@ -505,20 +505,20 @@ export function LandingPage() {
               target="_blank"
               rel="noopener noreferrer"
               aria-label="Dendrite on GitHub"
-              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-[#d2deeb] bg-white/80 text-[#617694] transition-colors hover:text-[#111827] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea8cd]"
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-[#f2c79b] bg-white/85 text-[#cc6f22] transition-colors hover:text-[#a65217] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#e79a58]"
               title="GitHub"
             >
-              <Github className="h-4 w-4" />
+              <Github className="h-[18px] w-[18px]" />
             </a>
             <a
               href={LINKEDIN_URL}
               target="_blank"
               rel="noopener noreferrer"
               aria-label="Dimitris Papadopoulos on LinkedIn"
-              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-[#d2deeb] bg-white/80 text-[#617694] transition-colors hover:text-[#111827] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea8cd]"
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-[#f2c79b] bg-white/85 text-[#cc6f22] transition-colors hover:text-[#a65217] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#e79a58]"
               title="LinkedIn"
             >
-              <Linkedin className="h-4 w-4" />
+              <Linkedin className="h-[18px] w-[18px]" />
             </a>
           </div>
         </footer>

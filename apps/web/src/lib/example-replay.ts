@@ -16,6 +16,10 @@ export const EXAMPLE_REPLAY_OPTIONS: ExampleReplayOption[] = [
     id: "example-t2d-ckd-v1",
     query: "How is type 2 diabetes connected to chronic kidney disease?",
   },
+  {
+    id: "example-cannabis-anorexia-v1",
+    query: "How does cannabis affect anorexia?",
+  },
 ];
 
 export const EXAMPLE_REPLAY_ID = EXAMPLE_REPLAY_OPTIONS[0].id;

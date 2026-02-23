@@ -1,95 +1,87 @@
 # <img src="dendrite.png" alt="Dendrite logo" width="34" valign="middle" /> Dendrite
 
-Dendrite is an agentic biomedical discovery app that turns a free-text question into a live, explorable mechanism-hypothesis graph and an evidence-grounded synthesis.
+Dendrite is an open-source, agentic biomedical discovery workbench.
+It converts a natural-language research question into:
 
-It is for research synthesis and hypothesis generation, not clinical decision-making.
+- a live, evidence-attributed graph (diseases, targets, pathways, compounds, exposures)
+- a mechanism-focused synthesis with citations, caveats, and next-step suggestions
 
-## What It Does
+This project is for research synthesis and hypothesis generation only. It is not for clinical decision-making.
 
-- Resolves entities from your query (diseases, targets, pathways, compounds, exposures).
+## What Dendrite Does
+
+- Resolves query entities and relations from free text.
 - Runs multi-hop retrieval across OpenTargets, Reactome, STRING, ChEMBL, PubMed/BioMCP, and Medical MCP.
-- Streams graph updates and execution logs while the run is in progress.
-- Produces a final synthesis with inline citations, caveats, and suggested next experiments.
-- Keeps unresolved or partial routes visible instead of forcing a false “complete mechanism.”
+- Streams run progress, warnings, and graph updates in real time.
+- Preserves uncertainty: partial/contested connections remain visible instead of being overstated.
+- Supports replayable canned runs for demos without requiring a live OpenAI key.
 
-## How To Interpret Results
+## System Overview
 
-Dendrite links entities using heterogeneous evidence types, including:
+- `apps/web`: Next.js app (UI + API orchestration routes).
+- `services/*`: MCP services used as biomedical data providers.
+- `docker-compose.yml`: local orchestration for MCP services and the web app.
+- `scripts/bootstrap-services.sh`: clones/builds missing service repos.
+- `scripts/check-services.sh`: quick endpoint/health checks.
 
-- genetic/association evidence
-- pathway membership
-- protein-protein interaction
-- drug-target activity
-- literature-derived signals
+## Requirements
 
-Important interpretation rules:
-
-- Multi-hop paths are treated as mechanistic hypotheses, not causal proof.
-- Score/confidence values are ranking signals, not probabilities of truth.
-- Causal direction should only be inferred when the cited evidence explicitly supports it.
-- If coverage is partial, the run should state that explicitly in both graph context and synthesis caveats.
-
-## Repository Layout
-
-- `apps/web` - Next.js UI and API routes.
-- `services/mcp-opentargets` - OpenTargets MCP.
-- `services/mcp-reactome` - Reactome MCP.
-- `services/mcp-string` - STRING MCP.
-- `services/mcp-chembl` - ChEMBL MCP.
-- `services/mcp-pubmed` - PubMed MCP.
-- `services/mcp-medical` - Medical MCP (`jamesanz/medical-mcp`).
-- `services/biomcp` - BioMCP.
-- `scripts/bootstrap-services.sh` - Clones/builds local service dependencies.
-- `docker-compose.yml` - Local MCP stack orchestration.
-
-## Prerequisites
-
-- Node.js 20+
-- npm 10+
+- Node.js `>=20`
+- npm `>=10`
 - Docker + Docker Compose
+- OpenAI API key for live agentic runs (optional for replay mode)
 
-## Quick Start (Local)
+## Quick Start
 
-1. Configure environment:
+### 1) Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-2. Bootstrap local services:
+### 2) Bootstrap service repos (first-time setup)
 
 ```bash
 ./scripts/bootstrap-services.sh
 ```
 
-3. Start service stack:
+### 3) Start the full stack in Docker
 
 ```bash
-docker compose up --build
+docker compose up --build -d web
 ```
 
-4. Start web app:
+`web` depends on MCP services, so this brings up the full stack.
 
-```bash
-npm --prefix apps/web install
-npm --prefix apps/web run dev
-```
-
-5. Open:
+### 4) Open the app
 
 - `http://localhost:3000`
 
-## API Keys and Example Mode
+## Local Web Development (optional)
 
-- **Live runs** use an OpenAI API key from the landing page input (BYOK).
-- **Run example** uses replay fixtures and does not consume new LLM tokens.
+If you want hot reload in `apps/web`:
 
-## Core Environment Variables
+1. Start only MCP backends in Docker.
+2. Run the Next.js app locally.
+
+```bash
+docker compose up --build -d mcp-opentargets mcp-reactome mcp-string mcp-chembl mcp-pubmed mcp-medical biomcp
+npm --prefix apps/web ci
+npm --prefix apps/web run dev
+```
+
+## Replay Mode vs Live Mode
+
+- Live mode: user provides an OpenAI key in the UI (BYOK), runs use real-time model calls.
+- Replay mode: canned event fixtures are streamed, useful for demos and no-key environments.
+
+## Configuration
+
+Core variables (see `.env.example` for the full list):
 
 ```bash
 OPENAI_API_KEY=
 MCP_TRANSPORT_MODE=auto
-
 OPENTARGETS_MCP_URL=http://localhost:7010/mcp
 REACTOME_MCP_URL=http://localhost:7020/mcp
 STRING_MCP_URL=http://localhost:7030/mcp
@@ -97,41 +89,27 @@ CHEMBL_MCP_URL=http://localhost:7040/mcp
 PUBMED_MCP_URL=http://localhost:7050/mcp
 MEDICAL_MCP_URL=http://localhost:7060/mcp
 BIOMCP_URL=http://localhost:8000/mcp
-MEDICAL_MCP_ENABLE_JOURNAL_SCRAPE=0
 ```
 
-`MCP_TRANSPORT_MODE`:
+`MCP_TRANSPORT_MODE` values:
 
 - `auto` (default)
 - `prefer_mcp`
-- `fallback_only` (useful when external MCP transport is unavailable)
+- `fallback_only`
 
-## Deploying to Vercel
+## Deployment (Vercel)
 
-Recommended baseline:
+Use `apps/web` as the Vercel project root:
 
-1. Import the repo and set **Root Directory** to `apps/web` in Vercel project settings.
-2. Use framework preset **Next.js** with:
-   - Install Command: `npm ci`
-   - Build Command: `npm run build`
-   - Dev Command: `npm run dev`
-   - Output Directory: `.next`
-3. Keep BYOK enabled in the UI for end users.
-4. If you want server-side fallback key support, also set `OPENAI_API_KEY`.
-5. Set explicit MCP URLs only if you host externally reachable MCP services.
+1. Import repository in Vercel.
+2. Set Root Directory to `apps/web`.
+3. Keep default Next.js commands (`npm ci`, `npm run build`).
+4. Set environment variables needed for your deployment.
 
 Notes:
 
-- On Vercel, local loopback MCP transport is auto-disabled and HTTP/API fallbacks are used.
-- Long-running API routes already export extended `maxDuration`; effective ceilings still depend on your Vercel plan/runtime.
-
-## Operations and Health
-
-- Landing page tool chips use `GET /api/mcpHealth`.
-- Health semantics:
-  - green: responding
-  - amber: reachable but degraded/slow
-  - red: unreachable
+- Vercel Pro serverless functions require `maxDuration` between `1` and `800` seconds.
+- Local MCP URLs (`localhost`) do not work on Vercel; configure externally reachable endpoints or use fallback transport.
 
 ## Validation
 
@@ -141,11 +119,14 @@ npm --prefix apps/web run build
 ./scripts/check-services.sh
 ```
 
----
+## Contributing
 
-Preclinical evidence synthesis only; not for clinical recommendation.
+1. Create a branch from `main`.
+2. Keep changes focused and include tests/checks where relevant.
+3. Open a pull request with a clear summary, risk notes, and validation steps.
 
 ## License
 
-The core Dendrite application (agent logic, UI, and repository-owned code) is licensed under the Apache License 2.0.
-MCP services under services/ are subject to their respective upstream licenses. See the individual service directories and upstream repositories for details.
+The Dendrite application code in this repository is licensed under Apache 2.0 (`LICENSE`).
+
+Some directories under `services/` are upstream projects with their own licenses. Check each service directory for license details.

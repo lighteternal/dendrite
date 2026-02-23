@@ -70,11 +70,6 @@ npm --prefix apps/web ci
 npm --prefix apps/web run dev
 ```
 
-## Replay Mode vs Live Mode
-
-- Live mode: user provides an OpenAI key in the UI (BYOK), runs use real-time model calls.
-- Replay mode: canned event fixtures are streamed, useful for demos and no-key environments.
-
 ## Configuration
 
 Core variables (see `.env.example` for the full list):
@@ -108,7 +103,6 @@ Use `apps/web` as the Vercel project root:
 
 Notes:
 
-- Vercel Pro serverless functions require `maxDuration` between `1` and `800` seconds.
 - Local MCP URLs (`localhost`) do not work on Vercel; configure externally reachable endpoints or use fallback transport.
 
 ## Validation

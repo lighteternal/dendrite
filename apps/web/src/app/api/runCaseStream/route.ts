@@ -45,8 +45,7 @@ import {
 } from "@/server/replay/example-replays";
 
 export const runtime = "nodejs";
-const VERCEL_MAX_DURATION_SECONDS = 800;
-export const maxDuration = VERCEL_MAX_DURATION_SECONDS;
+export const maxDuration = 800;
 
 type RunMode = "multihop";
 
@@ -92,10 +91,11 @@ const INTERNAL_STREAM_CONNECT_TIMEOUT_MS = 35_000;
 const SESSION_RUN_STALE_MS = 15 * 60 * 1000;
 const SESSION_API_KEY_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_JOURNEY_EVENTS = 300;
+const VERCEL_MAX_DURATION_MS = 800_000;
 const VERCEL_FUNCTION_GRACE_MS = 30_000;
 const RUN_HARD_BUDGET_LIMIT_MS = Math.max(
   180_000,
-  VERCEL_MAX_DURATION_SECONDS * 1000 - VERCEL_FUNCTION_GRACE_MS,
+  VERCEL_MAX_DURATION_MS - VERCEL_FUNCTION_GRACE_MS,
 );
 const MAX_ANCHOR_PATH_INPUTS = 10;
 const SECONDARY_ANCHOR_TARGET_LIMIT = 10;

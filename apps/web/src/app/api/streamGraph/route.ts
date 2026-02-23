@@ -47,6 +47,9 @@ type PipelinePhase = "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6";
 type SourceHealthState = Record<SourceName, "green" | "yellow" | "red">;
 
 const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
+const MAX_STREAM_TARGETS = 200;
+const MAX_STREAM_SEED_TARGETS = 80;
+const PATHWAYS_PER_TARGET_LIMIT = 12;
 
 function normalizeApiKey(raw: string | null | undefined): string | undefined {
   const value = raw?.trim();
@@ -122,12 +125,15 @@ export async function GET(request: NextRequest) {
   const diseaseQuery = searchParams.get("diseaseQuery")?.trim();
   const diseaseIdHint = searchParams.get("diseaseId")?.trim();
   const runId = searchParams.get("runId")?.trim() || null;
-  const maxTargets = Number(searchParams.get("maxTargets") ?? 20);
+  const maxTargetsRaw = Number(searchParams.get("maxTargets") ?? 20);
+  const maxTargets = Number.isFinite(maxTargetsRaw)
+    ? Math.max(5, Math.min(MAX_STREAM_TARGETS, Math.floor(maxTargetsRaw)))
+    : 20;
   const seedTargets = (searchParams.get("seedTargets") ?? "")
     .split(",")
     .map((token) => token.trim().toUpperCase())
     .filter((token) => token.length >= 2)
-    .slice(0, 20);
+    .slice(0, MAX_STREAM_SEED_TARGETS);
   const includePathways = searchParams.get("pathways") !== "0";
   const includeDrugs = searchParams.get("drugs") !== "0";
   const includeInteractions = searchParams.get("interactions") !== "0";
@@ -394,7 +400,7 @@ export async function GET(request: NextRequest) {
             );
           try {
             targets = await withTimeout(
-              getDiseaseTargetsSummary(diseaseId, Math.min(40, Math.max(5, maxTargets))),
+              getDiseaseTargetsSummary(diseaseId, Math.max(5, maxTargets)),
               phaseTimeoutMs,
             );
           } catch {
@@ -425,7 +431,7 @@ export async function GET(request: NextRequest) {
             const missingSeedSymbols = seedTargets
               .map((symbol) => symbol.toUpperCase())
               .filter((symbol) => !existingSymbols.has(symbol))
-              .slice(0, 6);
+              .slice(0, 24);
             if (missingSeedSymbols.length > 0) {
               emitStatus(
                 "P1",
@@ -447,8 +453,8 @@ export async function GET(request: NextRequest) {
 
           const diseaseNodeId = makeNodeId("disease", diseaseId);
           const targetSliceLimit = Math.min(
-            40,
-            maxTargets + Math.min(6, seedTargets.length),
+            targets.length,
+            maxTargets + Math.min(24, seedTargets.length),
           );
           for (const batch of chunkArray(targets.slice(0, targetSliceLimit), 5)) {
             const nodes: GraphNode[] = [];
@@ -496,7 +502,7 @@ export async function GET(request: NextRequest) {
 
             pushNodesEdges(nodes, edges);
             targetCount += batch.length;
-            emitStatus("P1", `${targetCount}/${Math.min(maxTargets, targets.length)} targets enriched`, 30, {
+            emitStatus("P1", `${targetCount}/${targetSliceLimit} targets enriched`, 30, {
               targets: targetCount,
             });
             await sleep(randomInt(appConfig.stream.batchMinDelayMs, appConfig.stream.batchMaxDelayMs));
@@ -543,7 +549,7 @@ export async function GET(request: NextRequest) {
               targets: targetCount,
             });
 
-            const seededTargets = targetNodeIds.slice(0, Math.min(targetNodeIds.length, maxTargets));
+            const seededTargets = targetNodeIds;
             let degradedTargets = 0;
             let budgetTruncated = false;
             const p2Deadline = Date.now() + Math.max(18_000, Math.floor(phaseTimeoutMs * 2));
@@ -565,7 +571,7 @@ export async function GET(request: NextRequest) {
                   );
                   return {
                     targetNodeId,
-                    pathways: pathways.slice(0, 8),
+                    pathways: pathways.slice(0, PATHWAYS_PER_TARGET_LIMIT),
                   };
                 }),
               );

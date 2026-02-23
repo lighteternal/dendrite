@@ -98,8 +98,22 @@ const RUN_HARD_BUDGET_LIMIT_MS = Math.max(
   VERCEL_MAX_DURATION_MS - VERCEL_FUNCTION_GRACE_MS,
 );
 const MAX_ANCHOR_PATH_INPUTS = 10;
-const SECONDARY_ANCHOR_TARGET_LIMIT = 10;
-const SECONDARY_ANCHOR_SEED_ROWS = 10;
+const SECONDARY_ANCHOR_CANDIDATE_LIMIT = 4;
+const SECONDARY_ANCHOR_SEED_CANDIDATE_LIMIT = 3;
+const SECONDARY_ANCHOR_TARGET_LIMIT = 24;
+const SECONDARY_ANCHOR_SEED_ROWS = 20;
+const MAX_PLANNED_TARGET_SEEDS = 48;
+const BRIDGE_DISEASE_TARGET_FETCH_LIMIT = 80;
+const BRIDGE_SYMBOL_FRONTIER_LIMIT = 24;
+const BRIDGE_PATHWAY_SYMBOL_LIMIT = 36;
+const BRIDGE_PATHWAYS_PER_SYMBOL_LIMIT = 12;
+const BRIDGE_PATHWAY_LINK_LIMIT = 12;
+const BRIDGE_INTERACTION_SEED_LIMIT = 36;
+const BRIDGE_INTERACTION_DIRECT_LINK_LIMIT = 12;
+const BRIDGE_INTERACTION_VIA_LINK_LIMIT = 10;
+const BRIDGE_SHARED_TARGET_RENDER_LIMIT = 8;
+const BRIDGE_PATHWAY_RENDER_LIMIT = 10;
+const BRIDGE_INTERACTION_RENDER_LIMIT = 10;
 const RUN_HARD_BUDGET_MS = Math.max(
   180_000,
   Math.min(RUN_HARD_BUDGET_LIMIT_MS, appConfig.run.hardBudgetMs),
@@ -638,9 +652,10 @@ async function streamReplayFixture(params: {
   }
 }
 
-function modeConfig() {
+function modeConfig(options?: { relationQuery?: boolean; secondaryAnchors?: number }) {
+  const bridgeHeavyQuery = Boolean(options?.relationQuery);
   return {
-    maxTargets: 20,
+    maxTargets: bridgeHeavyQuery ? 120 : 20,
     pathways: 1,
     drugs: 1,
     interactions: 1,
@@ -3624,7 +3639,7 @@ function extractSymbolSeedTargets(query: string): string[] {
     seen.add(normalized);
     out.push(normalized);
   }
-  return out.slice(0, 12);
+  return out.slice(0, MAX_PLANNED_TARGET_SEEDS);
 }
 
 function diseaseNameSimilarity(a: string, b: string): number {
@@ -3699,7 +3714,7 @@ function buildCrossDiseaseBridgePatch(
 
   const queryAnchorSecondaryIds = options?.queryAnchorSecondaryIds ?? new Set<string>();
 
-  for (const disease of secondaryDiseases.slice(0, 3)) {
+  for (const disease of secondaryDiseases.slice(0, SECONDARY_ANCHOR_CANDIDATE_LIMIT)) {
     const nodeId = makeNodeId("disease", disease.id);
     const queryAnchorSecondary = queryAnchorSecondaryIds.has(disease.id);
     secondaryNodeIds.push(nodeId);
@@ -3774,9 +3789,23 @@ function uniqueNormalizedSymbols(symbols: string[]): string[] {
 
 async function evaluateCrossDiseaseBridge(options: {
   primaryTargetSymbols: string[];
+  primaryDiseaseId?: string;
   secondaryDiseases: DiseaseCandidate[];
 }): Promise<CrossDiseaseBridgeOutcome[]> {
-  const primarySymbols = uniqueNormalizedSymbols(options.primaryTargetSymbols);
+  let primarySymbols = uniqueNormalizedSymbols(options.primaryTargetSymbols);
+  if (options.primaryDiseaseId) {
+    const primaryRows = await withTimeout(
+      getDiseaseTargetsSummary(options.primaryDiseaseId, BRIDGE_DISEASE_TARGET_FETCH_LIMIT),
+      3_800,
+    ).catch(() => []);
+    const primaryRowSymbols = uniqueNormalizedSymbols(
+      primaryRows
+        .map((row) => row.targetSymbol?.trim() ?? "")
+        .filter((symbol) => symbol.length > 0),
+    );
+    primarySymbols = uniqueNormalizedSymbols([...primarySymbols, ...primaryRowSymbols]);
+  }
+
   const primarySet = new Set(primarySymbols);
   if (primarySet.size === 0 || options.secondaryDiseases.length === 0) return [];
 
@@ -3794,7 +3823,7 @@ async function evaluateCrossDiseaseBridge(options: {
               : String(row.name ?? "").trim(),
           }))
           .filter((row) => row.id.length > 0 && row.name.length > 0)
-          .slice(0, 4),
+          .slice(0, BRIDGE_PATHWAYS_PER_SYMBOL_LIMIT),
       )
       .catch(() => []);
     pathwayCache.set(symbol, pathways);
@@ -3802,9 +3831,12 @@ async function evaluateCrossDiseaseBridge(options: {
   };
 
   const outcomes = await Promise.all(
-    options.secondaryDiseases.slice(0, 3).map(async (secondary) => {
+    options.secondaryDiseases.slice(0, SECONDARY_ANCHOR_CANDIDATE_LIMIT).map(async (secondary) => {
       try {
-        const rows = await withTimeout(getDiseaseTargetsSummary(secondary.id, 30), 3_200);
+        const rows = await withTimeout(
+          getDiseaseTargetsSummary(secondary.id, BRIDGE_DISEASE_TARGET_FETCH_LIMIT),
+          3_200,
+        );
         const secondarySymbols = uniqueNormalizedSymbols(
           rows
             .map((row) => row.targetSymbol?.trim() ?? "")
@@ -3813,15 +3845,18 @@ async function evaluateCrossDiseaseBridge(options: {
         const secondarySet = new Set(secondarySymbols);
         const sharedTargets = secondarySymbols
           .filter((symbol) => primarySet.has(symbol))
-          .slice(0, 8);
+          .slice(0, BRIDGE_SHARED_TARGET_RENDER_LIMIT);
 
         const pathwayLinks: BridgePathwayLink[] = [];
         const interactionLinks: BridgeInteractionLink[] = [];
 
-        if (sharedTargets.length === 0 && primarySymbols.length > 0 && secondarySymbols.length > 0) {
-          const primaryFrontier = primarySymbols.slice(0, 6);
-          const secondaryFrontier = secondarySymbols.slice(0, 6);
-          const allPathwaySymbols = uniqueNormalizedSymbols([...primaryFrontier, ...secondaryFrontier]).slice(0, 10);
+        if (primarySymbols.length > 0 && secondarySymbols.length > 0) {
+          const primaryFrontier = primarySymbols.slice(0, BRIDGE_SYMBOL_FRONTIER_LIMIT);
+          const secondaryFrontier = secondarySymbols.slice(0, BRIDGE_SYMBOL_FRONTIER_LIMIT);
+          const allPathwaySymbols = uniqueNormalizedSymbols([...primaryFrontier, ...secondaryFrontier]).slice(
+            0,
+            BRIDGE_PATHWAY_SYMBOL_LIMIT,
+          );
           const pathwayRows = await Promise.all(
             allPathwaySymbols.map(async (symbol) => ({
               symbol,
@@ -3855,10 +3890,13 @@ async function evaluateCrossDiseaseBridge(options: {
               primaryTarget: primaryEntry.symbol,
               secondaryTarget: secondaryEntry.symbol,
             });
-            if (pathwayLinks.length >= 4) break;
+            if (pathwayLinks.length >= BRIDGE_PATHWAY_LINK_LIMIT) break;
           }
 
-          const interactionSeeds = uniqueNormalizedSymbols([...primaryFrontier, ...secondaryFrontier]).slice(0, 12);
+          const interactionSeeds = uniqueNormalizedSymbols([...primaryFrontier, ...secondaryFrontier]).slice(
+            0,
+            BRIDGE_INTERACTION_SEED_LIMIT,
+          );
           const interaction = await withTimeout(
             getInteractionNetwork(interactionSeeds, 0.72, 80),
             3_000,
@@ -3875,7 +3913,7 @@ async function evaluateCrossDiseaseBridge(options: {
                 (primarySet.has(edge.source) && secondarySet.has(edge.target)) ||
                 (primarySet.has(edge.target) && secondarySet.has(edge.source)),
             )
-            .slice(0, 4);
+            .slice(0, BRIDGE_INTERACTION_DIRECT_LINK_LIMIT);
 
           if (directInteraction.length > 0) {
             for (const edge of directInteraction) {
@@ -3917,7 +3955,7 @@ async function evaluateCrossDiseaseBridge(options: {
                   viaTarget,
                   score: 0.64,
                 });
-                if (interactionLinks.length >= 3) break outer;
+                if (interactionLinks.length >= BRIDGE_INTERACTION_VIA_LINK_LIMIT) break outer;
               }
             }
           }
@@ -6053,7 +6091,7 @@ export async function GET(request: NextRequest) {
           ...extractSymbolSeedTargets(query),
         ]
           .filter((value, index, all) => all.indexOf(value) === index)
-          .slice(0, 12);
+          .slice(0, MAX_PLANNED_TARGET_SEEDS);
         const diseaseAnchorsFromPlan = (resolvedQueryPlan?.anchors ?? [])
           .filter((anchor) => anchor.entityType === "disease")
           .map((anchor) => ({
@@ -6100,7 +6138,7 @@ export async function GET(request: NextRequest) {
           if (strictExplicitAnchorMode) {
             return dedupeDistinctDiseases(planSecondaryCandidatesScoped)
               .filter((candidate) => !isSameDiseaseCandidate(candidate, chosen.selected))
-              .slice(0, 3);
+              .slice(0, SECONDARY_ANCHOR_CANDIDATE_LIMIT);
           }
           return dedupeDistinctDiseases(
             mergeDiseaseCandidates(
@@ -6112,7 +6150,7 @@ export async function GET(request: NextRequest) {
             ),
           )
             .filter((candidate) => !isSameDiseaseCandidate(candidate, chosen.selected))
-            .slice(0, 3);
+            .slice(0, SECONDARY_ANCHOR_CANDIDATE_LIMIT);
         })();
         const queryImpliedSecondaryDiseaseIds = new Set(
           planSecondaryCandidatesScoped.map((candidate) => candidate.id),
@@ -6122,7 +6160,9 @@ export async function GET(request: NextRequest) {
         );
         if (secondaryAnchorSeedCandidates.length > 0) {
           const settled = await Promise.allSettled(
-            secondaryAnchorSeedCandidates.slice(0, 2).map(async (candidate) => {
+            secondaryAnchorSeedCandidates
+              .slice(0, SECONDARY_ANCHOR_SEED_CANDIDATE_LIMIT)
+              .map(async (candidate) => {
               const rows = await withTimeout(
                 getDiseaseTargetsSummary(candidate.id, SECONDARY_ANCHOR_TARGET_LIMIT),
                 Math.min(DISEASE_SEARCH_TIMEOUT_MS, 8_000),
@@ -6138,18 +6178,18 @@ export async function GET(request: NextRequest) {
           );
           const seededSecondaryRows = settled
             .flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
-            .slice(0, 2);
+            .slice(0, SECONDARY_ANCHOR_SEED_CANDIDATE_LIMIT);
           const secondaryAnchorTargetSeeds = settled
             .flatMap((result) => (result.status === "fulfilled" ? result.value.symbols : []))
             .filter((value, index, all) => all.indexOf(value) === index)
-            .slice(0, 8);
+            .slice(0, MAX_PLANNED_TARGET_SEEDS);
           if (secondaryAnchorTargetSeeds.length > 0) {
             plannedTargetSeeds = [
               ...plannedTargetSeeds,
               ...secondaryAnchorTargetSeeds,
             ]
               .filter((value, index, all) => all.indexOf(value) === index)
-              .slice(0, 16);
+              .slice(0, MAX_PLANNED_TARGET_SEEDS);
           }
           if (seededSecondaryRows.length > 0) {
             const seedNodes: GraphNode[] = [];
@@ -6293,7 +6333,10 @@ export async function GET(request: NextRequest) {
           });
         }
 
-        const profile = modeConfig();
+        const profile = modeConfig({
+          relationQuery,
+          secondaryAnchors: secondaryDiseaseCandidates.length,
+        });
         const internalParams = new URLSearchParams({
           runId,
           diseaseQuery: chosen.selected.name,
@@ -6305,7 +6348,10 @@ export async function GET(request: NextRequest) {
           literature: String(profile.literature),
         });
         if (plannedTargetSeeds.length > 0) {
-          internalParams.set("seedTargets", [...new Set(plannedTargetSeeds)].slice(0, 16).join(","));
+          internalParams.set(
+            "seedTargets",
+            [...new Set(plannedTargetSeeds)].slice(0, MAX_PLANNED_TARGET_SEEDS).join(","),
+          );
         }
 
         preStreamHeartbeatMessage = "Connecting evidence graph stream";
@@ -6571,11 +6617,17 @@ export async function GET(request: NextRequest) {
                     : {};
                 if (secondaryDiseaseCandidates.length > 0) {
                   const primaryNodeId = makeNodeId("disease", chosen.selected.id);
-                  const primaryTargetSymbols = [...nodeMap.values()]
-                    .filter((node) => node.type === "target")
-                    .map((node) => String(node.meta.targetSymbol ?? node.label));
+                  const primaryTargetSymbols = [...edgeMap.values()]
+                    .filter(
+                      (edge) => edge.type === "disease_target" && edge.source === primaryNodeId,
+                    )
+                    .map((edge) => nodeMap.get(edge.target))
+                    .filter((node): node is GraphNode => Boolean(node && node.type === "target"))
+                    .map((node) => String(node.meta.targetSymbol ?? node.label))
+                    .filter((value) => value.trim().length > 0);
                   const outcomes = await evaluateCrossDiseaseBridge({
                     primaryTargetSymbols,
+                    primaryDiseaseId: chosen.selected.id,
                     secondaryDiseases: secondaryDiseaseCandidates,
                   });
 
@@ -6793,7 +6845,7 @@ export async function GET(request: NextRequest) {
                       const sharedSymbols = outcome.sharedTargets
                         .map((symbol) => normalizeTargetSymbol(symbol))
                         .filter((symbol, index, all) => symbol.length > 0 && all.indexOf(symbol) === index)
-                        .slice(0, 3);
+                        .slice(0, BRIDGE_SHARED_TARGET_RENDER_LIMIT);
                       const pathwayLinks = outcome.pathwayLinks
                         .map((item) => ({
                           pathwayId: item.pathwayId.trim(),
@@ -6808,7 +6860,7 @@ export async function GET(request: NextRequest) {
                             item.primaryTarget.length > 0 &&
                             item.secondaryTarget.length > 0,
                         )
-                        .slice(0, 3);
+                        .slice(0, BRIDGE_PATHWAY_RENDER_LIMIT);
                       const interactionLinks = outcome.interactionLinks
                         .map((item) => ({
                           primaryTarget: normalizeTargetSymbol(item.primaryTarget),
@@ -6822,7 +6874,7 @@ export async function GET(request: NextRequest) {
                             item.secondaryTarget.length > 0 &&
                             item.primaryTarget !== item.secondaryTarget,
                         )
-                        .slice(0, 3);
+                        .slice(0, BRIDGE_INTERACTION_RENDER_LIMIT);
 
                       const pairSegments: Array<{
                         nodeIds: string[];
@@ -6833,7 +6885,7 @@ export async function GET(request: NextRequest) {
                       }> = [];
 
                       if (outcome.connected && sharedSymbols.length > 0) {
-                        for (const sharedSymbol of sharedSymbols.slice(0, 2)) {
+                        for (const sharedSymbol of sharedSymbols) {
                           const targetNode = ensureBridgeTargetNode(sharedSymbol, {
                             fromDisease: chosen.selected.name,
                             toDisease: outcome.disease.name,

@@ -28,7 +28,8 @@ type MentionType =
   | "anatomy"
   | "unknown";
 
-type CandidateEntityType = "disease" | "target" | "drug";
+type CandidateEntityType = "disease" | "target" | "drug" | "unknown";
+type AnchorSource = "opentargets" | "chembl" | "planner";
 
 export type QueryPlanAnchor = {
   mention: string;
@@ -38,7 +39,7 @@ export type QueryPlanAnchor = {
   name: string;
   description?: string;
   confidence: number;
-  source: "opentargets" | "chembl";
+  source: AnchorSource;
 };
 
 export type QueryPlanConstraint = {
@@ -128,6 +129,51 @@ function clean(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function slugify(value: string, max = 48): string {
+  const slug = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, max);
+  return slug || "unknown";
+}
+
+const PSEUDO_ANCHOR_TYPES = new Set<MentionType>([
+  "anatomy",
+  "phenotype",
+  "effect",
+  "pathway",
+]);
+
+const NON_DISEASE_TYPES = new Set<MentionType>([
+  "target",
+  "protein",
+  "molecule",
+  "drug",
+  "intervention",
+  "pathway",
+  "anatomy",
+  "phenotype",
+  "effect",
+]);
+
+function isExposureHint(mention: string): boolean {
+  return /\b(alcohol|cannabis|marijuana|nicotine|tobacco|caffeine|opioid|opioids|cocaine|heroin|ketamine|psilocybin|mdma|lsd|amphetamine|methamphetamine)\b/i.test(
+    mention,
+  );
+}
+
+function isPseudoAnchorType(requestedType: MentionType): boolean {
+  return PSEUDO_ANCHOR_TYPES.has(requestedType);
+}
+
+function shouldPreferNonDiseaseCandidate(mention: string, requestedType: MentionType): boolean {
+  if (NON_DISEASE_TYPES.has(requestedType)) return true;
+  if (isExposureHint(mention)) return true;
+  if (isGenericMechanismMention(mention)) return true;
+  return false;
+}
+
 function mentionHasSurfaceSupport(query: string, mention: string): boolean {
   const mentionDisplay = clean(mention);
   if (!mentionDisplay) return false;
@@ -206,6 +252,23 @@ function inferMentionTypeFromLexical(mention: string): MentionType {
   const normalizedMention = clean(mention);
   if (!normalizedMention) return "unknown";
   if (hasDiseaseCue(normalizedMention)) return "disease";
+  if (
+    /\b(bbb|blood[-\s]*brain barrier|brain|cns|central nervous system|blood[-\s]*brain|endothelial|vascular|liver|kidney|lung|heart|gut|intestine|synapse|hippocampus)\b/i.test(
+      normalizedMention,
+    )
+  ) {
+    return "anatomy";
+  }
+  if (
+    /\b(side effects?|adverse|toxicity|outcome|mortality|morbidity|weight loss|cognition|memory)\b/i.test(
+      normalizedMention,
+    )
+  ) {
+    return "phenotype";
+  }
+  if (/\b(pathway|signaling|signal|cascade|axis)\b/i.test(normalizedMention)) {
+    return "pathway";
+  }
   if (/\b(?:drug|treatment|therapy|compound|inhibitor|agonist|antagonist|antibody)\b/i.test(normalizedMention)) {
     return "intervention";
   }
@@ -226,6 +289,11 @@ function entityPreferenceBoost(
     boost -= 1.2;
   }
 
+  if (NON_DISEASE_TYPES.has(requestedType)) {
+    if (entityType === "disease") boost -= 0.55;
+    if (entityType !== "disease") boost += 0.12;
+  }
+
   if (requestedType === "target" || requestedType === "protein" || requestedType === "molecule") {
     if (entityType === "target") boost += 0.35;
     if (entityType === "disease") boost -= 0.45;
@@ -234,6 +302,11 @@ function entityPreferenceBoost(
   if (requestedType === "drug" || requestedType === "intervention") {
     if (entityType === "drug") boost += 0.3;
     if (entityType === "disease") boost -= 0.3;
+  }
+
+  if (isExposureHint(mention)) {
+    if (entityType === "drug") boost += 0.25;
+    if (entityType === "disease") boost -= 0.4;
   }
 
   if (requestedType === "unknown" && isLikelySymbolMention(mention)) {
@@ -781,7 +854,7 @@ async function extractMentions(query: string): Promise<{
               {
                 type: "input_text",
                 text:
-                  "Extract resolver-ready biomedical mentions and explicit constraints from the user query. Preserve all principal entities explicitly mentioned by the user (including mediator molecules/cytokines, diseases, targets, and interventions) when resolvable. Return only entities that can be resolved with tools; keep language exact; do not invent entities.",
+                  "Extract resolver-ready biomedical mentions and explicit constraints from the user query. Preserve all principal entities explicitly mentioned by the user (including mediator molecules/cytokines, diseases, targets, and interventions). Also include context-only mentions (anatomy, phenotypes, outcomes, barriers) even if not directly resolvable; label them as anatomy/phenotype/effect. Keep language exact; do not invent entities; do not coerce substances into disorders unless explicitly stated.",
               },
             ],
           },
@@ -1012,6 +1085,7 @@ async function expandMentionSearchQueries(
                 text: [
                   "Generate canonical biomedical search variants for entity resolver mentions.",
                   "Use semantically equivalent aliases only (e.g., abbreviations, canonical punctuation, known synonymous naming).",
+                  "Expand common biomedical abbreviations when obvious from context (e.g., BBB -> blood brain barrier).",
                   "Do not invent new concepts and do not add generic words.",
                   "Return up to 3 high-precision search queries per mention.",
                 ].join(" "),
@@ -1079,6 +1153,14 @@ async function resolveMentionCandidates(
 ): Promise<CandidateRow[]> {
   const query = mention.trim();
   if (!query) return [];
+
+  if (isPseudoAnchorType(requestedType)) {
+    const allowResolution =
+      hasDiseaseCue(query) || isLikelySymbolMention(query) || /pathway|signaling/i.test(query);
+    if (!allowResolution) {
+      return [];
+    }
+  }
 
   const mentionTokens = query.split(/\s+/).filter(Boolean);
   const variantSet = new Set<string>([query, ...searchQueries]);
@@ -1388,22 +1470,55 @@ export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
       .sort((a, b) => b.score - a.score);
     const top = mentionRows[0];
     const minimumScore = anchorScoreThreshold(mention.mention, mention.type);
-    if (!top || top.score < minimumScore) {
-      unresolvedMentions.add(mention.mention);
+    const preferNonDisease = shouldPreferNonDiseaseCandidate(mention.mention, mention.type);
+    const nonDiseaseCandidate = preferNonDisease
+      ? mentionRows.find((row) => row.entityType !== "disease")
+      : undefined;
+    const selected =
+      nonDiseaseCandidate &&
+      (!top || top.entityType === "disease" || nonDiseaseCandidate.score >= top.score - 0.12)
+        ? nonDiseaseCandidate
+        : top;
+    if (!selected || selected.score < minimumScore) {
+      const shouldCreateSynthetic =
+        isPseudoAnchorType(mention.type) ||
+        (mention.type === "unknown" &&
+          mentionHasSurfaceSupport(normalizedQuery, mention.mention) &&
+          !isGenericMechanismMention(mention.mention));
+      if (shouldCreateSynthetic) {
+        const syntheticId = `QUERY_${slugify(mention.mention, 40).toUpperCase()}`;
+        const syntheticKey = `unknown:${syntheticId}`;
+        if (!selectedAnchors.has(syntheticKey)) {
+          selectedAnchors.set(syntheticKey, {
+            mention: mention.mention,
+            requestedType: mention.type,
+            entityType: "unknown",
+            id: syntheticId,
+            name: mention.mention,
+            confidence: 0.28,
+            source: "planner",
+          });
+        }
+      } else {
+        unresolvedMentions.add(mention.mention);
+      }
       continue;
     }
 
-    const key = `${top.entityType}:${top.id}`;
+    const key = `${selected.entityType}:${selected.id}`;
     if (!selectedAnchors.has(key)) {
       selectedAnchors.set(key, {
         mention: mention.mention,
         requestedType: mention.type,
-        entityType: top.entityType,
-        id: top.id,
-        name: top.name,
-        description: top.description,
-        confidence: Math.max(0.15, Math.min(0.98, Number((top.score * 1.05).toFixed(3)))),
-        source: top.source,
+        entityType: selected.entityType,
+        id: selected.id,
+        name: selected.name,
+        description: selected.description,
+        confidence: Math.max(
+          0.15,
+          Math.min(0.98, Number((selected.score * 1.05).toFixed(3))),
+        ),
+        source: selected.source,
       });
     }
   }
@@ -1424,22 +1539,52 @@ export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
     }
 
     for (const mention of rescueMentions) {
-      const top = rescueRows
+      const mentionRows = rescueRows
         .filter((row) => normalize(row.mention) === normalize(mention.mention))
-        .sort((a, b) => b.score - a.score)[0];
+        .sort((a, b) => b.score - a.score);
+      const top = mentionRows[0];
       const minimumScore = anchorScoreThreshold(mention.mention, mention.type);
-      if (!top || top.score < minimumScore) continue;
-      const key = `${top.entityType}:${top.id}`;
+      const preferNonDisease = shouldPreferNonDiseaseCandidate(mention.mention, mention.type);
+      const nonDiseaseCandidate = preferNonDisease
+        ? mentionRows.find((row) => row.entityType !== "disease")
+        : undefined;
+      const selected =
+        nonDiseaseCandidate &&
+        (!top || top.entityType === "disease" || nonDiseaseCandidate.score >= top.score - 0.12)
+          ? nonDiseaseCandidate
+          : top;
+      if (!selected || selected.score < minimumScore) {
+        if (isPseudoAnchorType(mention.type)) {
+          const syntheticId = `QUERY_${slugify(mention.mention, 40).toUpperCase()}`;
+          const syntheticKey = `unknown:${syntheticId}`;
+          if (!selectedAnchors.has(syntheticKey)) {
+            selectedAnchors.set(syntheticKey, {
+              mention: mention.mention,
+              requestedType: mention.type,
+              entityType: "unknown",
+              id: syntheticId,
+              name: mention.mention,
+              confidence: 0.26,
+              source: "planner",
+            });
+          }
+        }
+        continue;
+      }
+      const key = `${selected.entityType}:${selected.id}`;
       if (selectedAnchors.has(key)) continue;
       selectedAnchors.set(key, {
         mention: mention.mention,
         requestedType: mention.type,
-        entityType: top.entityType,
-        id: top.id,
-        name: top.name,
-        description: top.description,
-        confidence: Math.max(0.16, Math.min(0.98, Number((top.score * 1.04).toFixed(3)))),
-        source: top.source,
+        entityType: selected.entityType,
+        id: selected.id,
+        name: selected.name,
+        description: selected.description,
+        confidence: Math.max(
+          0.16,
+          Math.min(0.98, Number((selected.score * 1.04).toFixed(3))),
+        ),
+        source: selected.source,
       });
     }
   }

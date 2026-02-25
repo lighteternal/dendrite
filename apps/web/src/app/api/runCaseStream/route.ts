@@ -3222,6 +3222,7 @@ type DerivedPathUpdate = {
   connectedAcrossAnchors?: boolean;
   unresolvedAnchorPairs?: string[];
   threadCandidates?: MechanismThreadCandidate[];
+  pathState?: "active" | "candidate" | "discarded";
 };
 
 function normalizeForMatch(value: string): string {
@@ -3305,12 +3306,26 @@ function resolveAnchorNodeId(
   anchor: ResolvedQueryPlan["anchors"][number],
   nodeMap: Map<string, GraphNode>,
 ): string | null {
+  const requestedFallback: GraphNode["type"] =
+    anchor.requestedType === "target"
+      ? "target"
+      : anchor.requestedType === "drug" || anchor.requestedType === "intervention"
+        ? "drug"
+        : anchor.requestedType === "pathway"
+          ? "pathway"
+          : anchor.requestedType === "anatomy" ||
+              anchor.requestedType === "phenotype" ||
+              anchor.requestedType === "effect"
+            ? "interaction"
+            : "disease";
   const preferredType: GraphNode["type"] =
     anchor.entityType === "target"
       ? "target"
       : anchor.entityType === "drug"
         ? "drug"
-        : "disease";
+        : anchor.entityType === "disease"
+          ? "disease"
+          : requestedFallback;
   const exactCandidates = [
     makeNodeId(preferredType, anchor.id),
     anchor.entityType === "target" ? makeNodeId("target", anchor.name.toUpperCase()) : null,
@@ -3491,7 +3506,13 @@ function derivePathUpdate(
 ): DerivedPathUpdate | null {
   const anchorPath = deriveAnchorPathUpdate(nodeMap, edgeMap, queryPlan);
   if (anchorPath) {
-    return anchorPath;
+    const pathState =
+      anchorPath.connectedAcrossAnchors === true
+        ? "active"
+        : anchorPath.edgeIds.length === 0
+          ? "discarded"
+          : "candidate";
+    return { ...anchorPath, pathState };
   }
 
   const diseases = [...nodeMap.values()].filter((node) => node.type === "disease");
@@ -3542,6 +3563,7 @@ function derivePathUpdate(
           nodeIds: [leftDisease.id, target.id, rightDisease.id],
           edgeIds: [bestBridge.sourceEdge.id, bestBridge.secondaryEdge.id],
           summary: `${leftDisease.label} -> ${target.label} -> ${rightDisease.label}`,
+          pathState: "candidate",
         };
       }
     }
@@ -3557,6 +3579,7 @@ function derivePathUpdate(
       nodeIds: [disease.id],
       edgeIds: [],
       summary: `${disease.label} resolved. Building target evidence...`,
+      pathState: "candidate",
     };
   }
 
@@ -3594,6 +3617,7 @@ function derivePathUpdate(
     nodeIds: [...nodeIds],
     edgeIds: [...edgeIds],
     summary,
+    pathState: "candidate",
   };
 }
 
@@ -6330,6 +6354,7 @@ export async function GET(request: NextRequest) {
                     .map((item) => item.name)
                     .join(" / ")}`
                 : `Disease anchor set: ${chosen.selected.name}`,
+            pathState: "candidate",
           });
         }
 
@@ -7196,6 +7221,8 @@ export async function GET(request: NextRequest) {
                     ].filter((value, index, all) => all.indexOf(value) === index);
                     const hasFullAnchorCoverage =
                       Boolean(strongestSegment) && missingPrimaryAnchors.length === 0;
+                    const bridgePathState: DerivedPathUpdate["pathState"] =
+                      hasFullAnchorCoverage ? "active" : strongestSegment ? "candidate" : "discarded";
                     const bridgePathUpdate: DerivedPathUpdate = {
                       nodeIds: strongestSegment?.nodeIds ?? [primaryNodeId, ...bridgePatch.secondaryNodeIds],
                       edgeIds: strongestSegment?.edgeIds ?? [...bridgeEdges.values()].map((edge) => edge.id),
@@ -7213,6 +7240,7 @@ export async function GET(request: NextRequest) {
                           : `No strong multihop mechanism path found between ${chosen.selected.name} and ${secondaryNames} in this run.`,
                       connectedAcrossAnchors: hasFullAnchorCoverage,
                       unresolvedAnchorPairs,
+                      pathState: bridgePathState,
                     };
                     latestPathUpdate = bridgePathUpdate;
                     lastPathSignature = `${bridgePathUpdate.nodeIds.join("|")}::${bridgePathUpdate.edgeIds.join("|")}`;

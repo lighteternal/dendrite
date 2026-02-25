@@ -583,12 +583,12 @@ export function GraphCanvas({
       {
         selector: "node.is-washed",
         style: {
-          "background-color": "#a8b4cc",
-          opacity: 0.9,
+          "background-color": "#e7a9b2",
+          opacity: 0.92,
           "text-opacity": 1,
-          "text-border-color": "#9cabca",
-          "text-background-color": "#f2f5fd",
-          color: "#2c3e5f",
+          "text-border-color": "#d88b96",
+          "text-background-color": "#fdeff1",
+          color: "#5f2c35",
         },
       },
       {
@@ -784,11 +784,11 @@ export function GraphCanvas({
       {
         selector: "edge.is-washed",
         style: {
-          "line-color": "#7f8eb1",
-          "target-arrow-color": "#7f8eb1",
+          "line-color": "#d16373",
+          "target-arrow-color": "#d16373",
           "line-style": "dashed",
           "line-dash-pattern": [4, 5],
-          opacity: 0.9,
+          opacity: 0.92,
         },
       },
       {

@@ -7,7 +7,7 @@ RUN npm ci
 
 COPY apps/web ./
 
-RUN npm run build
+RUN NODE_OPTIONS=--max-old-space-size=4096 npm run build
 
 EXPOSE 3000
 

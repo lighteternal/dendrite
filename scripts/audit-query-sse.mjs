@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 
 const base = process.env.BASE_URL || "http://localhost:3100";
 const query = process.argv.slice(2).join(" ").trim();
+const apiKey = process.env.OPENAI_API_KEY?.trim() ?? "";
 
 if (!query) {
   console.error("usage: node scripts/audit-query-sse.mjs \"<query>\"");
@@ -16,6 +17,23 @@ const safe = query.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 96);
 const sessionId = `audit-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 const url = `${base}/api/runCaseStream?query=${encodeURIComponent(query)}&mode=multihop&sessionId=${encodeURIComponent(sessionId)}`;
 const startedAt = Date.now();
+
+async function setSessionApiKey() {
+  if (!apiKey) return { ok: false, reason: "missing_openai_api_key" };
+  const response = await fetch(
+    `${base}/api/runCaseStream?action=set_api_key&sessionId=${encodeURIComponent(sessionId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey }),
+    },
+  );
+  if (!response.ok) {
+    const payload = await response.text().catch(() => "");
+    return { ok: false, reason: `set_api_key_failed_${response.status}:${payload.slice(0, 200)}` };
+  }
+  return { ok: true };
+}
 
 function parseSseBlock(block) {
   const lines = block.split("\n");
@@ -38,18 +56,6 @@ function parseSseBlock(block) {
   }
   return { event, data };
 }
-
-const controller = new AbortController();
-const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
-
-const response = await fetch(url, { signal: controller.signal });
-if (!response.ok || !response.body) {
-  clearTimeout(timer);
-  throw new Error(`request failed: ${response.status}`);
-}
-
-const decoder = new TextDecoder();
-let buffer = "";
 
 const summary = {
   query,
@@ -94,7 +100,22 @@ const summary = {
   warnings: [],
   errors: [],
   finalDonePayload: null,
+  keyStatus: await setSessionApiKey(),
 };
+
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+const response = await fetch(url, { signal: controller.signal });
+if (!response.ok || !response.body) {
+  clearTimeout(timer);
+  throw new Error(`request failed: ${response.status}`);
+}
+
+const decoder = new TextDecoder();
+let buffer = "";
+
+// summary defined above
 
 const rawEvents = [];
 let shouldStop = false;

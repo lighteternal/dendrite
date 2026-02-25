@@ -158,13 +158,23 @@ export async function getPubmedArticles(
   disease: string,
   targetSymbol: string,
   limit = 5,
+  contextTerms: string[] = [],
 ): Promise<PubmedArticle[]> {
   const normalizedDisease = disease.trim();
   const normalizedTarget = targetSymbol.trim().toUpperCase();
   const capped = Math.max(1, Math.min(10, limit));
+  const extraTerms = (contextTerms ?? [])
+    .map((term) => String(term ?? "").trim())
+    .filter((term) => term.length >= 2)
+    .slice(0, 4);
   if (!normalizedDisease || !normalizedTarget) return [];
 
-  const query = `${normalizedTarget}[Title/Abstract] AND ${normalizedDisease}[Title/Abstract]`;
+  const baseQuery = `${normalizedTarget}[Title/Abstract] AND ${normalizedDisease}[Title/Abstract]`;
+  const contextClause =
+    extraTerms.length > 0
+      ? ` AND (${extraTerms.map((term) => `${term}[Title/Abstract]`).join(" OR ")})`
+      : "";
+  const query = `${baseQuery}${contextClause}`;
   const cacheKey = `pair::${query.toLowerCase()}::${capped}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;

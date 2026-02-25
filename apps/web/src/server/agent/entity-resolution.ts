@@ -25,7 +25,7 @@ import {
 import { searchDrugCandidates } from "@/server/mcp/chembl";
 import { createTrackedOpenAIClient } from "@/server/openai/client";
 
-type CandidateEntityType = "disease" | "target" | "drug";
+type CandidateEntityType = "disease" | "target" | "drug" | "unknown";
 type MentionType =
   | "disease"
   | "target"
@@ -57,7 +57,7 @@ type ResolutionModelResult = {
     id: string;
     confidence: number;
   }>;
-  primaryDiseaseId?: string;
+  primaryDiseaseId?: string | null;
   constraints?: QueryPlanConstraint[];
   unresolvedMentions?: string[];
   rationale?: string;
@@ -1154,14 +1154,14 @@ async function runModelResolution(
           additionalProperties: false,
           properties: {
             mention: { type: "string" },
-            entityType: { type: "string", enum: ["disease", "target", "drug"] },
+            entityType: { type: "string", enum: ["disease", "target", "drug", "unknown"] },
             id: { type: "string" },
             confidence: { type: "number" },
           },
           required: ["mention", "entityType", "id", "confidence"],
         },
       },
-      primaryDiseaseId: { type: "string" },
+      primaryDiseaseId: { type: ["string", "null"] },
       unresolvedMentions: {
         type: "array",
         items: { type: "string" },
@@ -1180,7 +1180,14 @@ async function runModelResolution(
       },
       rationale: { type: "string" },
     },
-    required: ["intent", "anchors", "unresolvedMentions", "constraints", "rationale"],
+    required: [
+      "intent",
+      "anchors",
+      "unresolvedMentions",
+      "constraints",
+      "rationale",
+      "primaryDiseaseId",
+    ],
   } as const;
 
   try {

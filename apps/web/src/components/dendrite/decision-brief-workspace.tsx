@@ -505,6 +505,7 @@ export function DecisionBriefWorkspace({
   const [showInteractionContext, setShowInteractionContext] = useState(false);
 
   const [activePath, setActivePath] = useState<PathUpdate | null>(null);
+  const [candidatePaths, setCandidatePaths] = useState<PathUpdate[]>([]);
   const [washedPaths, setWashedPaths] = useState<PathUpdate[]>([]);
   const [bridgeAnalysis, setBridgeAnalysis] = useState<BridgeAnalysis | null>(null);
   const agentFinalReadout: AgentFinalAnswer | null = stream.agentFinal;
@@ -552,12 +553,35 @@ export function DecisionBriefWorkspace({
   ]);
 
   useEffect(() => {
+    activePathRef.current = null;
+    setActivePath(null);
+    setCandidatePaths([]);
+    setWashedPaths([]);
+  }, [runSessionId]);
+
+  useEffect(() => {
     const incoming = stream.pathUpdate;
     if (!incoming) return;
     const incomingSignature = pathSignature(incoming);
     const previous = activePathRef.current;
     const previousSignature = pathSignature(previous);
     if (incomingSignature === previousSignature) return;
+
+    const pathState = incoming.pathState ?? "active";
+    if (pathState === "discarded") {
+      setWashedPaths((prev) => {
+        const next = [incoming, ...prev.filter((item) => pathSignature(item) !== incomingSignature)];
+        return next.slice(0, 8);
+      });
+      return;
+    }
+    if (pathState === "candidate") {
+      setCandidatePaths((prev) => {
+        const next = [incoming, ...prev.filter((item) => pathSignature(item) !== incomingSignature)];
+        return next.slice(0, 6);
+      });
+      return;
+    }
 
     if (previous && previous.edgeIds.length > 0) {
       setWashedPaths((prev) => {
@@ -568,6 +592,7 @@ export function DecisionBriefWorkspace({
 
     activePathRef.current = incoming;
     setActivePath(incoming);
+    setCandidatePaths((prev) => prev.filter((item) => pathSignature(item) !== incomingSignature));
   }, [stream.pathUpdate]);
 
   const activeSourceHealth = (stream.status?.sourceHealth ?? {}) as SourceHealth;
@@ -1129,19 +1154,35 @@ export function DecisionBriefWorkspace({
       .filter((item): item is PathUpdate => Boolean(item));
   }, [buildPathForTargetSymbol, stream.finalBrief]);
 
+  const candidatePathsMerged = useMemo(() => {
+    const all = [...candidatePaths, ...shortlistPaths, ...alternativePaths];
+    const seen = new Set<string>();
+    const merged: PathUpdate[] = [];
+    for (const path of all) {
+      const signature = pathSignature(path);
+      if (!signature || seen.has(signature)) continue;
+      seen.add(signature);
+      merged.push(path);
+      if (merged.length >= 8) break;
+    }
+    return merged;
+  }, [alternativePaths, candidatePaths, shortlistPaths]);
+
   const mergedWashedPaths = useMemo(() => {
     const activeSignature = pathSignature(activePath);
-    const shortlistSignatures = new Set(shortlistPaths.map((path) => pathSignature(path)));
+    const candidateSignatures = new Set(
+      candidatePathsMerged.map((path) => pathSignature(path)),
+    );
     const seen = new Set<string>();
     const merged: PathUpdate[] = [];
 
-    for (const item of [...washedPaths, ...alternativePaths]) {
+    for (const item of washedPaths) {
       const signature = pathSignature(item);
       if (
         !signature ||
         signature === activeSignature ||
         seen.has(signature) ||
-        shortlistSignatures.has(signature)
+        candidateSignatures.has(signature)
       ) {
         continue;
       }
@@ -1151,7 +1192,7 @@ export function DecisionBriefWorkspace({
     }
 
     return merged;
-  }, [activePath, alternativePaths, shortlistPaths, washedPaths]);
+  }, [activePath, candidatePathsMerged, washedPaths]);
 
   const topStatus = stream.status?.message ?? "Preparing run";
   const runLabel = "Multi-hop search";
@@ -1587,7 +1628,7 @@ export function DecisionBriefWorkspace({
                 edges={graphEdges}
                 pathUpdate={graphPath}
                 washedPathUpdates={mergedWashedPaths}
-                shortlistPathUpdates={shortlistPaths}
+                candidatePathUpdates={candidatePathsMerged}
                 showPathwayContext={showPathwayContext}
                 showDrugContext={showDrugContext}
                 showInteractionContext={showInteractionContext}

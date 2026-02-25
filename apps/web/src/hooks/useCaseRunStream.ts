@@ -28,6 +28,7 @@ export type PathUpdate = {
   nodeIds: string[];
   edgeIds: string[];
   summary: string;
+  pathState?: "active" | "candidate" | "discarded";
 };
 
 export type RecommendationSection = {
@@ -47,11 +48,11 @@ export type QueryPlan = {
   anchors: Array<{
     mention: string;
     requestedType: string;
-    entityType: "disease" | "target" | "drug";
+    entityType: "disease" | "target" | "drug" | "unknown";
     id: string;
     name: string;
     confidence: number;
-    source: "opentargets" | "chembl";
+    source: "opentargets" | "chembl" | "planner";
   }>;
   constraints: Array<{
     text: string;

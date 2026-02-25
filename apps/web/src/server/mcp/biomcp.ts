@@ -29,6 +29,23 @@ const enrichmentCache = createTTLCache<
 
 const mcp = new McpClient(appConfig.mcp.biomcp);
 
+async function runBioMcpThink(context: string): Promise<void> {
+  try {
+    await mcp.callToolRaw(
+      "think",
+      {
+        thought: context,
+        thoughtNumber: 1,
+        totalThoughts: 1,
+        nextThoughtNeeded: false,
+      },
+      8_000,
+    );
+  } catch {
+    // Non-blocking: BioMCP think tool is advisory for structured analysis.
+  }
+}
+
 function parseMcpArticleLines(raw: string): ArticleSnippet[] {
   const lines = raw.split("\n").map((line) => line.trim());
   const snippets: ArticleSnippet[] = [];
@@ -91,6 +108,12 @@ export async function getLiteratureAndTrials(
 
   const cached = enrichmentCache.get(cacheKey);
   if (cached) return cached;
+
+  await runBioMcpThink(
+    `Plan BioMCP evidence search for ${disease} with target ${targetSymbol}${
+      interventionHint ? ` and intervention ${interventionHint}` : ""
+    }.`,
+  );
 
   let articleResults: ArticleSnippet[] = [];
   let trialResults: TrialSnippet[] = [];

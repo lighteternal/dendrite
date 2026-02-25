@@ -41,6 +41,7 @@ import {
 } from "@/server/openai/client";
 import {
   getReplayFixture,
+  type ReplayEvent,
   type ReplayFixture,
 } from "@/server/replay/example-replays";
 
@@ -232,6 +233,7 @@ type SessionApiKeyState = {
 
 const activeSessionRuns = new Map<string, ActiveSessionRun>();
 const sessionApiKeys = new Map<string, SessionApiKeyState>();
+const replayEventsCache = new Map<string, ReplayEvent[]>();
 
 function normalizeApiKey(raw: string): string | null {
   const value = raw.trim();
@@ -536,8 +538,30 @@ function patchReplayEventData(
   };
 }
 
+async function loadReplayEvents(
+  request: NextRequest,
+  fixture: ReplayFixture,
+): Promise<ReplayEvent[]> {
+  const cached = replayEventsCache.get(fixture.id);
+  if (cached) return cached;
+
+  const url = new URL(fixture.eventsPath, request.url);
+  const response = await fetch(url.toString(), { cache: "force-cache" });
+  if (!response.ok) {
+    throw new Error(`Replay fixture fetch failed: ${response.status}`);
+  }
+  const payload = (await response.json()) as unknown;
+  if (!Array.isArray(payload)) {
+    throw new Error("Replay fixture payload invalid");
+  }
+  const events = payload as ReplayEvent[];
+  replayEventsCache.set(fixture.id, events);
+  return events;
+}
+
 async function streamReplayFixture(params: {
   fixture: ReplayFixture;
+  events: ReplayEvent[];
   runId: string;
   query: string;
   startedAt: number;
@@ -548,6 +572,7 @@ async function streamReplayFixture(params: {
 }) {
   const {
     fixture,
+    events,
     runId,
     query,
     startedAt,
@@ -556,7 +581,6 @@ async function streamReplayFixture(params: {
     nodeMap,
     edgeMap,
   } = params;
-  const events = fixture.events ?? [];
   const replayDurationMs = Math.max(20_000, fixture.durationMs);
   const totalEvents = Math.max(1, events.length);
 
@@ -5384,8 +5408,10 @@ export async function GET(request: NextRequest) {
 
       if (replayFixture) {
         try {
+          const replayEvents = await loadReplayEvents(request, replayFixture);
           await streamReplayFixture({
             fixture: replayFixture,
+            events: replayEvents,
             runId,
             query,
             startedAt,

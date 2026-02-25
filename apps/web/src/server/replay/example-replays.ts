@@ -1,7 +1,3 @@
-import rawObesityT2dEvents from "@/server/replay/fixtures/example-obesity-t2d-v1.events.json";
-import rawAlsOxidativeEvents from "@/server/replay/fixtures/example-als-oxidative-v1.events.json";
-import rawT2dCkdEvents from "@/server/replay/fixtures/example-t2d-ckd-v1.events.json";
-import rawCannabisAnorexiaEvents from "@/server/replay/fixtures/example-cannabis-anorexia-v1.events.json";
 import { EXAMPLE_REPLAY_OPTIONS } from "@/lib/example-replay";
 
 export type ReplayEvent = {
@@ -19,14 +15,7 @@ export type ReplayFixture = {
     rationale: string;
     sources: string[];
   };
-  events: ReplayEvent[];
-};
-
-const replayEventsById: Record<string, ReplayEvent[]> = {
-  "example-obesity-t2d-v1": (rawObesityT2dEvents as ReplayEvent[]) ?? [],
-  "example-als-oxidative-v1": (rawAlsOxidativeEvents as ReplayEvent[]) ?? [],
-  "example-t2d-ckd-v1": (rawT2dCkdEvents as ReplayEvent[]) ?? [],
-  "example-cannabis-anorexia-v1": (rawCannabisAnorexiaEvents as ReplayEvent[]) ?? [],
+  eventsPath: string;
 };
 
 const replayMetaById: Record<
@@ -97,7 +86,6 @@ const replayMetaById: Record<
 const fixtures: Record<string, ReplayFixture> = Object.fromEntries(
   EXAMPLE_REPLAY_OPTIONS.map((option) => {
     const meta = replayMetaById[option.id];
-    const events = replayEventsById[option.id] ?? [];
     return [
       option.id,
       {
@@ -110,7 +98,7 @@ const fixtures: Record<string, ReplayFixture> = Object.fromEntries(
           rationale: "Replay fixture loaded from captured run output.",
           sources: [],
         },
-        events,
+        eventsPath: `/replays/${option.id}.events.json`,
       } satisfies ReplayFixture,
     ];
   }),

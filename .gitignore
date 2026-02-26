@@ -36,3 +36,4 @@ services/mcp-chembl/*
 services/biomcp/*
 !services/biomcp/.gitkeep
 .vercel
+.venv-playwright/

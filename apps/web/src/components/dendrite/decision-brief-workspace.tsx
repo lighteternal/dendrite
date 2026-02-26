@@ -4,9 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
+  ChevronDown,
   Clock3,
   Download,
   Loader2,
+  Maximize2,
+  PanelRightClose,
   PanelRightOpen,
   Play,
   Search,
@@ -18,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   useCaseRunStream,
   type AgentFinalAnswer,
@@ -347,24 +351,24 @@ function MarkdownAnswer({
         remarkPlugins={[remarkGfm]}
         components={{
           h1: ({ children }) => (
-            <h1 className="mb-2 mt-3 text-[15px] font-semibold text-[#33457a] first:mt-0">{children}</h1>
+            <h1 className="mb-2 mt-3 text-[18px] font-semibold text-[#2f3f72] first:mt-0">{children}</h1>
           ),
           h2: ({ children }) => (
-            <h2 className="mb-2 mt-3 text-[14px] font-semibold text-[#33457a] first:mt-0">{children}</h2>
+            <h2 className="mb-2 mt-3 text-[16px] font-semibold text-[#2f3f72] first:mt-0">{children}</h2>
           ),
           h3: ({ children }) => (
-            <h3 className="mb-1.5 mt-3 text-[12px] font-semibold uppercase tracking-[0.08em] text-[#42508a] first:mt-0">
+            <h3 className="mb-1.5 mt-3 text-[12px] font-semibold uppercase tracking-[0.1em] text-[#42508a] first:mt-0">
               {children}
             </h3>
           ),
-          p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+          p: ({ children }) => <p className="mb-2.5 last:mb-0">{children}</p>,
           ul: ({ children }) => <ul className="mb-2 list-disc space-y-1 pl-5 last:mb-0">{children}</ul>,
           ol: ({ children }) => <ol className="mb-2 list-decimal space-y-1 pl-5 last:mb-0">{children}</ol>,
           li: ({ children }) => <li>{children}</li>,
           blockquote: ({ children }) => (
             <blockquote className="mb-2 border-l-2 border-[#d4d8f4] pl-3 text-[#556395]">{children}</blockquote>
           ),
-          strong: ({ children }) => <strong className="font-semibold text-[#33457a]">{children}</strong>,
+          strong: ({ children }) => <strong className="font-semibold text-[#1f2f65]">{children}</strong>,
           em: ({ children }) => <em className="italic">{children}</em>,
           code: ({ children }) => (
             <code className="rounded bg-[#eef1ff] px-1 py-0.5 text-[12px] text-[#3b4b86]">{children}</code>
@@ -503,6 +507,12 @@ export function DecisionBriefWorkspace({
   const [showPathwayContext, setShowPathwayContext] = useState(true);
   const [showDrugContext, setShowDrugContext] = useState(true);
   const [showInteractionContext, setShowInteractionContext] = useState(false);
+  const [answerTab, setAnswerTab] = useState<"answer" | "log">("answer");
+  const [showSidePanel, setShowSidePanel] = useState(true);
+  const [referencesOpen, setReferencesOpen] = useState(false);
+  const [splitRatio, setSplitRatio] = useState(68);
+  const [splitTouched, setSplitTouched] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
 
   const [activePath, setActivePath] = useState<PathUpdate | null>(null);
   const [candidatePaths, setCandidatePaths] = useState<PathUpdate[]>([]);
@@ -514,13 +524,27 @@ export function DecisionBriefWorkspace({
   const discoverElapsedMs = stream.journeyElapsedMs;
   const discoverIsRunning = stream.journeyIsRunning;
   const activePathRef = useRef<PathUpdate | null>(null);
+  const runWasActiveRef = useRef(false);
   const lastNarrationAtRef = useRef<number>(0);
   const [secondsSinceNarration, setSecondsSinceNarration] = useState(0);
   const [liveNowMs, setLiveNowMs] = useState(() => Date.now());
+  const splitRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{ startX: number; startRatio: number } | null>(null);
 
   useEffect(() => {
     lastNarrationAtRef.current = Date.now();
   }, []);
+
+  useEffect(() => {
+    const running = stream.isRunning || discoverIsRunning;
+    if (running && !runWasActiveRef.current) {
+      setAnswerTab("log");
+    }
+    if (!running && runWasActiveRef.current) {
+      setAnswerTab((current) => (current === "log" ? "answer" : current));
+    }
+    runWasActiveRef.current = running;
+  }, [discoverIsRunning, stream.isRunning]);
 
   useEffect(() => {
     const autoStartSignature = [
@@ -1027,10 +1051,137 @@ export function DecisionBriefWorkspace({
     [verdictCitations],
   );
 
+  useEffect(() => {
+    if (stream.isRunning) {
+      setReferencesOpen(false);
+    }
+  }, [stream.isRunning]);
+
   const verdictTarget = recommendation?.target ?? liveTargetFallback ?? "not resolved";
   const verdictPathway = recommendation?.pathway ?? "not provided";
   const verdictHeadingTarget = queryMode === "bridge" ? queryAnchorsSummary : verdictTarget;
   const verdictHeadingPathway = queryMode === "bridge" ? "multihop evidence thread" : verdictPathway;
+  const isLongtail =
+    (stream.isRunning || discoverIsRunning) &&
+    (progressPct >= 95 || stream.status?.phase === "P6");
+  const preferredGraphRatio =
+    stream.isRunning || discoverIsRunning ? 70 : finalVerdictReady ? 56 : 64;
+
+  const SynthWave = () => (
+    <div className="tg-wave">
+      {Array.from({ length: 5 }).map((_, index) => (
+        <span key={index} className="tg-wave-bar" />
+      ))}
+    </div>
+  );
+
+  const renderAnswerBlock = (variant: "compact" | "focus") => {
+    const isFocus = variant === "focus";
+    const containerClass = isFocus ? "px-4 py-3" : "px-3 py-2.5";
+    const markdownClass = isFocus
+      ? "mt-2 text-[16px] leading-8 text-[#4a5a92]"
+      : "mt-1 text-[15px] leading-7 text-[#4f5d91]";
+    const metaClass = isFocus ? "mt-1 text-[12px]" : "mt-1 text-[12px]";
+
+    return (
+      <>
+        {stream.isRunning ? (
+          <div className={`rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] ${containerClass}`}>
+            <div className="font-semibold text-[#47429d]">Answer in progress</div>
+            <MarkdownAnswer
+              text={scientificVerdict.directAnswer}
+              className={markdownClass}
+              citationIndices={verdictCitationIndexSet}
+            />
+            <div className={`${metaClass} text-[#6170a2]`}>Active thread: {scientificVerdict.mechanismThread}</div>
+            <div className={`${metaClass} text-[#6170a2]`}>
+              Current phase: {phaseSummaryMap[stream.status?.phase ?? ""] ?? "Streaming evidence"} ({progressPct}
+              %)
+            </div>
+            {isLongtail ? (
+              <div className="mt-2 flex items-center gap-2 text-[11px] text-[#5a65a1]">
+                <SynthWave />
+                <span>Deep synthesis running. The graph is stable while the final answer composes.</span>
+              </div>
+            ) : null}
+          </div>
+        ) : finalVerdictReady ? (
+          <div className={`rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] ${containerClass}`}>
+            <div className="font-semibold text-[#47429d]">
+              {hasAgentFinalAnswer ? "Final answer" : `${verdictHeadingTarget} in ${verdictHeadingPathway}`}
+            </div>
+            <MarkdownAnswer
+              text={scientificVerdict.directAnswer}
+              className={markdownClass}
+              citationIndices={verdictCitationIndexSet}
+            />
+            <div className={`${metaClass} text-[#6170a2]`}>
+              Primary mechanism path: {scientificVerdict.mechanismThread}
+            </div>
+            <div className={`${metaClass} text-[#6170a2]`}>
+              Score {recommendation ? recommendation.score.toFixed(3) : "partial"} • Evidence confidence:{" "}
+              {scientificVerdict.confidence}
+            </div>
+            {agentFinalReadout?.keyFindings?.length ? (
+              <div className="mt-2 rounded-md border border-[#ddd9fb] bg-white px-2.5 py-2 text-[11px] text-[#576597]">
+                {agentFinalReadout.keyFindings.slice(0, 4).map((item) => (
+                  <div key={item}>• {item}</div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div className={`rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] ${containerClass}`}>
+            <div className="font-semibold text-[#47429d]">No conclusive mechanism identified</div>
+            <div className="mt-1 text-[15px] text-[#4f5d91]">
+              This run ended without a stable mechanism thread. Review references and the graph trails.
+            </div>
+          </div>
+        )}
+        {stream.finalBrief?.caveats?.length ? (
+          <div className={`rounded-lg border border-[#ddd9fb] bg-[#f7f4ff] ${isFocus ? "px-3 py-2" : "px-2.5 py-2"} text-xs text-[#665ca3]`}>
+            {stream.finalBrief.caveats.slice(0, 4).map((item) => (
+              <div key={item}>• {item}</div>
+            ))}
+          </div>
+        ) : null}
+      </>
+    );
+  };
+
+  useEffect(() => {
+    if (!showSidePanel || splitTouched) return;
+    setSplitRatio(preferredGraphRatio);
+  }, [preferredGraphRatio, showSidePanel, splitTouched]);
+
+  useEffect(() => {
+    if (!isResizing) return;
+    const onMove = (event: PointerEvent) => {
+      if (!splitRef.current || !dragRef.current) return;
+      const rect = splitRef.current.getBoundingClientRect();
+      const delta = event.clientX - dragRef.current.startX;
+      const startPx = (dragRef.current.startRatio / 100) * rect.width;
+      const nextPx = startPx + delta;
+      const nextRatio = Math.min(78, Math.max(52, (nextPx / rect.width) * 100));
+      setSplitRatio(nextRatio);
+    };
+    const onUp = () => {
+      setIsResizing(false);
+      dragRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [isResizing]);
 
   const runBrief = () => {
     const trimmed = query.trim();
@@ -1066,6 +1217,19 @@ export function DecisionBriefWorkspace({
       diseaseId: diseaseIdOverride,
       diseaseName: diseaseNameOverride,
     });
+  };
+
+  const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!showSidePanel) return;
+    event.preventDefault();
+    setSplitTouched(true);
+    setIsResizing(true);
+    dragRef.current = { startX: event.clientX, startRatio: splitRatio };
+  };
+
+  const resetSplitLayout = () => {
+    setSplitTouched(false);
+    setSplitRatio(preferredGraphRatio);
   };
 
   const buildPathForTargetSymbol = useCallback(
@@ -1240,6 +1404,7 @@ export function DecisionBriefWorkspace({
                 className="h-9 bg-[#4d47d8] text-white hover:bg-[#403ab8] disabled:cursor-not-allowed disabled:opacity-55"
                 onClick={runBrief}
                 disabled={stream.isRunning}
+                title="Run a multihop analysis (long runs often take 5–12 minutes)"
               >
               {stream.isRunning ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1254,6 +1419,7 @@ export function DecisionBriefWorkspace({
               variant="secondary"
               onClick={() => void stream.interrupt()}
               disabled={!stream.isRunning}
+              title="Stop the active run"
             >
               Interrupt
             </Button>
@@ -1262,15 +1428,20 @@ export function DecisionBriefWorkspace({
 
         <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-[#505b8d]">
           <span className="rounded-full border border-[#d6dbf3] bg-[#f7f8ff] px-3 py-1">
-            Search mode: {runLabel}
+            Mode: {runLabel}
           </span>
           <span className="rounded-full border border-[#d6dbf3] bg-[#f7f8ff] px-3 py-1">
-            {runDescription}
+            Status: {topStatus}
           </span>
-          <span className="rounded-full border border-[#d6dbf3] bg-[#f7f8ff] px-3 py-1">{topStatus}</span>
           {queryPlan ? (
             <span className="rounded-full border border-[#d6dbf3] bg-[#f7f8ff] px-3 py-1">
-              Query plan: {queryPlan.anchors.length} anchors
+              Anchors: {queryPlan.anchors.length}
+            </span>
+          ) : null}
+          <span className="w-full text-[11px] text-[#6b7399]">{runDescription}</span>
+          {stream.isRunning ? (
+            <span className="w-full text-[11px] text-[#6b7399]">
+              Long multi-hop runs can take ~5–12 minutes. Explore the graph while evidence streams in.
             </span>
           ) : null}
         </div>
@@ -1542,26 +1713,12 @@ export function DecisionBriefWorkspace({
 
                 <Card className="border-[#dbe4f2] bg-white">
                   <CardHeader className="pb-2">
-                    <CardTitle className="text-sm text-[#2a456f]">Case Actions</CardTitle>
+                    <CardTitle className="text-sm text-[#2a456f]">Export</CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-2">
-                    <Button
-                      size="sm"
-                      className="w-full bg-[#2f5ca4] text-white hover:bg-[#264b86] disabled:opacity-55"
-                      onClick={runBrief}
-                      disabled={stream.isRunning}
-                    >
-                      <Play className="h-3.5 w-3.5" /> Run analysis
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      className="w-full border-[#d6e1f3] bg-[#f1f6ff] text-[#315c9f] hover:bg-[#e8f0ff]"
-                      onClick={() => void stream.interrupt()}
-                      disabled={!stream.isRunning}
-                    >
-                      Interrupt active query
-                    </Button>
+                    <div className="text-[11px] text-[#5a7195]">
+                      Use the header controls to run or interrupt. Export the current brief when ready.
+                    </div>
                     <Button
                       size="sm"
                       variant="secondary"
@@ -1596,26 +1753,73 @@ export function DecisionBriefWorkspace({
           </Sheet>
         </div>
 
-        <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,1.55fr)_minmax(350px,0.72fr)]">
-          <Card className="border-[#d9d4fb] bg-white">
-            <CardHeader className="pb-2">
+        <div
+          ref={splitRef}
+          className={`mt-3 grid items-stretch ${showSidePanel ? "gap-2" : "gap-3 grid-cols-1"}`}
+          style={
+            showSidePanel
+              ? {
+                  gridTemplateColumns: `minmax(0, ${splitRatio}%) 12px minmax(0, ${100 - splitRatio}%)`,
+                }
+              : undefined
+          }
+        >
+          <Card className="border-[#e0e6f4] bg-white shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
+            <CardHeader className="border-b border-[#edf1fb] bg-[#fafbff] pb-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <CardTitle className="text-sm text-[#2a456f]">Interactive Mechanism Network</CardTitle>
                 <div className="flex flex-wrap items-center gap-2 text-xs text-[#4d668b]">
-                  <div className="flex items-center gap-1 rounded-md border border-[#ddd9fb] bg-[#f7f4ff] px-2 py-1.5">
+                  <div
+                    className="flex items-center gap-1 rounded-md border border-[#e1e6f5] bg-white px-2 py-1.5 text-[#4a5677]"
+                    title="Toggle pathway context edges"
+                  >
                     <span>Pathways</span>
                     <Switch checked={showPathwayContext} onCheckedChange={setShowPathwayContext} />
                   </div>
-                  <div className="flex items-center gap-1 rounded-md border border-[#ddd9fb] bg-[#f7f4ff] px-2 py-1.5">
+                  <div
+                    className="flex items-center gap-1 rounded-md border border-[#e1e6f5] bg-white px-2 py-1.5 text-[#4a5677]"
+                    title="Toggle drug and intervention edges"
+                  >
                     <span>Drugs</span>
                     <Switch checked={showDrugContext} onCheckedChange={setShowDrugContext} />
                   </div>
-                  <div className="flex items-center gap-1 rounded-md border border-[#ddd9fb] bg-[#f7f4ff] px-2 py-1.5">
+                  <div
+                    className="flex items-center gap-1 rounded-md border border-[#e1e6f5] bg-white px-2 py-1.5 text-[#4a5677]"
+                    title="Toggle target-target interaction edges"
+                  >
                     <span>Interactions</span>
                     <Switch checked={showInteractionContext} onCheckedChange={setShowInteractionContext} />
                   </div>
                   {stream.isRunning ? (
-                    <Badge className="border border-[#cbc8fb] bg-[#efebff] text-[#4f4da5]">Live</Badge>
+                    <Badge className="border border-[#cdd7f1] bg-[#eef4ff] text-[#2f4b7c]">Live</Badge>
+                  ) : null}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-7 border-[#d6e1f3] bg-white text-[#315c9f] hover:bg-[#eef3ff]"
+                    onClick={() => setShowSidePanel((current) => !current)}
+                    title={showSidePanel ? "Hide the answer panel to widen the graph" : "Show the answer panel"}
+                  >
+                    {showSidePanel ? (
+                      <>
+                        <PanelRightClose className="h-3.5 w-3.5" /> Expand graph
+                      </>
+                    ) : (
+                      <>
+                        <PanelRightOpen className="h-3.5 w-3.5" /> Show answer
+                      </>
+                    )}
+                  </Button>
+                  {showSidePanel ? (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="h-7 border-[#d6e1f3] bg-white text-[#315c9f] hover:bg-[#eef3ff]"
+                      onClick={resetSplitLayout}
+                      title="Reset panel sizing"
+                    >
+                      Reset layout
+                    </Button>
                   ) : null}
                 </div>
               </div>
@@ -1637,143 +1841,165 @@ export function DecisionBriefWorkspace({
                 selectedEdgeId={selectedEdgeId}
                 onSelectEdge={setSelectedEdgeId}
                 onBridgeAnalysisChange={setBridgeAnalysis}
+                onResetView={() => {
+                  setShowPathwayContext(true);
+                  setShowDrugContext(true);
+                  setShowInteractionContext(true);
+                }}
               />
             </CardContent>
           </Card>
 
-          <div className="space-y-2.5">
-            <Card className="border-[#d9d4fb] bg-white">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm text-[#2a456f]">Scientific answer</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-sm text-[#35557f] xl:max-h-[72vh] xl:overflow-y-auto xl:pr-1">
-                {stream.isRunning ? (
-                  <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
-                    <div className="font-semibold text-[#47429d]">Answer in progress</div>
-                    <MarkdownAnswer
-                      text={scientificVerdict.directAnswer}
-                      className="mt-1 text-[13px] leading-6 text-[#4f5d91]"
-                      citationIndices={verdictCitationIndexSet}
-                    />
-                    <div className="mt-1 text-[12px] text-[#6170a2]">
-                      Active thread: {scientificVerdict.mechanismThread}
-                    </div>
-                    <div className="mt-1 text-[12px] text-[#6170a2]">
-                      Current phase: {phaseSummaryMap[stream.status?.phase ?? ""] ?? "Streaming evidence"} (
-                      {progressPct}%)
+          {showSidePanel ? (
+            <div className="relative flex items-stretch justify-center">
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize panels"
+                onPointerDown={startResize}
+                className={`group absolute inset-y-0 left-1/2 -translate-x-1/2 ${
+                  isResizing ? "bg-[#4f46e5]" : "bg-[#e1e6f5]"
+                } w-[6px] cursor-col-resize rounded-full transition-colors hover:bg-[#c7d2f4]`}
+              />
+            </div>
+          ) : null}
+
+          {showSidePanel ? (
+            <div className="space-y-2.5">
+            <Card className="border-[#e0e6f4] bg-white shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
+              <Tabs
+                value={answerTab}
+                onValueChange={(value) => setAnswerTab(value as "answer" | "log")}
+                className="h-full"
+              >
+                <CardHeader className="border-b border-[#edf1fb] bg-[#fafbff] pb-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <CardTitle className="text-base text-[#2a456f]">Scientific answer</CardTitle>
+                    <div className="flex items-center gap-2">
+                      <TabsList
+                        variant="line"
+                        className="h-8 bg-transparent text-[11px] text-[#4c5a89]"
+                      >
+                        <TabsTrigger value="answer" className="text-[11px]">
+                          Answer
+                        </TabsTrigger>
+                        <TabsTrigger value="log" className="text-[11px]">
+                          Execution log
+                        </TabsTrigger>
+                      </TabsList>
+                      <Sheet>
+                        <SheetTrigger asChild>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="h-8 border-[#d6e1f3] bg-white text-[#315c9f] hover:bg-[#eef3ff]"
+                          >
+                            <Maximize2 className="h-3.5 w-3.5" /> Focus
+                          </Button>
+                        </SheetTrigger>
+                        <SheetContent className="border-l border-[#dbe4f2] bg-[#f8f9ff] sm:max-w-[720px]">
+                          <SheetHeader className="pb-1">
+                            <SheetTitle className="text-[#28446d]">Scientific answer</SheetTitle>
+                            <SheetDescription className="text-[#5a7195]">
+                              Expanded reading view for the live synthesis.
+                            </SheetDescription>
+                          </SheetHeader>
+                          <div className="flex-1 overflow-y-auto px-4 pb-6 text-[#35557f]">
+                            {renderAnswerBlock("focus")}
+                          </div>
+                        </SheetContent>
+                      </Sheet>
                     </div>
                   </div>
-                ) : finalVerdictReady ? (
-                  <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
-                    <div className="font-semibold text-[#47429d]">
-                      {hasAgentFinalAnswer
-                        ? "Final answer"
-                        : `${verdictHeadingTarget} in ${verdictHeadingPathway}`}
-                    </div>
-                    <MarkdownAnswer
-                      text={scientificVerdict.directAnswer}
-                      className="mt-1 text-[13px] leading-6 text-[#4f5d91]"
-                      citationIndices={verdictCitationIndexSet}
-                    />
-                    <div className="mt-1 text-[12px] text-[#6170a2]">
-                      Primary mechanism path: {scientificVerdict.mechanismThread}
-                    </div>
-                    <div className="mt-1 text-[12px] text-[#6170a2]">
-                      Score {recommendation ? recommendation.score.toFixed(3) : "partial"} • Evidence confidence:{" "}
-                      {scientificVerdict.confidence}
-                    </div>
-                    {agentFinalReadout?.keyFindings?.length ? (
-                      <div className="mt-2 rounded-md border border-[#ddd9fb] bg-white px-2.5 py-2 text-[11px] text-[#576597]">
-                        {agentFinalReadout.keyFindings.slice(0, 4).map((item) => (
-                          <div key={item}>• {item}</div>
-                        ))}
+                </CardHeader>
+                <CardContent className="pt-0">
+                  <TabsContent
+                    value="answer"
+                    className="space-y-2 text-[15px] leading-7 text-[#35557f] xl:max-h-[78vh] xl:overflow-y-auto xl:pr-1"
+                  >
+                    {renderAnswerBlock("compact")}
+                  </TabsContent>
+                  <TabsContent
+                    value="log"
+                    className="space-y-2 text-xs text-[#4f688d] xl:max-h-[78vh] xl:overflow-y-auto xl:pr-1"
+                  >
+                    {stream.isRunning ? (
+                      <div className="rounded-lg border border-[#d9d4fb] bg-[#f7f4ff] px-2.5 py-2 text-[11px] text-[#5a60a3]">
+                        Runs often take several minutes. The graph updates live while the final synthesis completes.
                       </div>
                     ) : null}
-                  </div>
-                ) : (
-                  <div className="rounded-lg border border-[#d3d0fb] bg-[#f7f4ff] px-3 py-2.5">
-                    <div className="font-semibold text-[#47429d]">No conclusive mechanism identified</div>
-                    <div className="mt-1 text-[13px] text-[#4f5d91]">
-                      This run ended without a stable mechanism thread. Review references and the graph trails.
-                    </div>
-                  </div>
-                )}
-                {stream.finalBrief?.caveats?.length ? (
-                  <div className="rounded-lg border border-[#ddd9fb] bg-[#f7f4ff] px-2.5 py-2 text-xs text-[#665ca3]">
-                    {stream.finalBrief.caveats.slice(0, 4).map((item) => (
-                      <div key={item}>• {item}</div>
-                    ))}
-                  </div>
-                ) : null}
-              </CardContent>
-            </Card>
-
-            <Card className="border-[#d9d4fb] bg-white">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm text-[#2a456f]">Execution log</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-xs text-[#4f688d]">
-                <div className="rounded-lg border border-[#d9d4fb] bg-[#f7f4ff] px-2.5 py-2">
-                  <div className="font-semibold text-[#3a3a8a]">
-                    {discoverStatusMessage ?? stream.status?.message ?? "Initializing search pipeline"}
-                  </div>
-                  <div className="mt-1 text-[11px] text-[#6166a3]">
-                    {phaseSummaryMap[stream.status?.phase ?? ""] ?? "Streaming evidence from connected sources."}
-                  </div>
-                  <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#ddd9f8]">
-                    <div
-                      className="h-full rounded-full bg-[#4f46e5] transition-all duration-500"
-                      style={{ width: `${progressBarPct}%` }}
-                    />
-                  </div>
-                  <div className="mt-1 text-[10px] text-[#696ea6]">
-                    Progress {progressPct}%
-                  </div>
-                  {runElapsedMs > 0 ? (
-                    <div className="mt-1 text-[10px] text-[#696ea6]">
-                      Run time {formatDuration(runElapsedMs)}
-                    </div>
-                  ) : null}
-                  <div className="mt-1 text-[11px] text-[#525aa3]">
-                    Current operation: {executionActivity.currentOperation}
-                  </div>
-                  <div className="mt-1 text-[11px] text-[#525aa3]">
-                    In-flight tool calls: {executionActivity.inFlightCalls}
-                    {executionActivity.latestEvidenceUpdate
-                      ? ` • Last evidence update: ${executionActivity.latestEvidenceUpdate}`
-                      : ""}
-                  </div>
-                  {stream.isRunning && secondsSinceNarration >= 8 ? (
-                    <div className="mt-1 text-[11px] text-[#525aa3]">
-                      Last update {secondsSinceNarration}s ago.
-                    </div>
-                  ) : null}
-                  <div className="mt-2 grid grid-cols-2 gap-1.5 text-[10px] md:grid-cols-4">
-                    <div className="rounded border border-[#d5dcf5] bg-white px-1.5 py-1 text-[#4c5b92]">
-                      Calls {journeySignals.toolCalls}
-                    </div>
-                    <div className="rounded border border-[#c6e6d8] bg-white px-1.5 py-1 text-[#2f6d4e]">
-                      Results {journeySignals.toolResults}
-                    </div>
-                    <div className="rounded border border-[#c4e7d8] bg-white px-1.5 py-1 text-[#2e6b4d]">
-                      Active {journeySignals.active}
-                    </div>
-                    <div className="rounded border border-[#e3e5ef] bg-white px-1.5 py-1 text-[#6a718f]">
-                      Discarded {journeySignals.discarded}
-                    </div>
-                  </div>
-                  {journeySignals.topSources.length > 0 ? (
-                    <div className="mt-1.5 flex flex-wrap gap-1">
-                      {journeySignals.topSources.map(([source, count]) => (
-                        <span
-                          key={`${source}-${count}`}
-                          className="rounded-full border border-[#d8d4f8] bg-white px-1.5 py-0.5 text-[10px] text-[#676ca8]"
-                        >
-                          {source} {count}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
+                    {isLongtail ? (
+                      <div className="rounded-lg border border-[#d9d4fb] bg-[#f7f4ff] px-2.5 py-2 text-[11px] text-[#5a60a3]">
+                        <div className="flex items-center gap-2">
+                          <SynthWave />
+                          <div>
+                            <div className="font-semibold text-[#47429d]">Final synthesis in progress</div>
+                            <div>The graph is stable; the model is composing the narrative.</div>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="rounded-lg border border-[#d9d4fb] bg-[#f7f4ff] px-2.5 py-2">
+                      <div className="font-semibold text-[#3a3a8a]">
+                        {discoverStatusMessage ?? stream.status?.message ?? "Initializing search pipeline"}
+                      </div>
+                      <div className="mt-1 text-[11px] text-[#6166a3]">
+                        {phaseSummaryMap[stream.status?.phase ?? ""] ?? "Streaming evidence from connected sources."}
+                      </div>
+                      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#ddd9f8]">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${isLongtail ? "tg-shimmer" : "bg-[#4f46e5]"}`}
+                          style={{ width: `${progressBarPct}%` }}
+                        />
+                      </div>
+                      <div className="mt-1 text-[10px] text-[#696ea6]">
+                        Progress {progressPct}%
+                      </div>
+                      {runElapsedMs > 0 ? (
+                        <div className="mt-1 text-[10px] text-[#696ea6]">
+                          Run time {formatDuration(runElapsedMs)}
+                        </div>
+                      ) : null}
+                      <div className="mt-1 text-[11px] text-[#525aa3]">
+                        Current operation: {executionActivity.currentOperation}
+                      </div>
+                      <div className="mt-1 text-[11px] text-[#525aa3]">
+                        In-flight tool calls: {executionActivity.inFlightCalls}
+                        {executionActivity.latestEvidenceUpdate
+                          ? ` • Last evidence update: ${executionActivity.latestEvidenceUpdate}`
+                          : ""}
+                      </div>
+                      {stream.isRunning && secondsSinceNarration >= 8 ? (
+                        <div className="mt-1 text-[11px] text-[#525aa3]">
+                          Last update {secondsSinceNarration}s ago.
+                        </div>
+                      ) : null}
+                      <div className="mt-2 grid grid-cols-2 gap-1.5 text-[10px] md:grid-cols-4">
+                        <div className="rounded border border-[#d5dcf5] bg-white px-1.5 py-1 text-[#4c5b92]">
+                          Calls {journeySignals.toolCalls}
+                        </div>
+                        <div className="rounded border border-[#c6e6d8] bg-white px-1.5 py-1 text-[#2f6d4e]">
+                          Results {journeySignals.toolResults}
+                        </div>
+                        <div className="rounded border border-[#c4e7d8] bg-white px-1.5 py-1 text-[#2e6b4d]">
+                          Active {journeySignals.active}
+                        </div>
+                        <div className="rounded border border-[#e3e5ef] bg-white px-1.5 py-1 text-[#6a718f]">
+                          Discarded {journeySignals.discarded}
+                        </div>
+                      </div>
+                      {journeySignals.topSources.length > 0 ? (
+                        <div className="mt-1.5 flex flex-wrap gap-1">
+                          {journeySignals.topSources.map(([source, count]) => (
+                            <span
+                              key={`${source}-${count}`}
+                              className="rounded-full border border-[#d8d4f8] bg-white px-1.5 py-0.5 text-[10px] text-[#676ca8]"
+                            >
+                              {source} {count}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                 </div>
 
                 {graphPath ? (
@@ -1822,58 +2048,86 @@ export function DecisionBriefWorkspace({
                     </div>
                   )}
                 </div>
-              </CardContent>
+              </TabsContent>
+            </CardContent>
+          </Tabs>
             </Card>
 
           </div>
+          ) : null}
         </div>
       </section>
 
       <section className="px-3 pt-3 md:px-6">
-        <Card className="border-[#d9d4fb] bg-white">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm text-[#2a456f]">
-              References ({verdictCitations.length})
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0 text-xs text-[#57608f]">
-            {verdictCitations.length > 0 ? (
-              <div className="max-h-[300px] space-y-1.5 overflow-y-auto pr-1">
-                {verdictCitations.map((citation) => (
-                  <div
-                    key={`${citation.kind}-${citation.index}`}
-                    id={`ref-${citation.index}`}
-                    className="scroll-mt-24 rounded-md border border-[#e1dff9] bg-[#f9f8ff] px-2 py-1"
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className="font-semibold text-[#4d48a6]">[{citation.index}]</span>
-                      <span className="rounded-full border border-[#ddd9fb] bg-white px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-[#6a65a9]">
-                        {citation.kind}
-                      </span>
-                      <span className="text-[10px] text-[#6d79ad]">{citation.source}</span>
+        <Sheet open={referencesOpen} onOpenChange={setReferencesOpen}>
+          <Card className="border-[#e0e6f4] bg-white shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
+            <CardContent className="flex flex-wrap items-center justify-between gap-3 py-2">
+              <div>
+                <div className="text-sm font-semibold text-[#2a456f]">
+                  References ({verdictCitations.length})
+                </div>
+                <div className="text-[11px] text-[#6a7196]" />
+              </div>
+              <SheetTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="h-8 border-[#d6e1f3] bg-[#f1f6ff] text-[#315c9f] hover:bg-[#e8f0ff]"
+                  disabled={verdictCitations.length === 0}
+                >
+                  {verdictCitations.length === 0 ? "No references yet" : "Show references"}
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              </SheetTrigger>
+            </CardContent>
+          </Card>
+
+          <SheetContent side="bottom" className="h-[60vh] border-t border-[#dbe4f2] bg-[#f9fbff]">
+            <SheetHeader className="pb-2">
+              <SheetTitle className="text-[#28446d]">References</SheetTitle>
+              <SheetDescription className="text-[#5a7195]">
+                Evidence citations extracted during the run.
+              </SheetDescription>
+            </SheetHeader>
+            <div className="flex-1 overflow-y-auto px-4 pb-6 text-xs text-[#57608f]">
+              {verdictCitations.length > 0 ? (
+                <div className="space-y-1.5">
+                  {verdictCitations.map((citation) => (
+                    <div
+                      key={`${citation.kind}-${citation.index}`}
+                      id={`ref-${citation.index}`}
+                      className="scroll-mt-24 rounded-md border border-[#e1dff9] bg-[#f9f8ff] px-2 py-1"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-[#4d48a6]">[{citation.index}]</span>
+                        <span className="rounded-full border border-[#ddd9fb] bg-white px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-[#6a65a9]">
+                          {citation.kind}
+                        </span>
+                        <span className="text-[10px] text-[#6d79ad]">{citation.source}</span>
+                      </div>
+                      {citation.url ? (
+                        <a
+                          href={citation.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-0.5 block text-[11px] text-[#3d53a0] underline underline-offset-2 hover:text-[#2c3d7b]"
+                        >
+                          {citation.label}
+                        </a>
+                      ) : (
+                        <div className="mt-0.5 text-[11px] text-[#4d5f95]">{citation.label}</div>
+                      )}
                     </div>
-                    {citation.url ? (
-                      <a
-                        href={citation.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="mt-0.5 block text-[11px] text-[#3d53a0] underline underline-offset-2 hover:text-[#2c3d7b]"
-                      >
-                        {citation.label}
-                      </a>
-                    ) : (
-                      <div className="mt-0.5 text-[11px] text-[#4d5f95]">{citation.label}</div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="rounded-md border border-[#e1dff9] bg-[#f9f8ff] px-2 py-2 text-[11px] text-[#6369a1]">
-                References will appear after evidence retrieval completes.
-              </div>
-            )}
-          </CardContent>
-        </Card>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-md border border-[#e1dff9] bg-[#f9f8ff] px-2 py-2 text-[11px] text-[#6369a1]">
+                  References will appear after evidence retrieval completes.
+                </div>
+              )}
+            </div>
+          </SheetContent>
+        </Sheet>
       </section>
 
       <footer className="px-6 pt-4 text-[11px] text-[#5f7598]">

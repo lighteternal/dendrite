@@ -1773,6 +1773,7 @@ async function synthesizeFreeformNarrative(
               "### Biological interpretation",
               "### What to test next",
               "### Residual uncertainty",
+              "Use minimal markdown emphasis: bold 3-6 key entities or mechanisms (especially in Working conclusion). Avoid overuse.",
               "Open with a direct answer sentence that names the main mechanism relation and a practical next step.",
               "Write a substantive answer (roughly 600-1200 words), not a one-liner.",
               "Mention the key entities from the query and only the mechanism hops required to justify the recommendation.",

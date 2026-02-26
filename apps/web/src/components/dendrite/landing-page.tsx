@@ -412,10 +412,7 @@ export function LandingPage() {
                   })}
                 </div>
                 <div className="px-3 pb-3 text-[10px] text-[#5e7698]">
-                  Green = responding. Amber = reachable but degraded or slow. Red = unreachable.
-                  {toolHealthCheckedAt
-                    ? ` Last check: ${new Date(toolHealthCheckedAt).toLocaleTimeString()}.`
-                    : ""}
+                  Status reflects live connectivity.
                 </div>
               </>
             )}

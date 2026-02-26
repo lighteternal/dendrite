@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { ChevronDown } from "lucide-react";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
 import { GraphCanvas } from "@/components/dendrite/graph-canvas";
 import { analyzeBridgeOutcomes, type BridgeAnalysis } from "@/components/dendrite/bridge-analysis";
@@ -12,6 +13,7 @@ import {
 } from "@/components/dendrite/graph-source";
 import type { QueryPlan } from "@/hooks/useCaseRunStream";
 import { Badge } from "@/components/ui/badge";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 
 type PathUpdate = {
   nodeIds: string[];
@@ -36,6 +38,7 @@ type Props = {
   selectedEdgeId?: string | null;
   onSelectEdge?: (edgeId: string | null) => void;
   onBridgeAnalysisChange?: (analysis: BridgeAnalysis) => void;
+  onResetView?: () => void;
 };
 
 type SourceCountMap = Record<EdgeSourceGroup, number>;
@@ -350,8 +353,11 @@ export function PathFirstGraph({
   selectedEdgeId,
   onSelectEdge,
   onBridgeAnalysisChange,
+  onResetView,
 }: Props) {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [showAllEdges, setShowAllEdges] = useState(false);
+  const [showControls, setShowControls] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<Record<EdgeSourceGroup, boolean>>(() =>
     EDGE_SOURCE_GROUPS.reduce(
       (acc, group) => {
@@ -369,7 +375,7 @@ export function PathFirstGraph({
     }));
   }, []);
 
-  const unhideAllSourceGroups = useCallback(() => {
+  const unhideAllSourceGroups = useCallback((expand = false) => {
     setSourceFilter(
       EDGE_SOURCE_GROUPS.reduce(
         (acc, group) => {
@@ -379,7 +385,14 @@ export function PathFirstGraph({
         {} as Record<EdgeSourceGroup, boolean>,
       ),
     );
+    if (expand) setShowAllEdges(true);
   }, []);
+
+  const resetGraphView = useCallback(() => {
+    unhideAllSourceGroups(false);
+    setShowAllEdges(false);
+    onResetView?.();
+  }, [onResetView, unhideAllSourceGroups]);
 
   const allSourceGroupsEnabled = useMemo(
     () => EDGE_SOURCE_GROUPS.every((group) => sourceFilter[group]),
@@ -425,17 +438,13 @@ export function PathFirstGraph({
       }
     }
 
-    const allAnchorPairsConnected =
-      bridgeAnalysis.pairs.length > 0 &&
-      bridgeAnalysis.pairs.every((pair) => pair.status === "connected");
     const connectedAnchorEdgeIds = new Set<string>();
-    if (allAnchorPairsConnected) {
-      for (const pair of bridgeAnalysis.pairs) {
-        for (const edgeId of pair.edgeIds) connectedAnchorEdgeIds.add(edgeId);
-      }
-      for (const edgeId of bridgeAnalysis.activeConnectedPath?.edgeIds ?? []) {
-        connectedAnchorEdgeIds.add(edgeId);
-      }
+    for (const pair of bridgeAnalysis.pairs) {
+      if (pair.status !== "connected") continue;
+      for (const edgeId of pair.edgeIds) connectedAnchorEdgeIds.add(edgeId);
+    }
+    for (const edgeId of bridgeAnalysis.activeConnectedPath?.edgeIds ?? []) {
+      connectedAnchorEdgeIds.add(edgeId);
     }
 
     const allEdges = dedupedGraph.edges.map((edge) =>
@@ -703,7 +712,6 @@ export function PathFirstGraph({
       return 1;
     };
 
-    const maxEdges = showInteractionContext ? 180 : 140;
     const prioritizedSelectedEdges = allEdges
       .filter((edge) => selectedEdgeIds.has(edge.id))
       .sort((a, b) => {
@@ -712,15 +720,43 @@ export function PathFirstGraph({
         return (b.weight ?? 0) - (a.weight ?? 0);
       });
 
+    const contextEligibleEdges = allEdges.filter((edge) => {
+      if (!showInteractionContext && edge.type === "target_target") return false;
+      if (!showPathwayContext && edge.type === "target_pathway") return false;
+      if (!showDrugContext && edge.type === "target_drug") return false;
+      return true;
+    });
+    const sourceEligibleEdges = contextEligibleEdges.filter(
+      (edge) => !sourceFilterEnabled || isSourceEnabled(edge) || focusEdgeIds.has(edge.id),
+    );
+
+    const maxEdges = showAllEdges
+      ? Math.min(2000, Math.max(320, sourceEligibleEdges.length))
+      : (showInteractionContext ? 180 : 140);
+
     const selectedEdgeMap = new Map<string, GraphEdge>();
-    for (const edge of prioritizedSelectedEdges.slice(0, maxEdges)) {
-      selectedEdgeMap.set(edge.id, edge);
-    }
-    for (const edge of prioritizedSelectedEdges) {
-      if (!focusEdgeIds.has(edge.id)) continue;
-      selectedEdgeMap.set(edge.id, edge);
+    if (showAllEdges) {
+      for (const edge of sourceEligibleEdges
+        .slice()
+        .sort((a, b) => {
+          const p = priority(b) - priority(a);
+          if (p !== 0) return p;
+          return (b.weight ?? 0) - (a.weight ?? 0);
+        })
+        .slice(0, maxEdges)) {
+        selectedEdgeMap.set(edge.id, edge);
+      }
+    } else {
+      for (const edge of prioritizedSelectedEdges.slice(0, maxEdges)) {
+        selectedEdgeMap.set(edge.id, edge);
+      }
+      for (const edge of prioritizedSelectedEdges) {
+        if (!focusEdgeIds.has(edge.id)) continue;
+        selectedEdgeMap.set(edge.id, edge);
+      }
     }
     const selectedEdges = [...selectedEdgeMap.values()];
+    const densityHiddenEdges = Math.max(0, sourceEligibleEdges.length - selectedEdges.length);
     const laneTotalsBySource = emptySourceCountMap();
     for (const edge of selectedEdges) {
       const sourceGroup = edgeSourceById.get(edge.id) ?? "other";
@@ -768,7 +804,7 @@ export function PathFirstGraph({
       .filter((id, index, all) => all.indexOf(id) === index)
       .slice(0, 4);
 
-    const hiddenEdges = Math.max(0, allEdges.length - visibleEdges.length);
+    const hiddenEdges = Math.max(0, sourceEligibleEdges.length - visibleEdges.length);
     const hiddenNodes = Math.max(0, allNodes.length - visibleNodes.length);
     const bridgeStatuses = diseaseBridgeEdges
       .map((edge) => String(edge.meta.status ?? "candidate"))
@@ -776,14 +812,16 @@ export function PathFirstGraph({
     const summaryPrefix =
       pathUpdate?.summary ??
       bridgeAnalysis.queryTrailPath?.summary ??
-      `Showing predominant ${showInteractionContext ? "mechanistic" : "translational"} connections across ${primaryTargetIds.size} lead targets`;
+      (showAllEdges
+        ? `Showing expanded ${showInteractionContext ? "mechanistic" : "translational"} context across ${primaryTargetIds.size} lead targets`
+        : `Showing predominant ${showInteractionContext ? "mechanistic" : "translational"} connections across ${primaryTargetIds.size} lead targets`);
     const bridgeSuffix =
       bridgeStatuses.length > 0
         ? ` Anchor connectivity: ${bridgeStatuses.join(", ")}.`
         : "";
     const filteredOutEdges = Math.max(0, selectedEdges.length - visibleEdges.length);
-    const summaryCore = hiddenEdges > 0
-      ? `${summaryPrefix}. +${hiddenEdges} additional edges hidden for readability.${bridgeSuffix}`
+    const summaryCore = densityHiddenEdges > 0
+      ? `${summaryPrefix}. +${densityHiddenEdges} additional edges hidden for readability.${bridgeSuffix}`
       : `${summaryPrefix}${bridgeSuffix}`;
     const sourceFilterSuffix =
       filteredOutEdges > 0
@@ -831,6 +869,7 @@ export function PathFirstGraph({
         visible: visibleCountsBySource,
       },
       sourceFilterMuted: filteredOutEdges,
+      densityHiddenEdges,
       highlightedNodeIds: pathFocusNodeIds,
       highlightedEdgeIds: pathFocusEdgeIds,
       shortlistedNodeIds: candidateNodeIds,
@@ -856,31 +895,38 @@ export function PathFirstGraph({
     showDrugContext,
     showInteractionContext,
     showPathwayContext,
+    showAllEdges,
     sourceFilter,
   ]);
 
   return (
     <div className="space-y-2.5">
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#d7dbf5] bg-[#f7f7ff] px-3 py-2 text-xs text-[#4b4f80]">
+      <Collapsible open={showControls} onOpenChange={setShowControls} className="space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#e1e6f5] bg-[#f8f9ff] px-3 py-2 text-xs text-[#4b4f80]">
         <div className="font-medium text-[#373c78]">
           {computed.summary}
         </div>
         <div className="flex items-center gap-2">
-          <Badge className="bg-[#ebe9ff] text-[#4a42aa]">
+          <Badge className="bg-[#eef2ff] text-[#3744a0]">
             Nodes {computed.visibleNodes.length}
           </Badge>
-          <Badge className="bg-[#effaf8] text-[#0f766e]">
+          <Badge className="bg-[#eefaf7] text-[#0f766e]">
             Edges {computed.visibleEdges.length}
           </Badge>
+          {computed.densityHiddenEdges > 0 ? (
+            <Badge className="bg-[#f3f5ff] text-[#4b4ea1]">
+              +{computed.densityHiddenEdges} hidden
+            </Badge>
+          ) : null}
           <Badge
             className={
               computed.bridgeStatus === "connected"
-                ? "bg-[#ecf7f2] text-[#1f7a4f]"
+                  ? "bg-[#eaf6f0] text-[#1f7a4f]"
                 : computed.bridgeStatus === "partial"
-                  ? "bg-[#fff4e8] text-[#9a5a0f]"
+                  ? "bg-[#fff3e6] text-[#9a5a0f]"
                 : computed.bridgeStatus === "no_connection"
-                  ? "bg-[#f4efff] text-[#6a43be]"
-                  : "bg-[#eef1f7] text-[#57607b]"
+                    ? "bg-[#f3f0ff] text-[#6a43be]"
+                    : "bg-[#eef1f7] text-[#57607b]"
             }
           >
             {computed.bridgeStatus === "connected"
@@ -897,13 +943,34 @@ export function PathFirstGraph({
               Source-muted edges {computed.sourceFilterMuted}
             </Badge>
           ) : null}
+          {computed.densityHiddenEdges > 0 || showAllEdges ? (
+            <button
+              type="button"
+              onClick={() => setShowAllEdges((current) => !current)}
+              className="rounded-full border border-[#d7dcf5] bg-white px-2 py-0.5 text-[10px] font-medium text-[#4b4ea1] hover:bg-[#f5f6ff]"
+              title={showAllEdges ? "Return to balanced readability view" : "Expand edge density for a fuller graph view"}
+            >
+              {showAllEdges ? "Balanced view" : "Show all edges"}
+            </button>
+          ) : null}
           {computed.washedEdgeIds.size > 0 ? (
             <Badge className="bg-[#f1f2fa] text-[#5d5f7b]">
               Rejected trails {computed.washedEdgeIds.size}
             </Badge>
           ) : null}
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 rounded-full border border-[#d7dcf5] bg-white px-2 py-0.5 text-[10px] font-medium text-[#4b4ea1] hover:bg-[#f5f6ff]"
+              title={showControls ? "Hide graph controls" : "Show graph controls"}
+            >
+              {showControls ? "Hide details" : "Show details"}
+              <ChevronDown className={`h-3 w-3 transition-transform ${showControls ? "rotate-180" : ""}`} />
+            </button>
+          </CollapsibleTrigger>
         </div>
       </div>
+      <CollapsibleContent className="space-y-2.5">
       {computed.activeTrail.length > 0 ? (
         <div className="rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
           <span className="font-semibold text-[#3f4a8f]">Active trail:</span>{" "}
@@ -911,7 +978,7 @@ export function PathFirstGraph({
         </div>
       ) : null}
       {bridgeAnalysis.anchors.length > 0 ? (
-        <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
+          <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#e1e6f5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
           <span className="font-semibold text-[#3f4a8f]">Query anchors:</span>
           {bridgeAnalysis.anchors.map((anchor) => {
             const mention =
@@ -943,9 +1010,10 @@ export function PathFirstGraph({
         </div>
       ) : null}
 
-      <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
+          <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#e1e6f5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
         <span className="font-semibold text-[#3f4a8f]">Evidence lanes:</span>
-        <span className="text-[10px] text-[#6b7399]">shown/available in current view</span>
+        <span className="text-[10px] text-[#6b7399]">visible / available in current view</span>
+        <span className="text-[10px] text-[#6b7399]">hover for full-graph totals</span>
         {EDGE_SOURCE_GROUPS.map((group) => {
           const total = computed.sourceCounts.total[group] ?? 0;
           if (total === 0) return null;
@@ -976,28 +1044,32 @@ export function PathFirstGraph({
             </button>
           );
         })}
-        {!allSourceGroupsEnabled ? (
+        {!allSourceGroupsEnabled || showAllEdges ? (
           <>
+            {!allSourceGroupsEnabled ? (
+              <button
+                type="button"
+                onClick={() => unhideAllSourceGroups(true)}
+                className="rounded-full border border-[#d7dcf5] bg-[#f5f6ff] px-2 py-0.5 text-[10px] font-medium text-[#4e59a0]"
+                title="Unhide all evidence lanes and expand edge density"
+              >
+                Unhide all
+              </button>
+            ) : null}
             <button
               type="button"
-              onClick={unhideAllSourceGroups}
+              onClick={resetGraphView}
               className="rounded-full border border-[#d7dcf5] bg-[#f5f6ff] px-2 py-0.5 text-[10px] font-medium text-[#4e59a0]"
+              title="Restore defaults for lanes and edge density"
             >
-              Unhide all
-            </button>
-            <button
-              type="button"
-              onClick={unhideAllSourceGroups}
-              className="rounded-full border border-[#d7dcf5] bg-[#f5f6ff] px-2 py-0.5 text-[10px] font-medium text-[#4e59a0]"
-            >
-              Reset
+              Reset view
             </button>
           </>
         ) : null}
       </div>
 
       {computed.bridgePairSummaries.length > 0 ? (
-        <div className="grid gap-1.5 rounded-lg border border-[#d7dcf5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
+            <div className="grid gap-1.5 rounded-lg border border-[#e1e6f5] bg-white px-3 py-2 text-[11px] text-[#4e5a88]">
           {computed.bridgePairSummaries.map((pair) => (
             <div
               key={pair.id}
@@ -1020,12 +1092,18 @@ export function PathFirstGraph({
       ) : null}
 
       {isRunning && computed.visibleEdges.length === 0 ? (
-        <div className="rounded-lg border border-[#d7dcf5] bg-[#f7f8ff] px-3 py-2 text-xs text-[#4b5686]">
+        <div className="rounded-lg border border-[#e1e6f5] bg-[#f7f9ff] px-3 py-2 text-xs text-[#4b5686]">
           Graph stream initialized. Waiting for target and pathway evidence batches.
         </div>
       ) : null}
+      {isRunning && computed.visibleEdges.length > 0 ? (
+        <div className="rounded-lg border border-[#e1e6f5] bg-[#f7f9ff] px-3 py-2 text-xs text-[#4b5686]">
+          Streaming evidence. The graph will keep updating while the final synthesis completes. Try
+          Shift-click two nodes for the shortest path or right-click a node to focus its neighborhood.
+        </div>
+      ) : null}
       {!isRunning && computed.visibleEdges.length === 0 && computed.sourceFilterMuted > 0 ? (
-        <div className="rounded-lg border border-[#d7dcf5] bg-[#f7f8ff] px-3 py-2 text-xs text-[#4b5686]">
+        <div className="rounded-lg border border-[#e1e6f5] bg-[#f7f9ff] px-3 py-2 text-xs text-[#4b5686]">
           No edges are visible with the active source filters. Re-enable one or more evidence lanes.
         </div>
       ) : null}
@@ -1041,6 +1119,8 @@ export function PathFirstGraph({
           Directed edges: disease -&gt; target -&gt; pathway/drug. Cross-anchor edges indicate connected/unresolved anchor pairs.
         </span>
       </div>
+      </CollapsibleContent>
+      </Collapsible>
 
       <GraphCanvas
         nodes={computed.visibleNodes}

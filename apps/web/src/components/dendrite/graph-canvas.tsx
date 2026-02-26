@@ -236,10 +236,14 @@ export function GraphCanvas({
     return fallback ? [fallback] : [];
   }, [layoutRootIds, nodes, validNodeIds]);
   const layoutSignature = useMemo(() => {
+    if (isRunning) {
+      const edgeBucket = nodes.length > 120 ? 60 : 30;
+      return `${nodes.length}:${Math.floor(validEdges.length / edgeBucket)}:${preferredRootIds.join("|")}`;
+    }
     const nodeIds = nodes.map((node) => node.id).sort().join("|");
     const edgeIds = validEdges.map((edge) => edge.id).sort().join("|");
     return `${nodeIds}::${edgeIds}`;
-  }, [nodes, validEdges]);
+  }, [isRunning, nodes, preferredRootIds, validEdges]);
 
   const adjacency = useMemo(() => {
     const map = new Map<string, string[]>();
@@ -288,15 +292,32 @@ export function GraphCanvas({
       activeEdgeSet.size > 0 ||
       shortlistNodeSet.size > 0 ||
       shortlistEdgeSet.size > 0);
-  const focusPulse = useMemo(() => (Math.sin(dashOffset / 2.8) + 1) / 2, [dashOffset]);
+  const shouldPulse = isRunning && nodes.length <= 80;
+  const pulseBase = shouldPulse ? dashOffset : 0;
+  const focusPulse = useMemo(() => (Math.sin(pulseBase / 2.8) + 1) / 2, [pulseBase]);
 
   useEffect(() => {
-    if (!isRunning) return;
+    if (!shouldPulse) return;
     const timer = window.setInterval(() => {
       setDashOffset((prev) => ((prev - 1) % 80 + 80) % 80);
     }, 120);
     return () => window.clearInterval(timer);
-  }, [isRunning]);
+  }, [shouldPulse]);
+
+  const sizeScale =
+    nodes.length > 180
+      ? 0.72
+      : nodes.length > 150
+        ? 0.78
+        : nodes.length > 110
+          ? 0.86
+          : nodes.length > 80
+            ? 0.92
+            : 1;
+  const labelFontSize =
+    nodes.length > 160 ? 8 : nodes.length > 120 ? 9 : nodes.length > 90 ? 10 : 12;
+  const labelMaxWidth =
+    nodes.length > 160 ? 110 : nodes.length > 120 ? 120 : nodes.length > 90 ? 136 : 154;
 
   const autoLabelNodeIds = useMemo(() => {
     const rankBy = (type: GraphNode["type"], count: number, field: "score" | "degree") =>
@@ -310,11 +331,20 @@ export function GraphCanvas({
         .slice(0, count)
         .map((node) => node.id);
 
+    const labelBudget =
+      nodes.length > 160
+        ? { target: 4, pathway: 3, drug: 3 }
+        : nodes.length > 120
+          ? { target: 5, pathway: 4, drug: 3 }
+          : nodes.length > 90
+            ? { target: 6, pathway: 5, drug: 4 }
+            : { target: 8, pathway: 6, drug: 5 };
+
     return new Set<string>([
       ...rankBy("disease", 1, "score"),
-      ...rankBy("target", 8, "score"),
-      ...rankBy("pathway", 6, "degree"),
-      ...rankBy("drug", 5, "degree"),
+      ...rankBy("target", labelBudget.target, "score"),
+      ...rankBy("pathway", labelBudget.pathway, "degree"),
+      ...rankBy("drug", labelBudget.drug, "degree"),
     ]);
   }, [degreeMap, nodes]);
 
@@ -323,15 +353,16 @@ export function GraphCanvas({
       const labelSource = informativeNodeLabel(node);
       const shouldShowLabel =
         node.type === "disease" ||
+        node.meta.queryAnchor === true ||
         selectedNodeId === node.id ||
         activeNodeSet.has(node.id) ||
         shortlistNodeSet.has(node.id) ||
         (washedNodeIds?.has(node.id) ?? false) ||
-        (hasFocusedSubset &&
-          (node.type === "target" ||
-            (node.type === "pathway" && nodes.length <= 84))) ||
         autoLabelNodeIds.has(node.id) ||
-        (node.type !== "interaction" && nodes.length <= 16) ||
+        (nodes.length <= 110 &&
+          hasFocusedSubset &&
+          (node.type === "target" || (node.type === "pathway" && nodes.length <= 84))) ||
+        (nodes.length <= 70 && node.type !== "interaction") ||
         (node.type === "target" && nodes.length <= 36) ||
         (node.type === "pathway" && nodes.length <= 24) ||
         (node.type === "drug" && nodes.length <= 24);
@@ -361,7 +392,9 @@ export function GraphCanvas({
             labelSource,
             node.type === "target" ? 20 : node.type === "pathway" ? 34 : 28,
           ),
-          rawSize: nodeSize(node),
+          rawSize: nodeSize(node) * sizeScale,
+          fontSize: labelFontSize,
+          labelWidth: labelMaxWidth,
           color: nodeColorFor(node),
         },
         classes,
@@ -454,10 +487,10 @@ export function GraphCanvas({
           height: "data(rawSize)",
           "background-color": "data(color)",
           color: "#2f2c66",
-          "font-size": 12,
+          "font-size": "data(fontSize)",
           "font-family": "var(--font-body)",
           "text-wrap": "wrap",
-          "text-max-width": 154,
+          "text-max-width": "data(labelWidth)",
           "min-zoomed-font-size": 8,
           "text-background-color": "#ffffff",
           "text-background-opacity": 0.94,
@@ -614,7 +647,7 @@ export function GraphCanvas({
           "line-cap": "round",
           "arrow-scale": 0.9,
           "curve-style": "bezier",
-          opacity: 0.84,
+          opacity: 0.72,
           "transition-property": "line-color, target-arrow-color, width, opacity, line-style",
           "transition-duration": "220ms",
         },
@@ -735,7 +768,7 @@ export function GraphCanvas({
         style: {
           "line-style": "dashed",
           "line-dash-pattern": [9, 4],
-          "line-dash-offset": dashOffset,
+          "line-dash-offset": pulseBase,
           opacity: 0.99,
           width: 2.4 + focusPulse * 1.35,
           "line-color": "#169a5c",
@@ -745,7 +778,7 @@ export function GraphCanvas({
       {
         selector: "edge.is-faded",
         style: {
-          opacity: 0.38,
+          opacity: 0.26,
         },
       },
       {
@@ -753,9 +786,9 @@ export function GraphCanvas({
         style: {
           opacity: 0.96,
           width: "mapData(weight, 0, 1, 2, 4.6)",
-          "line-style": isRunning ? "dashed" : "solid",
-          "line-dash-pattern": isRunning ? [8, 4] : [1, 0],
-          "line-dash-offset": isRunning ? dashOffset : 0,
+          "line-style": shouldPulse ? "dashed" : "solid",
+          "line-dash-pattern": shouldPulse ? [8, 4] : [1, 0],
+          "line-dash-offset": shouldPulse ? pulseBase : 0,
           "line-color": "#4f46e5",
           "target-arrow-color": "#4f46e5",
         },
@@ -767,7 +800,7 @@ export function GraphCanvas({
           width: 2.9 + focusPulse * 1.45,
           "line-style": "dashed",
           "line-dash-pattern": [10, 4],
-          "line-dash-offset": dashOffset,
+          "line-dash-offset": pulseBase,
           "line-color": "#149558",
           "target-arrow-color": "#149558",
         },
@@ -826,7 +859,7 @@ export function GraphCanvas({
         },
       },
     ],
-    [dashOffset, focusPulse, isRunning],
+    [pulseBase, focusPulse, isRunning, shouldPulse],
   );
 
   useEffect(() => {
@@ -834,14 +867,21 @@ export function GraphCanvas({
 
     const hasMultiRoots = preferredRootIds.length > 1;
     const useBreadth = nodes.length <= 32 || (hasMultiRoots && nodes.length <= 88);
+    const animateLayout = !isRunning && nodes.length <= 120;
+    const denseGraph = nodes.length > 120;
+    const midGraph = nodes.length > 80;
+    const edgeLengthScale = denseGraph ? 1.2 : midGraph ? 1.08 : 1;
+    const repulsionScale = denseGraph ? 1.22 : midGraph ? 1.12 : 1;
+    const componentSpacing = denseGraph ? 64 : midGraph ? 52 : 42;
+    const gravity = denseGraph ? 0.38 : 0.46;
 
     const layout = cy.layout(
       useBreadth
         ? {
             name: "breadthfirst",
             directed: true,
-            animate: true,
-            animationDuration: 320,
+            animate: animateLayout,
+            animationDuration: animateLayout ? 320 : 0,
             fit: true,
             padding: 28,
             spacingFactor: hasMultiRoots ? 1.1 : 0.98,
@@ -850,26 +890,26 @@ export function GraphCanvas({
           }
         : {
             name: "cose",
-            animate: true,
-            animationDuration: 360,
+            animate: animateLayout,
+            animationDuration: animateLayout ? 360 : 0,
             fit: true,
             padding: 22,
             randomize: false,
-            gravity: 0.46,
-            componentSpacing: 42,
+            gravity,
+            componentSpacing,
             idealEdgeLength: (edge: { data: (key: string) => string }) => {
               const type = edge.data("type") as GraphEdge["type"];
-              if (type === "disease_target") return 124;
-              if (type === "target_pathway") return 108;
-              if (type === "target_drug") return 98;
-              if (type === "target_target") return 114;
-              return 102;
+              if (type === "disease_target") return 124 * edgeLengthScale;
+              if (type === "target_pathway") return 108 * edgeLengthScale;
+              if (type === "target_drug") return 98 * edgeLengthScale;
+              if (type === "target_target") return 114 * edgeLengthScale;
+              return 102 * edgeLengthScale;
             },
             nodeRepulsion: (node: { data: (key: string) => string }) => {
               const type = node.data("type") as GraphNode["type"];
-              if (type === "disease") return 128000;
-              if (type === "target") return 88000;
-              return 62000;
+              if (type === "disease") return 128000 * repulsionScale;
+              if (type === "target") return 88000 * repulsionScale;
+              return 62000 * repulsionScale;
             },
           },
     );
@@ -1172,11 +1212,11 @@ export function GraphCanvas({
     return facts;
   }, [hoveredEdge]);
 
-  const densityBoost = nodes.length > 24 ? Math.min(220, (nodes.length - 24) * 5) : 0;
-  const baseCanvasHeight = Math.max(380, Math.floor(width * 0.48) + densityBoost);
+  const densityBoost = nodes.length > 24 ? Math.min(240, (nodes.length - 24) * 5) : 0;
+  const baseCanvasHeight = Math.max(420, Math.floor(width * 0.54) + densityBoost);
   const canvasHeight = fullscreen
     ? Math.max(420, Math.floor((typeof window !== "undefined" ? window.innerHeight : 900) - 48))
-    : Math.min(760, baseCanvasHeight);
+    : Math.min(840, baseCanvasHeight);
 
   return (
     <div

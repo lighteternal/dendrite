@@ -124,6 +124,74 @@
   }
 }
 
+@keyframes tgDashFlow {
+  0% {
+    stroke-dashoffset: 0;
+  }
+  100% {
+    stroke-dashoffset: -48;
+  }
+}
+
+@keyframes tgNodePop {
+  0%,
+  100% {
+    transform: scale(0.8);
+    opacity: 0.7;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 1;
+  }
+}
+
+@keyframes tgNodeFloat {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes tgNodeBurst {
+  0% {
+    transform: scale(0.1);
+    opacity: 0;
+  }
+  40% {
+    transform: scale(1.35);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(0.9);
+    opacity: 0.7;
+  }
+}
+
+@keyframes tgEdgePulse {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes tgRingPulse {
+  0%,
+  100% {
+    stroke-opacity: 0.3;
+    transform: scale(0.95);
+  }
+  50% {
+    stroke-opacity: 0.8;
+    transform: scale(1.05);
+  }
+}
+
 .tg-wave {
   display: inline-flex;
   align-items: flex-end;
@@ -160,4 +228,43 @@
   background-size: 200% 100%;
   background-image: linear-gradient(90deg, #4f46e5 0%, #9aa5ff 45%, #4f46e5 100%);
   animation: tgShimmer 1.6s linear infinite;
+}
+
+.tg-micro-dash {
+  stroke-dasharray: 6 6;
+  stroke-linecap: round;
+  animation: tgDashFlow 2.8s linear infinite;
+  opacity: 0.85;
+}
+
+.tg-node-pop {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: tgNodePop 2.8s ease-in-out infinite;
+}
+
+.tg-node-float {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: tgNodeFloat 4s ease-in-out infinite;
+}
+
+.tg-node-burst {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: tgNodeBurst 3.2s ease-in-out infinite;
+}
+
+.tg-edge-soft {
+  opacity: 0.55;
+}
+
+.tg-edge-pulse {
+  animation: tgEdgePulse 2.6s ease-in-out infinite;
+}
+
+.tg-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: tgRingPulse 3.4s ease-in-out infinite;
 }

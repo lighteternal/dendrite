@@ -20,6 +20,7 @@ import {
   getKnownDrugsForTarget,
   searchDiseases,
   searchTargets,
+  type TargetHit,
 } from "@/server/mcp/opentargets";
 import { findPathwaysByGene } from "@/server/mcp/reactome";
 import { getInteractionNetwork } from "@/server/mcp/stringdb";
@@ -50,6 +51,41 @@ const diseaseEntityPattern = /^(EFO|MONDO|ORPHANET|DOID|HP)[_:]/i;
 const MAX_STREAM_TARGETS = 200;
 const MAX_STREAM_SEED_TARGETS = 80;
 const PATHWAYS_PER_TARGET_LIMIT = 12;
+
+function normalizeSeedTargetSymbol(raw: string): string {
+  return raw
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]/g, "");
+}
+
+function isLikelySeedTargetSymbol(raw: string): boolean {
+  const value = normalizeSeedTargetSymbol(raw);
+  if (value.length < 2 || value.length > 14) return false;
+  if (!/[A-Z]/.test(value)) return false;
+  return /^[A-Z0-9-]+$/.test(value);
+}
+
+function compactUpper(value: string): string {
+  return value.replace(/[^A-Z0-9]/g, "").toUpperCase();
+}
+
+function resolveSeedTargetHit(symbol: string, hits: TargetHit[]): TargetHit | null {
+  const normalizedSymbol = normalizeSeedTargetSymbol(symbol);
+  if (!normalizedSymbol || hits.length === 0) return null;
+  const compactSymbol = compactUpper(normalizedSymbol);
+  const exact = hits.find((hit) => {
+    const candidate = normalizeSeedTargetSymbol(hit.name);
+    return candidate === normalizedSymbol || compactUpper(candidate) === compactSymbol;
+  });
+  if (exact) return exact;
+
+  const prefixed = hits.find((hit) =>
+    normalizeSeedTargetSymbol(hit.name).startsWith(`${normalizedSymbol}-`),
+  );
+  if (prefixed && normalizedSymbol.length >= 3) return prefixed;
+  return null;
+}
 
 function normalizeApiKey(raw: string | null | undefined): string | undefined {
   const value = raw?.trim();
@@ -129,11 +165,14 @@ export async function GET(request: NextRequest) {
   const maxTargets = Number.isFinite(maxTargetsRaw)
     ? Math.max(5, Math.min(MAX_STREAM_TARGETS, Math.floor(maxTargetsRaw)))
     : 20;
-  const seedTargets = (searchParams.get("seedTargets") ?? "")
-    .split(",")
-    .map((token) => token.trim().toUpperCase())
-    .filter((token) => token.length >= 2)
-    .slice(0, MAX_STREAM_SEED_TARGETS);
+  const seedTargets = [
+    ...new Set(
+      (searchParams.get("seedTargets") ?? "")
+        .split(",")
+        .map((token) => normalizeSeedTargetSymbol(token))
+        .filter((token) => isLikelySeedTargetSymbol(token)),
+    ),
+  ].slice(0, MAX_STREAM_SEED_TARGETS);
   const includePathways = searchParams.get("pathways") !== "0";
   const includeDrugs = searchParams.get("drugs") !== "0";
   const includeInteractions = searchParams.get("interactions") !== "0";
@@ -370,26 +409,19 @@ export async function GET(request: NextRequest) {
             symbols: string[],
             fallbackAssociationScore: number,
           ) =>
-            Promise.all(
+            (
+              await Promise.all(
               symbols.map(async (symbol) => {
                 const resolved = await withTimeout(
                   searchTargets(symbol, 4),
                   Math.min(phaseTimeoutMs, 3_500),
                 ).catch(() => []);
-                const best =
-                  resolved.find((item) => item.name.toUpperCase() === symbol) ?? resolved[0];
-                if (!best) {
-                  return {
-                    targetId: `QUERY_TARGET_${symbol}`,
-                    targetSymbol: symbol,
-                    targetName: symbol,
-                    associationScore: fallbackAssociationScore,
-                  };
-                }
+                const best = resolveSeedTargetHit(symbol, resolved);
+                if (!best) return null;
 
                 return {
                   targetId: best.id,
-                  targetSymbol: symbol,
+                  targetSymbol: normalizeSeedTargetSymbol(best.name) || symbol,
                   targetName: best.name,
                   associationScore: Math.max(
                     fallbackAssociationScore,
@@ -397,7 +429,8 @@ export async function GET(request: NextRequest) {
                   ),
                 };
               }),
-            );
+              )
+            ).filter((row): row is Awaited<ReturnType<typeof getDiseaseTargetsSummary>>[number] => Boolean(row));
           try {
             targets = await withTimeout(
               getDiseaseTargetsSummary(diseaseId, Math.max(5, maxTargets)),
@@ -421,6 +454,17 @@ export async function GET(request: NextRequest) {
               seedTargets.slice(0, maxTargets),
               0.38,
             );
+            if (seededTargetRows.length === 0) {
+              emitStatus(
+                "P1",
+                "No seed symbols resolved to canonical targets",
+                23,
+                {
+                  seedTargets: seedTargets.length,
+                },
+                true,
+              );
+            }
             targets = seededTargetRows;
           } else if (targets.length > 0 && seedTargets.length > 0) {
             const existingSymbols = new Set(
@@ -461,9 +505,14 @@ export async function GET(request: NextRequest) {
             const edges: GraphEdge[] = [];
 
             for (const target of batch) {
+              const normalizedTargetSymbol = normalizeSeedTargetSymbol(
+                target.targetSymbol || target.targetName || "",
+              );
+              if (!normalizedTargetSymbol) continue;
               const targetNodeId = makeNodeId("target", target.targetId);
+              if (targetSymbolByNodeId.has(targetNodeId)) continue;
               const score = normalizeScore(target.associationScore);
-              targetSymbolByNodeId.set(targetNodeId, target.targetSymbol);
+              targetSymbolByNodeId.set(targetNodeId, normalizedTargetSymbol);
               targetNodeIds.push(targetNodeId);
               pathwaysByTargetId.set(targetNodeId, new Set<string>());
               drugsByTargetId.set(targetNodeId, new Set<string>());
@@ -473,16 +522,16 @@ export async function GET(request: NextRequest) {
                 type: "target",
                 primaryId: target.targetId,
                 label: preferredLabel(
-                  [target.targetSymbol, target.targetName],
+                  [normalizedTargetSymbol, target.targetName],
                   target.targetId,
                   24,
                 ),
                 score,
                 size: 24 + score * 30,
                 meta: {
-                  targetSymbol: target.targetSymbol,
+                  targetSymbol: normalizedTargetSymbol,
                   targetName: target.targetName,
-                  displayName: target.targetName || target.targetSymbol,
+                  displayName: target.targetName || normalizedTargetSymbol,
                   openTargetsEvidence: score,
                   stage: "P1",
                 },
@@ -1126,7 +1175,7 @@ export async function GET(request: NextRequest) {
 
           return {
             id: node?.primaryId ?? targetNodeId,
-            symbol: String(node?.label ?? targetNodeId),
+            symbol: String(node?.meta?.targetSymbol ?? node?.label ?? targetNodeId),
             pathwayIds: pathways,
             openTargetsEvidence: Number(node?.meta?.openTargetsEvidence ?? node?.score ?? 0),
             drugActionability: Math.min(1, drugs.length / 8),

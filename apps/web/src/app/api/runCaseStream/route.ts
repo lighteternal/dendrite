@@ -17,6 +17,7 @@ import {
 import { extractRelationMentionsFast } from "@/server/agent/relation-mention-extractor";
 import { type ResolvedQueryPlan } from "@/server/agent/query-plan";
 import {
+  expandDiseaseAliases,
   resolveDiseaseAlternativesLoop,
   suggestDiseaseResolverMentions,
   type DiseaseCandidate,
@@ -90,6 +91,9 @@ const DISEASE_SEARCH_TIMEOUT_MS = 20_000;
 const BUNDLED_RESOLUTION_TIMEOUT_MS = 120_000;
 const INTERNAL_STREAM_CONNECT_TIMEOUT_MS = 35_000;
 const SESSION_RUN_STALE_MS = 15 * 60 * 1000;
+const SESSION_RUN_DETACH_GRACE_MS = 10 * 60 * 1000;
+const SESSION_RUN_COMPLETED_TTL_MS = 45 * 60 * 1000;
+const SESSION_EVENT_BUFFER_LIMIT = 1_200;
 const SESSION_API_KEY_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_JOURNEY_EVENTS = 300;
 const VERCEL_MAX_DURATION_MS = 800_000;
@@ -119,23 +123,27 @@ const RUN_HARD_BUDGET_MS = Math.max(
   180_000,
   Math.min(RUN_HARD_BUDGET_LIMIT_MS, appConfig.run.hardBudgetMs),
 );
+const RUN_EXECUTION_BUDGET_MS = Math.max(
+  180_000,
+  Math.min(RUN_HARD_BUDGET_MS, 240_000),
+);
 const FINALIZATION_RESERVE_MS = Math.max(
   60_000,
   Math.min(
     appConfig.run.finalizationReserveMs,
     180_000,
-    Math.max(60_000, RUN_HARD_BUDGET_MS - 30_000),
+    Math.max(60_000, RUN_EXECUTION_BUDGET_MS - 30_000),
   ),
 );
 const DISCOVERER_TIMEOUT_CEILING_MS = Math.max(
   90_000,
-  RUN_HARD_BUDGET_MS - FINALIZATION_RESERVE_MS,
+  RUN_EXECUTION_BUDGET_MS - FINALIZATION_RESERVE_MS,
 );
 const MAX_DISCOVERER_FINAL_WAIT_MS = Math.max(
   30_000,
   Math.min(
     appConfig.run.discovererFinalWaitMs,
-    Math.max(30_000, RUN_HARD_BUDGET_MS - 15_000),
+    Math.max(30_000, RUN_EXECUTION_BUDGET_MS - 15_000),
   ),
 );
 const FALLBACK_SYNTHESIS_TIMEOUT_MS = Math.max(
@@ -146,10 +154,32 @@ const FINAL_GROUNDING_TIMEOUT_MS = Math.max(
   20_000,
   appConfig.run.finalGroundingTimeoutMs,
 );
+const SYNTHESIS_DISCOVERER_WAIT_CAP_MS = 70_000;
+const LATE_DISCOVERER_WAIT_CAP_MS = 32_000;
+const FALLBACK_SYNTHESIS_STAGE_CAP_MS = 42_000;
+const FINAL_GROUNDING_STAGE_CAP_MS = 40_000;
+const INTERNAL_CRITIQUE_STAGE_CAP_MS = 22_000;
+const SYNTHESIS_NARRATION_INTERVAL_MS = 9_000;
 const SCIENTIFIC_ANSWER_WORD_BUDGET = Math.max(
   700,
   Math.min(2200, appConfig.run.scientificAnswerWordBudget),
 );
+
+type BriefSelectionDiagnostics = {
+  anchorCoverageScore: number;
+  pathFocusConfidence: number;
+  pathFocusApplied: boolean;
+  anchorMentionCount: number;
+  anchorMentions: string[];
+  endpointAnchorTargets: string[];
+  upstreamMediatorModeApplied: boolean;
+  anchorMatchedByRecommendation: boolean;
+  recommendationAnchorMatchScore: number;
+  recommendationDrugMediatorConsistency: number;
+  recommendationNoveltyScore: number;
+  recommendationEndpointLinkScore?: number;
+  genericHubPenaltyApplied: boolean;
+};
 
 type FinalBriefSnapshot = {
   recommendation?: {
@@ -180,6 +210,16 @@ type FinalBriefSnapshot = {
     trialSnippets?: number;
   };
   threadCandidates?: MechanismThreadCandidate[];
+  selectionDiagnostics?: BriefSelectionDiagnostics;
+  nextActions?: string[];
+  queryAlignment?: {
+    status?: "matched" | "anchored" | "mismatch" | "none";
+    requestedMentions?: string[];
+    requestedTargetSymbols?: string[];
+    matchedTarget?: string;
+    baselineTop?: string;
+    note?: string;
+  };
 };
 
 type MechanismThreadCandidate = {
@@ -192,6 +232,28 @@ type MechanismThreadCandidate = {
   edgeIds: string[];
   supportScore: number;
   connectedAcrossAnchors?: boolean;
+  anchorMatchScore?: number;
+  noveltyScore?: number;
+  mediatorDrugConsistency?: number;
+  interventionReadinessScore?: number;
+  endpointLinkScore?: number;
+  genericHubPenalty?: number;
+  compositeScore?: number;
+  matchedAnchors?: string[];
+  hypothesis?: {
+    id: string;
+    statement: string;
+    chain: Array<{
+      from: string;
+      relation: string;
+      to: string;
+      edgeId: string;
+      weight: number;
+    }>;
+    evidenceScore: number;
+    falsificationChecks: string[];
+    missingLinks: string[];
+  };
 };
 
 type PathFocusSnapshot = {
@@ -203,6 +265,26 @@ type PathFocusSnapshot = {
   pathways: string[];
   drugs: string[];
   threads: MechanismThreadCandidate[];
+};
+
+type SelectionIntentSnapshot = {
+  prioritizeMediatorDiscovery: boolean;
+  prioritizeInterventionReadiness: boolean;
+  requireConnectedAnchorEvidence: boolean;
+  endpointTargetSymbols: string[];
+  objective:
+    | "mechanism_explanation"
+    | "target_nomination"
+    | "drug_prioritization"
+    | "safety_constrained_selection"
+    | "biomarker_hypothesis"
+    | "comparative_analysis"
+    | "mixed_discovery";
+  reasoningStyle: "exploratory" | "balanced" | "conservative";
+  rankingAxes: string[];
+  chainSummary: string[];
+  confidence: number;
+  rationale: string;
 };
 
 type SupplementalEvidenceCitation = {
@@ -219,11 +301,40 @@ type SupplementalEvidenceAccumulator = {
   citationKeys: Set<string>;
 };
 
+type SessionRunStatus = "running" | "completed" | "interrupted" | "errored";
+
+type SessionRunBufferedEvent = {
+  seq: number;
+  event: string;
+  data: unknown;
+  emittedAt: string;
+};
+
+type SessionRunSubscriber = {
+  id: string;
+  send: (event: string, data: unknown) => boolean;
+  close: () => void;
+};
+
 type ActiveSessionRun = {
   runId: string;
   sessionKey: string;
+  query: string;
+  mode: RunMode;
+  diseaseIdHint?: string | null;
+  diseaseNameHint?: string | null;
+  replayId?: string | null;
   startedAt: number;
+  updatedAt: number;
+  finishedAt: number | null;
+  status: SessionRunStatus;
+  detachedAt: number | null;
+  detachAbortTimer: ReturnType<typeof setTimeout> | null;
   abortController: AbortController;
+  events: SessionRunBufferedEvent[];
+  nextEventSeq: number;
+  subscribers: Map<string, SessionRunSubscriber>;
+  terminalMessage: string | null;
 };
 
 type SessionApiKeyState = {
@@ -234,6 +345,224 @@ type SessionApiKeyState = {
 const activeSessionRuns = new Map<string, ActiveSessionRun>();
 const sessionApiKeys = new Map<string, SessionApiKeyState>();
 const replayEventsCache = new Map<string, ReplayEvent[]>();
+
+function createSessionRunState(params: {
+  runId: string;
+  sessionKey: string;
+  query: string;
+  mode: RunMode;
+  diseaseIdHint?: string | null;
+  diseaseNameHint?: string | null;
+  replayId?: string | null;
+  abortController: AbortController;
+}): ActiveSessionRun {
+  const now = Date.now();
+  return {
+    runId: params.runId,
+    sessionKey: params.sessionKey,
+    query: params.query,
+    mode: params.mode,
+    diseaseIdHint: params.diseaseIdHint ?? null,
+    diseaseNameHint: params.diseaseNameHint ?? null,
+    replayId: params.replayId ?? null,
+    startedAt: now,
+    updatedAt: now,
+    finishedAt: null,
+    status: "running",
+    detachedAt: null,
+    detachAbortTimer: null,
+    abortController: params.abortController,
+    events: [],
+    nextEventSeq: 1,
+    subscribers: new Map(),
+    terminalMessage: null,
+  };
+}
+
+function clearDetachedAbortTimer(run: ActiveSessionRun): void {
+  if (run.detachAbortTimer) {
+    clearTimeout(run.detachAbortTimer);
+    run.detachAbortTimer = null;
+  }
+  run.detachedAt = null;
+}
+
+function scheduleDetachedAbort(run: ActiveSessionRun): void {
+  if (run.status !== "running") return;
+  if (run.subscribers.size > 0) {
+    clearDetachedAbortTimer(run);
+    return;
+  }
+  if (run.detachAbortTimer) return;
+
+  run.detachedAt = Date.now();
+  run.detachAbortTimer = setTimeout(() => {
+    run.detachAbortTimer = null;
+    if (run.status !== "running" || run.subscribers.size > 0) {
+      run.detachedAt = null;
+      return;
+    }
+    run.abortController.abort("session detached timeout");
+  }, SESSION_RUN_DETACH_GRACE_MS);
+}
+
+function markSessionRunStatus(
+  run: ActiveSessionRun,
+  status: SessionRunStatus,
+  terminalMessage?: string | null,
+): void {
+  run.status = status;
+  run.updatedAt = Date.now();
+  if (status === "running") {
+    run.finishedAt = null;
+    run.terminalMessage = null;
+    return;
+  }
+  if (!run.finishedAt) {
+    run.finishedAt = run.updatedAt;
+  }
+  run.terminalMessage = terminalMessage?.trim() || run.terminalMessage || null;
+  clearDetachedAbortTimer(run);
+}
+
+function appendSessionRunEvent(
+  run: ActiveSessionRun,
+  event: string,
+  data: unknown,
+): void {
+  const row: SessionRunBufferedEvent = {
+    seq: run.nextEventSeq,
+    event,
+    data,
+    emittedAt: new Date().toISOString(),
+  };
+  run.nextEventSeq += 1;
+  run.updatedAt = Date.now();
+  run.events.push(row);
+  if (run.events.length > SESSION_EVENT_BUFFER_LIMIT) {
+    run.events.splice(0, run.events.length - SESSION_EVENT_BUFFER_LIMIT);
+  }
+
+  const droppedSubscribers: string[] = [];
+  for (const [subscriberId, subscriber] of run.subscribers.entries()) {
+    const delivered = subscriber.send(event, data);
+    if (!delivered) {
+      droppedSubscribers.push(subscriberId);
+    }
+  }
+  for (const subscriberId of droppedSubscribers) {
+    const subscriber = run.subscribers.get(subscriberId);
+    run.subscribers.delete(subscriberId);
+    subscriber?.close();
+  }
+
+  if (event === "done") {
+    markSessionRunStatus(run, "completed");
+    for (const subscriber of run.subscribers.values()) {
+      subscriber.close();
+    }
+    run.subscribers.clear();
+    return;
+  }
+
+  if (
+    event === "error" ||
+    (event === "run_error" &&
+      toRecord(data)?.recoverable === false)
+  ) {
+    const payload = toRecord(data);
+    const message =
+      payload && typeof payload.message === "string" && payload.message.trim().length > 0
+        ? payload.message
+        : "run failed";
+    markSessionRunStatus(
+      run,
+      run.abortController.signal.aborted ? "interrupted" : "errored",
+      message,
+    );
+    for (const subscriber of run.subscribers.values()) {
+      subscriber.close();
+    }
+    run.subscribers.clear();
+    return;
+  }
+
+  if (run.subscribers.size === 0) {
+    scheduleDetachedAbort(run);
+  } else {
+    clearDetachedAbortTimer(run);
+  }
+}
+
+function attachRunSubscriber(
+  run: ActiveSessionRun,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+): string {
+  const subscriberId =
+    typeof crypto?.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `sub-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+
+  const send = (event: string, data: unknown): boolean => {
+    try {
+      controller.enqueue(encodeEvent(event, data));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const close = () => {
+    try {
+      controller.close();
+    } catch {
+      // no-op
+    }
+  };
+
+  for (const row of run.events) {
+    if (!send(row.event, row.data)) {
+      close();
+      return subscriberId;
+    }
+  }
+
+  if (run.status !== "running") {
+    close();
+    return subscriberId;
+  }
+
+  clearDetachedAbortTimer(run);
+  run.subscribers.set(subscriberId, {
+    id: subscriberId,
+    send,
+    close,
+  });
+
+  return subscriberId;
+}
+
+function detachRunSubscriber(run: ActiveSessionRun, subscriberId: string | null): void {
+  if (!subscriberId) return;
+  const subscriber = run.subscribers.get(subscriberId);
+  run.subscribers.delete(subscriberId);
+  subscriber?.close();
+  if (run.subscribers.size === 0) {
+    scheduleDetachedAbort(run);
+  }
+}
+
+function createRunSubscriberStream(run: ActiveSessionRun): ReadableStream<Uint8Array> {
+  let subscriberId: string | null = null;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      subscriberId = attachRunSubscriber(run, controller);
+    },
+    cancel() {
+      detachRunSubscriber(run, subscriberId);
+      subscriberId = null;
+    },
+  });
+}
 
 function normalizeApiKey(raw: string): string | null {
   const value = raw.trim();
@@ -702,8 +1031,22 @@ function resolveSessionKey(request: NextRequest, explicitSessionId?: string | nu
 
 function cleanupStaleSessionRuns(now = Date.now()) {
   for (const [sessionKey, run] of activeSessionRuns.entries()) {
-    if (now - run.startedAt > SESSION_RUN_STALE_MS) {
+    if (run.status === "running" && now - run.startedAt > SESSION_RUN_STALE_MS) {
       run.abortController.abort("stale session run");
+      markSessionRunStatus(run, "interrupted", "stale session run");
+      for (const subscriber of run.subscribers.values()) {
+        subscriber.close();
+      }
+      run.subscribers.clear();
+      clearDetachedAbortTimer(run);
+      continue;
+    }
+    if (
+      run.status !== "running" &&
+      typeof run.finishedAt === "number" &&
+      now - run.finishedAt > SESSION_RUN_COMPLETED_TTL_MS
+    ) {
+      clearDetachedAbortTimer(run);
       activeSessionRuns.delete(sessionKey);
     }
   }
@@ -716,7 +1059,17 @@ function cleanupStaleSessionRuns(now = Date.now()) {
 
 function clearSessionRunLock(sessionKey: string, runId: string) {
   const current = activeSessionRuns.get(sessionKey);
-  if (current && current.runId === runId) {
+  if (!current || current.runId !== runId) {
+    return;
+  }
+  if (current.status === "running") {
+    return;
+  }
+  if (
+    typeof current.finishedAt === "number" &&
+    Date.now() - current.finishedAt > SESSION_RUN_COMPLETED_TTL_MS
+  ) {
+    clearDetachedAbortTimer(current);
     activeSessionRuns.delete(sessionKey);
   }
 }
@@ -852,7 +1205,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 
 function remainingRunBudgetMs(startedAt: number, reserveMs = 0): number {
   const elapsed = Math.max(0, Date.now() - startedAt);
-  return Math.max(0, RUN_HARD_BUDGET_MS - elapsed - Math.max(0, reserveMs));
+  return Math.max(0, RUN_EXECUTION_BUDGET_MS - elapsed - Math.max(0, reserveMs));
 }
 
 function boundedStageTimeoutMs(
@@ -1733,15 +2086,41 @@ function buildGraphPathContext(input: {
     edgeTrail,
     connectedAcrossAnchors: Boolean(input.pathUpdate.connectedAcrossAnchors),
     unresolvedAnchorPairs: input.pathUpdate.unresolvedAnchorPairs ?? [],
-    threadCandidates: (input.pathUpdate.threadCandidates ?? []).slice(0, 3).map((thread) => ({
-      summary: sanitizePathSummaryForNarrative(thread.summary),
-      target: thread.target,
-      pathway: thread.pathway,
-      drug: thread.drug,
-      diseases: thread.diseases.slice(0, 3),
-      supportScore: thread.supportScore,
-      connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
-    })),
+    threadCandidates: (input.pathUpdate.threadCandidates ?? [])
+      .slice(0, 3)
+      .map((thread) => toThreadCandidatePromptRow(thread)),
+  };
+}
+
+function toThreadCandidatePromptRow(thread: MechanismThreadCandidate) {
+  return {
+    summary: sanitizePathSummaryForNarrative(thread.summary),
+    target: thread.target,
+    pathway: thread.pathway,
+    drug: thread.drug,
+    diseases: thread.diseases.slice(0, 3),
+    supportScore: Number(thread.supportScore.toFixed(4)),
+    connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
+    anchorMatchScore: Number((thread.anchorMatchScore ?? 0).toFixed(4)),
+    mediatorDrugConsistency: Number((thread.mediatorDrugConsistency ?? 0).toFixed(4)),
+    interventionReadinessScore: Number((thread.interventionReadinessScore ?? 0).toFixed(4)),
+    endpointLinkScore: Number((thread.endpointLinkScore ?? 0).toFixed(4)),
+    hypothesis: thread.hypothesis
+      ? {
+          id: thread.hypothesis.id,
+          statement: thread.hypothesis.statement,
+          evidenceScore: Number(thread.hypothesis.evidenceScore.toFixed(4)),
+          chain: thread.hypothesis.chain.slice(0, 5).map((step) => ({
+            from: step.from,
+            relation: step.relation,
+            to: step.to,
+            edgeId: step.edgeId,
+            weight: Number(step.weight.toFixed(4)),
+          })),
+          falsificationChecks: thread.hypothesis.falsificationChecks.slice(0, 3),
+          missingLinks: thread.hypothesis.missingLinks.slice(0, 3),
+        }
+      : null,
   };
 }
 
@@ -1755,6 +2134,8 @@ function mergeThreadCandidates(
   const push = (candidate: MechanismThreadCandidate | null | undefined) => {
     if (!candidate) return;
     const summary = sanitizePathSummaryForNarrative(candidate.summary);
+    const targetRaw = String(candidate.target ?? "").trim();
+    if (!targetRaw || /^not provided$/i.test(targetRaw)) return;
     const target = String(candidate.target ?? "").trim().toUpperCase();
     const pathway = String(candidate.pathway ?? "").trim().toUpperCase();
     const key = `${target}::${pathway}::${summary.toLowerCase()}`;
@@ -1919,16 +2300,313 @@ function collectAllowedEntityLabels(
   return ordered;
 }
 
+type GraphEntityRow = {
+  id: string;
+  type: GraphNode["type"];
+  label: string;
+  normalizedLabel: string;
+};
+
+function normalizeEntityLabelForMatch(value: string): string {
+  return clean(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function buildGraphEntityRows(nodeMap: Map<string, GraphNode>): GraphEntityRow[] {
+  const rows: GraphEntityRow[] = [];
+  for (const node of nodeMap.values()) {
+    const primary =
+      node.type === "target"
+        ? clean(String(node.meta.targetSymbol ?? node.label ?? ""))
+        : clean(String(node.meta.displayName ?? node.label ?? ""));
+    const alternates = [
+      primary,
+      clean(String(node.label ?? "")),
+      clean(String(node.meta.displayName ?? "")),
+      node.type === "target" ? clean(String(node.meta.targetSymbol ?? "")) : "",
+    ].filter(Boolean);
+    const seen = new Set<string>();
+    for (const label of alternates) {
+      const key = label.toLowerCase();
+      if (!label || seen.has(key)) continue;
+      seen.add(key);
+      const normalizedLabel = normalizeEntityLabelForMatch(label);
+      if (!normalizedLabel) continue;
+      rows.push({
+        id: node.id,
+        type: node.type,
+        label,
+        normalizedLabel,
+      });
+    }
+  }
+  return rows;
+}
+
+function matchesGraphEntityLabel(
+  mention: string,
+  graphEntities: GraphEntityRow[],
+  preferredTypes?: Array<GraphNode["type"]>,
+): boolean {
+  const normalizedMention = normalizeEntityLabelForMatch(mention);
+  if (!normalizedMention || normalizedMention.length < 3) return false;
+  for (const entity of graphEntities) {
+    if (preferredTypes && preferredTypes.length > 0 && !preferredTypes.includes(entity.type)) {
+      continue;
+    }
+    if (entity.normalizedLabel === normalizedMention) return true;
+    if (
+      entity.normalizedLabel.length >= 4 &&
+      normalizedMention.length >= 4 &&
+      (entity.normalizedLabel.includes(normalizedMention) ||
+        normalizedMention.includes(entity.normalizedLabel))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findGraphNodeIdsForLabel(
+  mention: string,
+  graphEntities: GraphEntityRow[],
+  preferredTypes?: Array<GraphNode["type"]>,
+): string[] {
+  const normalizedMention = normalizeEntityLabelForMatch(mention);
+  if (!normalizedMention || normalizedMention.length < 3) return [];
+  const ids = new Set<string>();
+  for (const entity of graphEntities) {
+    if (preferredTypes && preferredTypes.length > 0 && !preferredTypes.includes(entity.type)) {
+      continue;
+    }
+    if (
+      entity.normalizedLabel === normalizedMention ||
+      (entity.normalizedLabel.length >= 4 &&
+        normalizedMention.length >= 4 &&
+        (entity.normalizedLabel.includes(normalizedMention) ||
+          normalizedMention.includes(entity.normalizedLabel)))
+    ) {
+      ids.add(entity.id);
+    }
+  }
+  return [...ids];
+}
+
+function hasEdgeBetweenAnyNodes(
+  edgeMap: Map<string, GraphEdge>,
+  sourceIds: string[],
+  targetIds: string[],
+  allowedTypes: GraphEdge["type"][],
+): boolean {
+  if (sourceIds.length === 0 || targetIds.length === 0) return false;
+  const sourceSet = new Set(sourceIds);
+  const targetSet = new Set(targetIds);
+  for (const edge of edgeMap.values()) {
+    if (!allowedTypes.includes(edge.type)) continue;
+    if (
+      (sourceSet.has(edge.source) && targetSet.has(edge.target)) ||
+      (sourceSet.has(edge.target) && targetSet.has(edge.source))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isLikelyBiomedicalClaimMention(value: string): boolean {
+  const text = clean(value);
+  if (!text) return false;
+  if (text.length < 3 || text.length > 64) return false;
+  const tokenCount = text.split(/\s+/).filter(Boolean).length;
+  if (tokenCount === 0 || tokenCount > 6) return false;
+  if (!/[a-z]/i.test(text)) return false;
+  if (/^(?:the|and|or|with|from|into|that|which|where|when|while|during)$/i.test(text)) {
+    return false;
+  }
+  if (
+    /\b(?:pathway|signaling|signal|mechanism|mediator|disease|model|effect|outcome|targets?|drugs?)\b/i.test(
+      text,
+    ) &&
+    tokenCount <= 2
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function collectGraphNarrativeMismatches(input: {
+  answerMentions: string[];
+  brief: FinalBriefSnapshot;
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+}): {
+  unsupportedClaims: string[];
+  missingGraphEntities: string[];
+  missingGraphRelations: string[];
+} {
+  const graphEntities = buildGraphEntityRows(input.nodeMap);
+  const unsupportedClaims: string[] = [];
+  const missingGraphEntities: string[] = [];
+  const missingGraphRelations: string[] = [];
+
+  for (const mention of input.answerMentions) {
+    if (!isLikelyBiomedicalClaimMention(mention)) continue;
+    if (matchesGraphEntityLabel(mention, graphEntities)) continue;
+    if (unsupportedClaims.includes(mention)) continue;
+    unsupportedClaims.push(mention);
+    if (unsupportedClaims.length >= 8) break;
+  }
+
+  const recommendationTarget = clean(String(input.brief.recommendation?.target ?? ""));
+  const recommendationPathway = clean(String(input.brief.recommendation?.pathway ?? ""));
+  const recommendationDrug = clean(String(input.brief.recommendation?.drugHook ?? ""));
+  const requiredEntities: Array<{ label: string; type: GraphNode["type"] }> = [
+    ...(recommendationTarget && recommendationTarget !== "not provided"
+      ? [{ label: recommendationTarget, type: "target" as const }]
+      : []),
+    ...(recommendationPathway && recommendationPathway !== "not provided"
+      ? [{ label: recommendationPathway, type: "pathway" as const }]
+      : []),
+    ...(recommendationDrug && recommendationDrug !== "not provided"
+      ? [{ label: recommendationDrug, type: "drug" as const }]
+      : []),
+  ];
+
+  for (const entity of requiredEntities) {
+    if (matchesGraphEntityLabel(entity.label, graphEntities, [entity.type])) continue;
+    missingGraphEntities.push(`${entity.type}: ${entity.label}`);
+  }
+
+  const primaryThread = (input.brief.threadCandidates ?? [])[0] ?? null;
+  const recommendationTargetNormalized = normalizeTargetSymbol(recommendationTarget);
+  const primaryThreadTargetNormalized = normalizeTargetSymbol(primaryThread?.target ?? "");
+  if (
+    recommendationTargetNormalized &&
+    primaryThreadTargetNormalized &&
+    recommendationTargetNormalized !== primaryThreadTargetNormalized
+  ) {
+    unsupportedClaims.push(
+      `Recommendation target (${recommendationTarget}) does not match primary mechanism thread (${primaryThread?.target}).`,
+    );
+  }
+  if (primaryThread) {
+    const hypothesis = primaryThread.hypothesis;
+    if (!hypothesis || (hypothesis.chain ?? []).length < 2) {
+      missingGraphRelations.push(
+        `Primary mechanism thread for ${primaryThread.target} lacks an explicit multi-step graph-supported chain.`,
+      );
+    } else {
+      const pathwayNorm = clean(recommendationPathway).toLowerCase();
+      const drugNorm = clean(recommendationDrug).toLowerCase();
+      const normalizedChainTargets = hypothesis.chain
+        .map((step) => clean(step.to).toLowerCase())
+        .filter(Boolean);
+      if (
+        pathwayNorm &&
+        pathwayNorm !== "not provided" &&
+        !normalizedChainTargets.some((item) => item === pathwayNorm)
+      ) {
+        missingGraphRelations.push(
+          `Recommendation pathway (${recommendationPathway}) is not represented in the primary hypothesis chain.`,
+        );
+      }
+      if (
+        drugNorm &&
+        drugNorm !== "not provided" &&
+        !normalizedChainTargets.some((item) => item === drugNorm)
+      ) {
+        missingGraphRelations.push(
+          `Recommendation drug (${recommendationDrug}) is not represented in the primary hypothesis chain.`,
+        );
+      }
+      for (const step of hypothesis.chain.slice(0, 6)) {
+        if (!step.edgeId || !input.edgeMap.has(step.edgeId)) {
+          missingGraphRelations.push(
+            `Hypothesis step lacks supporting graph edge: ${step.from} ${step.relation} ${step.to}.`,
+          );
+        }
+      }
+    }
+  }
+
+  const targetIds = recommendationTarget
+    ? findGraphNodeIdsForLabel(recommendationTarget, graphEntities, ["target"])
+    : [];
+  const pathwayIds = recommendationPathway
+    ? findGraphNodeIdsForLabel(recommendationPathway, graphEntities, ["pathway"])
+    : [];
+  const drugIds = recommendationDrug
+    ? findGraphNodeIdsForLabel(recommendationDrug, graphEntities, ["drug"])
+    : [];
+
+  if (
+    recommendationTarget &&
+    recommendationPathway &&
+    targetIds.length > 0 &&
+    pathwayIds.length > 0 &&
+    !hasEdgeBetweenAnyNodes(input.edgeMap, targetIds, pathwayIds, ["target_pathway"])
+  ) {
+    missingGraphRelations.push(
+      `No graph edge supports target-pathway link: ${recommendationTarget} -> ${recommendationPathway}.`,
+    );
+  }
+  if (
+    recommendationTarget &&
+    recommendationDrug &&
+    targetIds.length > 0 &&
+    drugIds.length > 0 &&
+    !hasEdgeBetweenAnyNodes(input.edgeMap, targetIds, drugIds, ["target_drug"])
+  ) {
+    missingGraphRelations.push(
+      `No graph edge supports target-drug link: ${recommendationTarget} -> ${recommendationDrug}.`,
+    );
+  }
+
+  return {
+    unsupportedClaims: unsupportedClaims.slice(0, 8),
+    missingGraphEntities: missingGraphEntities.slice(0, 6),
+    missingGraphRelations: missingGraphRelations.slice(0, 6),
+  };
+}
+
 function mergePathFocusIntoBrief(
   brief: ReturnType<typeof generateBriefSections>,
   pathFocus: PathFocusSnapshot | null,
+  options?: {
+    allowConnectedPathOverride?: boolean;
+    blockedOverrideTargets?: string[];
+  },
 ): ReturnType<typeof generateBriefSections> {
   if (!pathFocus) return brief;
-  const mergedThreadCandidates = mergeThreadCandidates(
-    pathFocus.threads ?? [],
-    brief.threadCandidates ?? [],
-    3,
+  const allowConnectedPathOverride = options?.allowConnectedPathOverride ?? true;
+  const blockedOverrideTargets = new Set(
+    (options?.blockedOverrideTargets ?? []).map((value) => value.trim().toUpperCase()),
   );
+  const promoteBestNonEndpointThread = (
+    inputBrief: ReturnType<typeof generateBriefSections>,
+    threads: MechanismThreadCandidate[],
+  ): ReturnType<typeof generateBriefSections> => {
+    if (threads.length === 0 || blockedOverrideTargets.size === 0) return inputBrief;
+    const primary = threads[0]!;
+    const primaryScore = primary.compositeScore ?? primary.supportScore;
+    const fallbackIndex = threads.findIndex((candidate, index) => {
+      if (index === 0) return false;
+      const symbol = normalizeTargetSymbol(candidate.target);
+      if (!symbol || blockedOverrideTargets.has(symbol)) return false;
+      const score = candidate.compositeScore ?? candidate.supportScore;
+      return score >= primaryScore - 0.35;
+    });
+    if (fallbackIndex <= 0) return inputBrief;
+    const reordered = [
+      threads[fallbackIndex]!,
+      ...threads.filter((_, index) => index !== fallbackIndex),
+    ];
+    return applyThreadSelectionToBrief(inputBrief, reordered);
+  };
+  const mergedThreadCandidates = pathFocus.connectedAcrossAnchors
+    ? mergeThreadCandidates(pathFocus.threads ?? [], brief.threadCandidates ?? [], 3)
+    : mergeThreadCandidates(brief.threadCandidates ?? [], pathFocus.threads ?? [], 3);
   if (!pathFocus.connectedAcrossAnchors) {
     if (mergedThreadCandidates.length === 0) return brief;
     return {
@@ -1943,10 +2621,72 @@ function mergePathFocusIntoBrief(
       threadCandidates: mergedThreadCandidates,
     };
   }
+  const primaryTargetUpper = primaryTarget.toUpperCase();
+  const pathOverrideBlocked =
+    !allowConnectedPathOverride || blockedOverrideTargets.has(primaryTargetUpper);
   if (brief.recommendation.target?.toUpperCase() === primaryTarget.toUpperCase()) {
+    if (pathOverrideBlocked) {
+      const blockNote = `Connected path target (${primaryTarget}) overlaps downstream anchor markers; recommendation override suppressed for upstream-mediator intent.`;
+      const blockedThreadCandidates = mergeThreadCandidates(
+        brief.threadCandidates ?? [],
+        pathFocus.threads ?? [],
+        3,
+      );
+      const promotedBrief = promoteBestNonEndpointThread(
+        {
+          ...brief,
+          threadCandidates: blockedThreadCandidates,
+        },
+        blockedThreadCandidates,
+      );
+      return {
+        ...promotedBrief,
+        selectionDiagnostics: {
+          ...promotedBrief.selectionDiagnostics,
+          pathFocusApplied: true,
+        },
+        caveats: promotedBrief.caveats.includes(blockNote)
+          ? promotedBrief.caveats
+          : [...promotedBrief.caveats, blockNote].slice(0, 8),
+      };
+    }
     return {
       ...brief,
       threadCandidates: mergedThreadCandidates,
+      selectionDiagnostics: {
+        ...brief.selectionDiagnostics,
+        pathFocusApplied: true,
+        anchorMatchedByRecommendation: true,
+      },
+      queryAlignment: {
+        ...brief.queryAlignment,
+        matchedTarget: brief.recommendation.target,
+      },
+    };
+  }
+  if (pathOverrideBlocked) {
+    const blockNote = `Connected path target (${primaryTarget}) overlaps downstream anchor markers; recommendation override suppressed for upstream-mediator intent.`;
+    const blockedThreadCandidates = mergeThreadCandidates(
+      brief.threadCandidates ?? [],
+      pathFocus.threads ?? [],
+      3,
+    );
+    const promotedBrief = promoteBestNonEndpointThread(
+      {
+        ...brief,
+        threadCandidates: blockedThreadCandidates,
+      },
+      blockedThreadCandidates,
+    );
+    return {
+      ...promotedBrief,
+      selectionDiagnostics: {
+        ...promotedBrief.selectionDiagnostics,
+        pathFocusApplied: true,
+      },
+      caveats: promotedBrief.caveats.includes(blockNote)
+        ? promotedBrief.caveats
+        : [...promotedBrief.caveats, blockNote].slice(0, 8),
     };
   }
   const primaryPathway = pathFocus.pathways[0] ?? "not provided";
@@ -1961,6 +2701,14 @@ function mergePathFocusIntoBrief(
   return {
     ...brief,
     threadCandidates: mergedThreadCandidates,
+    selectionDiagnostics: {
+      ...brief.selectionDiagnostics,
+      pathFocusApplied: true,
+      anchorMatchedByRecommendation: true,
+      recommendationAnchorMatchScore: Number(
+        Math.max(brief.selectionDiagnostics.recommendationAnchorMatchScore, 0.65).toFixed(4),
+      ),
+    },
     recommendation: {
       ...brief.recommendation,
       target: primaryTarget,
@@ -1968,16 +2716,35 @@ function mergePathFocusIntoBrief(
       drugHook: primaryDrug,
       why: whySegments.join(" "),
     },
+    queryAlignment: {
+      ...brief.queryAlignment,
+      status: "anchored",
+      matchedTarget: primaryTarget,
+      baselineTop: brief.recommendation.target,
+      note: `Connected path focus promoted ${primaryTarget} as the final recommendation target.`,
+    },
   };
 }
 
 function alignFinalFocusThreadToPath(
   final: DiscovererFinal,
   pathFocus: PathFocusSnapshot | null,
+  options?: { allowedTargets?: string[] },
 ): DiscovererFinal {
   if (!pathFocus?.connectedAcrossAnchors) return final;
   const primaryTarget = pathFocus.targets[0];
   if (!primaryTarget) return final;
+  const allowedTargets = new Set(
+    (options?.allowedTargets ?? [])
+      .map((value) => normalizeTargetSymbol(value))
+      .filter(Boolean),
+  );
+  if (
+    allowedTargets.size > 0 &&
+    !allowedTargets.has(normalizeTargetSymbol(primaryTarget))
+  ) {
+    return final;
+  }
 
   return {
     ...final,
@@ -1986,6 +2753,49 @@ function alignFinalFocusThreadToPath(
       target: primaryTarget,
       pathway: pathFocus.pathways[0] ?? "not provided",
       drug: pathFocus.drugs[0] ?? "not provided",
+    },
+  };
+}
+
+function buildPathAlignmentAllowedTargets(input: {
+  brief: FinalBriefSnapshot;
+}): string[] {
+  const recommendationTarget = clean(String(input.brief.recommendation?.target ?? ""));
+  const mediatorEndpointMode = Boolean(
+    input.brief.selectionDiagnostics?.upstreamMediatorModeApplied &&
+      (input.brief.selectionDiagnostics?.endpointAnchorTargets?.length ?? 0) > 0,
+  );
+  if (mediatorEndpointMode) {
+    return recommendationTarget ? [recommendationTarget] : [];
+  }
+  return [
+    ...(input.brief.threadCandidates ?? []).map((thread) => clean(thread.target)),
+    recommendationTarget,
+  ].filter(Boolean);
+}
+
+function reconcileFinalFocusThreadFromBrief(
+  final: DiscovererFinal,
+  brief: FinalBriefSnapshot,
+): DiscovererFinal {
+  const target =
+    clean(String(brief.recommendation?.target ?? "")) ||
+    clean(String(final.focusThread?.target ?? "")) ||
+    "not provided";
+  const pathway =
+    clean(String(brief.recommendation?.pathway ?? "")) ||
+    clean(String(final.focusThread?.pathway ?? "")) ||
+    "not provided";
+  const drug =
+    clean(String(brief.recommendation?.drugHook ?? "")) ||
+    clean(String(final.focusThread?.drug ?? "")) ||
+    "not provided";
+  return {
+    ...final,
+    focusThread: {
+      pathway,
+      target,
+      drug,
     },
   };
 }
@@ -2133,8 +2943,12 @@ function buildScientificTemplateHintsFromDraft(input: {
   const threadHints = (input.threadCandidates ?? [])
     .map((thread, index) => {
       const summary = sanitizePathSummaryForNarrative(thread.summary);
-      if (!summary) return "";
-      return `Supported thread ${index + 1}: ${summary}.`;
+      const hypothesisStatement = clean(thread.hypothesis?.statement ?? "");
+      if (!summary && !hypothesisStatement) return "";
+      if (summary && hypothesisStatement) {
+        return `Supported thread ${index + 1}: ${summary}. Mechanistic hypothesis: ${hypothesisStatement}`;
+      }
+      return `Supported thread ${index + 1}: ${summary || hypothesisStatement}.`;
     })
     .filter(Boolean)
     .slice(0, 3);
@@ -2229,13 +3043,9 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
                       query: input.query,
                       answer: normalizedAnswer,
                       pathFocus: input.pathFocus ?? null,
-                      threadCandidates: (input.threadCandidates ?? []).slice(0, 3).map((thread) => ({
-                        summary: sanitizePathSummaryForNarrative(thread.summary),
-                        target: thread.target,
-                        pathway: thread.pathway,
-                        drug: thread.drug,
-                        diseases: thread.diseases,
-                      })),
+                      threadCandidates: (input.threadCandidates ?? [])
+                        .slice(0, 3)
+                        .map((thread) => toThreadCandidatePromptRow(thread)),
                       graphPathContext: input.graphPathContext ?? null,
                       queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
                         mention: anchor.mention,
@@ -2283,7 +3093,7 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
         synthesisClient.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 10000,
+          max_output_tokens: 4200,
           input: [
             {
               role: "system",
@@ -2328,13 +3138,9 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
                         revisionPlan: "Repair template and align claims to evidence.",
                       },
                       pathFocus: input.pathFocus ?? null,
-                      threadCandidates: (input.threadCandidates ?? []).slice(0, 3).map((thread) => ({
-                        summary: sanitizePathSummaryForNarrative(thread.summary),
-                        target: thread.target,
-                        pathway: thread.pathway,
-                        drug: thread.drug,
-                        diseases: thread.diseases,
-                      })),
+                      threadCandidates: (input.threadCandidates ?? [])
+                        .slice(0, 3)
+                        .map((thread) => toThreadCandidatePromptRow(thread)),
                       graphPathContext: input.graphPathContext ?? null,
                       allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                       queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
@@ -2367,6 +3173,954 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
   return revised;
 }
 
+type FinalClaimGateSnapshot = {
+  pass: boolean;
+  confidence: number;
+  majorMismatch: boolean;
+  unsupportedClaims: string[];
+  approvedDrugClaimIssues: string[];
+  rationale: string;
+};
+
+type GraphNarrativeGateSnapshot = {
+  pass: boolean;
+  confidence: number;
+  majorMismatch: boolean;
+  unsupportedClaims: string[];
+  missingGraphEntities: string[];
+  missingGraphRelations: string[];
+  rationale: string;
+};
+
+type BiomedicalMechanismGateSnapshot = {
+  pass: boolean;
+  confidence: number;
+  majorMismatch: boolean;
+  selectedThreadIndex: number;
+  offContextIssues: string[];
+  evidenceGapIssues: string[];
+  rationale: string;
+};
+
+type ApprovedDrugEvidenceRow = {
+  drug: string;
+  phase: number;
+  status?: string;
+  target: string;
+  source: string;
+};
+
+function computeThreadDiseaseContextScore(
+  candidate: MechanismThreadCandidate,
+  diseaseAnchors: string[],
+): number {
+  const threadDiseases = (candidate.diseases ?? [])
+    .map((value) => clean(String(value ?? "")))
+    .filter(Boolean);
+  if (threadDiseases.length === 0 || diseaseAnchors.length === 0) return 0;
+  let best = 0;
+  for (const disease of threadDiseases) {
+    for (const anchor of diseaseAnchors) {
+      best = Math.max(best, diseaseNameSimilarity(disease, anchor));
+    }
+  }
+  return clamp01(best);
+}
+
+function collectApprovedDrugEvidence(input: {
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+  limit?: number;
+}): ApprovedDrugEvidenceRow[] {
+  const limit = Math.max(1, Math.min(40, input.limit ?? 20));
+  const approved: ApprovedDrugEvidenceRow[] = [];
+  const seen = new Set<string>();
+  for (const edge of input.edgeMap.values()) {
+    if (edge.type !== "target_drug") continue;
+    const sourceName = clean(String(edge.meta?.source ?? "")) || "graph";
+    const targetNode = input.nodeMap.get(edge.source);
+    const drugNode = input.nodeMap.get(edge.target);
+    if (!targetNode || !drugNode || drugNode.type !== "drug") continue;
+    const target =
+      clean(String(targetNode.meta.targetSymbol ?? targetNode.label ?? "")) || "not provided";
+    const drug = clean(String(drugNode.meta.displayName ?? drugNode.label ?? ""));
+    if (!drug) continue;
+    const phaseRaw = Number(drugNode.meta.phase ?? Number.NaN);
+    const phase = Number.isFinite(phaseRaw) ? Math.max(0, Math.min(4, Math.floor(phaseRaw))) : 0;
+    const status = clean(String(drugNode.meta.status ?? "")) || undefined;
+    const statusSupportsApproval = Boolean(status && /\b(approved|marketed|authorized)\b/i.test(status));
+    if (!statusSupportsApproval && phase < 4) continue;
+    const key = `${drug.toLowerCase()}::${target.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    approved.push({
+      drug,
+      phase,
+      status,
+      target,
+      source: sourceName,
+    });
+    if (approved.length >= limit) break;
+  }
+  return approved;
+}
+
+async function runBiomedicalMechanismGate(input: {
+  query: string;
+  brief: GeneratedBriefSections;
+  selectedDiseaseName: string;
+  queryPlan?: ResolvedQueryPlan | null;
+  selectionIntent?: SelectionIntentSnapshot | null;
+  pathFocus?: PathFocusSnapshot | null;
+  timeoutMs: number;
+}): Promise<{
+  brief: GeneratedBriefSections;
+  gate: BiomedicalMechanismGateSnapshot;
+  changed: boolean;
+}> {
+  const fallbackGate: BiomedicalMechanismGateSnapshot = {
+    pass: true,
+    confidence: 0.56,
+    majorMismatch: false,
+    selectedThreadIndex: 0,
+    offContextIssues: [],
+    evidenceGapIssues: [],
+    rationale: "Biomedical mechanism gate unavailable; retained current recommendation.",
+  };
+  if (!input.brief.recommendation || (input.brief.threadCandidates ?? []).length === 0) {
+    return {
+      brief: input.brief,
+      gate: fallbackGate,
+      changed: false,
+    };
+  }
+
+  const timeoutMs = Math.max(4_000, Math.min(24_000, input.timeoutMs));
+  const threads = (input.brief.threadCandidates ?? []).slice(0, 3);
+  if (threads.length === 0) {
+    return {
+      brief: input.brief,
+      gate: fallbackGate,
+      changed: false,
+    };
+  }
+
+  const diseaseAnchors = [
+    clean(input.selectedDiseaseName),
+    ...(input.queryPlan?.anchors ?? [])
+      .filter((anchor) => anchor.entityType === "disease")
+      .map((anchor) => clean(anchor.name || anchor.mention))
+      .filter(Boolean),
+  ].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+
+  const endpointSet = new Set(
+    (input.selectionIntent?.endpointTargetSymbols ?? [])
+      .map((value) => normalizeTargetSymbol(String(value ?? "")))
+      .filter(Boolean),
+  );
+  const evidenceBySymbol = new Map(
+    (input.brief.evidenceTrace ?? []).map((row) => [
+      normalizeTargetSymbol(String(row.symbol ?? "")),
+      row,
+    ]),
+  );
+  const candidateRows = threads.map((thread, index) => {
+    const symbol = normalizeTargetSymbol(thread.target);
+    const trace = evidenceBySymbol.get(symbol);
+    const refs = trace?.refs ?? [];
+    const readRef = (field: string) => {
+      const ref = refs.find((item) => item.field === field);
+      return typeof ref?.value === "number" ? Number(ref.value) : 0;
+    };
+    return {
+      index,
+      summary: sanitizePathSummaryForNarrative(thread.summary),
+      target: thread.target,
+      pathway: thread.pathway,
+      drug: thread.drug,
+      diseases: thread.diseases,
+      connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
+      anchorMatchScore: Number((thread.anchorMatchScore ?? 0).toFixed(4)),
+      mediatorDrugConsistency: Number((thread.mediatorDrugConsistency ?? 0).toFixed(4)),
+      interventionReadinessScore: Number((thread.interventionReadinessScore ?? 0).toFixed(4)),
+      diseaseContextScore: Number(
+        computeThreadDiseaseContextScore(thread, diseaseAnchors).toFixed(4),
+      ),
+      isEndpointReadoutCandidate: endpointSet.has(symbol),
+      literatureSupport: Number(readRef("literatureSupport").toFixed(4)),
+      drugActionability: Number(readRef("drugActionability").toFixed(4)),
+      articleCount: Number(readRef("articleCount").toFixed(4)),
+      trialCount: Number(readRef("trialCount").toFixed(4)),
+      score: Number((trace?.score ?? thread.compositeScore ?? thread.supportScore).toFixed(4)),
+    };
+  });
+
+  const deterministicCandidateIndex = (() => {
+    const sorted = [...candidateRows].sort((left, right) => {
+      const leftComposite =
+        left.diseaseContextScore * 0.45 +
+        (left.connectedAcrossAnchors ? 0.18 : 0) +
+        left.anchorMatchScore * 0.15 +
+        left.literatureSupport * 0.1 +
+        left.drugActionability * 0.07 +
+        (input.selectionIntent?.prioritizeInterventionReadiness
+          ? left.interventionReadinessScore * 0.22
+          : left.interventionReadinessScore * 0.05) +
+        (left.isEndpointReadoutCandidate ? -0.2 : 0);
+      const rightComposite =
+        right.diseaseContextScore * 0.45 +
+        (right.connectedAcrossAnchors ? 0.18 : 0) +
+        right.anchorMatchScore * 0.15 +
+        right.literatureSupport * 0.1 +
+        right.drugActionability * 0.07 +
+        (input.selectionIntent?.prioritizeInterventionReadiness
+          ? right.interventionReadinessScore * 0.22
+          : right.interventionReadinessScore * 0.05) +
+        (right.isEndpointReadoutCandidate ? -0.2 : 0);
+      return rightComposite - leftComposite;
+    });
+    return sorted[0]?.index ?? 0;
+  })();
+
+  const client = createTrackedOpenAIClient();
+  let gate = fallbackGate;
+  let selectedThreadIndex = deterministicCandidateIndex;
+
+  if (client) {
+    const response = await withOpenAiOperationContext(
+      "run_case.biomedical_mechanism_gate",
+      () =>
+        withTimeout(
+          client.responses.create({
+            model: appConfig.openai.smallModel,
+            reasoning: { effort: "minimal" },
+            max_output_tokens: 420,
+            input: [
+              {
+                role: "system",
+                content: [
+                  {
+                    type: "input_text",
+                    text: [
+                      "You are a biomedical mechanism-validity gate for discovery answers.",
+                      "Select the strongest candidate thread for the specific disease context and requested phenotype anchors.",
+                      "If mediator discovery is prioritized, prefer upstream mechanistic mediators over endpoint/readout markers.",
+                      "If intervention readiness is prioritized or approved drugs are requested, prefer candidates with high interventionReadinessScore and specific approved drug links over generic hooks.",
+                      "Do not choose a candidate solely due to score; require disease-context coherence and mechanistic plausibility.",
+                      "Flag off-context disease drift and evidence gaps.",
+                      "Return JSON only.",
+                    ].join(" "),
+                  },
+                ],
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "input_text",
+                    text: JSON.stringify(
+                      {
+                        query: input.query,
+                        selectedDiseaseName: clean(input.selectedDiseaseName),
+                        diseaseAnchors,
+                        selectionIntent: input.selectionIntent ?? null,
+                        pathFocus: input.pathFocus
+                          ? {
+                              connectedAcrossAnchors: input.pathFocus.connectedAcrossAnchors,
+                              targets: input.pathFocus.targets.slice(0, 6),
+                              summary: sanitizePathSummaryForNarrative(input.pathFocus.summary),
+                            }
+                          : null,
+                        candidates: candidateRows,
+                        outputContract: {
+                          pass: "boolean",
+                          confidence: "0-1",
+                          majorMismatch: "boolean",
+                          selectedThreadIndex: "integer",
+                          offContextIssues: "string[]",
+                          evidenceGapIssues: "string[]",
+                          rationale: "string",
+                        },
+                      },
+                      null,
+                      2,
+                    ),
+                  },
+                ],
+              },
+            ],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "biomedical_mechanism_gate",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    pass: { type: "boolean" },
+                    confidence: { type: "number" },
+                    majorMismatch: { type: "boolean" },
+                    selectedThreadIndex: { type: "integer" },
+                    offContextIssues: {
+                      type: "array",
+                      items: { type: "string" },
+                    },
+                    evidenceGapIssues: {
+                      type: "array",
+                      items: { type: "string" },
+                    },
+                    rationale: { type: "string" },
+                  },
+                  required: [
+                    "pass",
+                    "confidence",
+                    "majorMismatch",
+                    "selectedThreadIndex",
+                    "offContextIssues",
+                    "evidenceGapIssues",
+                    "rationale",
+                  ],
+                },
+              },
+            },
+          }),
+          timeoutMs,
+        ),
+    ).catch(() => null);
+
+    if (response) {
+      const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+      const selectedRaw = Number(parsed?.selectedThreadIndex ?? Number.NaN);
+      if (
+        Number.isFinite(selectedRaw) &&
+        selectedRaw >= 0 &&
+        selectedRaw < threads.length
+      ) {
+        selectedThreadIndex = Math.floor(selectedRaw);
+      }
+      const confidenceRaw = Number(parsed?.confidence ?? Number.NaN);
+      gate = {
+        pass: Boolean(parsed?.pass),
+        confidence: clamp01(Number.isFinite(confidenceRaw) ? confidenceRaw : 0.5),
+        majorMismatch: Boolean(parsed?.majorMismatch),
+        selectedThreadIndex,
+        offContextIssues: Array.isArray(parsed?.offContextIssues)
+          ? parsed.offContextIssues
+              .map((value) => clean(String(value ?? "")))
+              .filter(Boolean)
+              .slice(0, 6)
+          : [],
+        evidenceGapIssues: Array.isArray(parsed?.evidenceGapIssues)
+          ? parsed.evidenceGapIssues
+              .map((value) => clean(String(value ?? "")))
+              .filter(Boolean)
+              .slice(0, 6)
+          : [],
+        rationale:
+          clean(String(parsed?.rationale ?? "")) || fallbackGate.rationale,
+      };
+    }
+  }
+
+  let nextBrief = input.brief;
+  let changed = false;
+  const promoteThreadAtIndex = (index: number) => {
+    const available = nextBrief.threadCandidates ?? [];
+    if (index <= 0 || index >= available.length) return;
+    const reordered = [
+      available[index]!,
+      ...available.filter((_, itemIndex) => itemIndex !== index),
+    ];
+    const beforeTarget = clean(nextBrief.recommendation?.target ?? "");
+    nextBrief = applyThreadSelectionToBrief(nextBrief, reordered);
+    const afterTarget = clean(nextBrief.recommendation?.target ?? "");
+    if (beforeTarget !== afterTarget) changed = true;
+  };
+
+  if (selectedThreadIndex > 0) {
+    promoteThreadAtIndex(selectedThreadIndex);
+  }
+
+  if (
+    input.selectionIntent?.prioritizeMediatorDiscovery &&
+    endpointSet.size > 0
+  ) {
+    const available = nextBrief.threadCandidates ?? [];
+    const currentTarget = normalizeTargetSymbol(
+      String(nextBrief.recommendation?.target ?? ""),
+    );
+    if (endpointSet.has(currentTarget)) {
+      const currentThread = available[0] ?? null;
+      const currentComposite =
+        currentThread?.compositeScore ?? currentThread?.supportScore ?? 0;
+      const nonEndpointIndex = available.findIndex((candidate) => {
+        const symbol = normalizeTargetSymbol(candidate.target);
+        if (!symbol || endpointSet.has(symbol)) return false;
+        const candidateComposite =
+          candidate.compositeScore ?? candidate.supportScore ?? 0;
+        if (candidateComposite < currentComposite - 0.35) return false;
+        if (candidateComposite >= currentComposite - 0.08) return true;
+        const contextScore = computeThreadDiseaseContextScore(candidate, diseaseAnchors);
+        return contextScore >= 0.25;
+      });
+      if (nonEndpointIndex > 0) {
+        promoteThreadAtIndex(nonEndpointIndex);
+      }
+    }
+  }
+
+  {
+    const available = nextBrief.threadCandidates ?? [];
+    if (available.length > 1) {
+      const currentContext = computeThreadDiseaseContextScore(
+        available[0]!,
+        diseaseAnchors,
+      );
+      const betterContextIndex = available.findIndex((candidate, index) => {
+        if (index === 0) return false;
+        return (
+          computeThreadDiseaseContextScore(candidate, diseaseAnchors) >=
+          currentContext + 0.25
+        );
+      });
+      if (betterContextIndex > 0) {
+        promoteThreadAtIndex(betterContextIndex);
+      }
+    }
+  }
+
+  if (input.selectionIntent?.prioritizeMediatorDiscovery) {
+    const available = nextBrief.threadCandidates ?? [];
+    if (available.length > 1) {
+      const current = available[0];
+      const currentComposite = current?.compositeScore ?? current?.supportScore ?? 0;
+      const currentContext = current
+        ? computeThreadDiseaseContextScore(current, diseaseAnchors)
+        : 0;
+      const strongerMechanisticIndex = available.findIndex((candidate, index) => {
+        if (index === 0) return false;
+        if (endpointSet.size > 0) {
+          const symbol = normalizeTargetSymbol(candidate.target);
+          if (symbol && endpointSet.has(symbol)) return false;
+        }
+        const candidateComposite = candidate.compositeScore ?? candidate.supportScore ?? 0;
+        if (candidateComposite < currentComposite + 0.2) return false;
+        const candidateContext = computeThreadDiseaseContextScore(candidate, diseaseAnchors);
+        return candidateContext >= Math.max(0.2, currentContext - 0.08);
+      });
+      if (strongerMechanisticIndex > 0) {
+        promoteThreadAtIndex(strongerMechanisticIndex);
+      }
+    }
+  }
+
+  const caveatLines = [
+    ...(gate.offContextIssues.length > 0
+      ? [`Mechanism gate flagged disease-context drift risk: ${gate.offContextIssues.slice(0, 2).join(" | ")}.`]
+      : []),
+    ...(gate.evidenceGapIssues.length > 0
+      ? [`Mechanism gate flagged evidence gaps: ${gate.evidenceGapIssues.slice(0, 2).join(" | ")}.`]
+      : []),
+  ];
+  if (caveatLines.length > 0) {
+    nextBrief = {
+      ...nextBrief,
+      caveats: [...new Set([...(nextBrief.caveats ?? []), ...caveatLines])].slice(0, 10),
+    };
+  }
+
+  return {
+    brief: nextBrief,
+    gate: {
+      ...gate,
+      selectedThreadIndex: (() => {
+        const resolvedIndex = (nextBrief.threadCandidates ?? []).findIndex(
+          (candidate) =>
+            normalizeTargetSymbol(candidate.target) ===
+            normalizeTargetSymbol(nextBrief.recommendation?.target ?? ""),
+        );
+        return resolvedIndex >= 0 ? resolvedIndex : 0;
+      })(),
+    },
+    changed,
+  };
+}
+
+async function runFinalClaimGate(input: {
+  query: string;
+  answer: string;
+  brief: FinalBriefSnapshot;
+  pathFocus?: PathFocusSnapshot | null;
+  queryPlan?: ResolvedQueryPlan | null;
+  allowedEntityLabels?: string[];
+  approvedDrugEvidence?: ApprovedDrugEvidenceRow[];
+  timeoutMs: number;
+}): Promise<{ answer: string; gate: FinalClaimGateSnapshot }> {
+  const fallbackGate: FinalClaimGateSnapshot = {
+    pass: true,
+    confidence: 0.55,
+    majorMismatch: false,
+    unsupportedClaims: [],
+    approvedDrugClaimIssues: [],
+    rationale: "Claim gate unavailable; answer retained after grounding.",
+  };
+  const normalizedAnswer = normalizeAnswerEnding(input.answer);
+  const timeoutMs = Math.max(7_000, Math.min(35_000, input.timeoutMs));
+  if (!normalizedAnswer || timeoutMs < 7_000) {
+    return {
+      answer: normalizedAnswer,
+      gate: fallbackGate,
+    };
+  }
+
+  const client = createTrackedOpenAIClient();
+  if (!client) {
+    return {
+      answer: normalizedAnswer,
+      gate: fallbackGate,
+    };
+  }
+
+  const citations = prioritizeCitationsForGrounding(input.brief.citations ?? [], input.query, 24);
+  const response = await withOpenAiOperationContext(
+    "run_case.final_claim_gate",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 1600,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "You are the final claim-verification gate before scientific answer delivery.",
+                    "Evaluate whether each major claim is supported by provided mechanism threads and citation ledger.",
+                    "Reject claims that are off-disease-context, unsupported, or overconfidently causal.",
+                    "When drug claims mention approved status, only allow this if explicitly supported by provided evidence and approvedDrugEvidence entries; otherwise downgrade claim language.",
+                    "If unsupported claims exist, produce a revised answer that removes or softens them while preserving utility.",
+                    "Keep required markdown heading template unchanged if you revise.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify(
+                    {
+                      query: input.query,
+                      answer: normalizedAnswer,
+                      recommendation: input.brief.recommendation ?? null,
+                      threadCandidates: (input.brief.threadCandidates ?? [])
+                        .slice(0, 3)
+                        .map((thread) => toThreadCandidatePromptRow(thread)),
+                      selectionDiagnostics: input.brief.selectionDiagnostics ?? null,
+                      pathFocus: input.pathFocus ?? null,
+                      queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
+                        mention: anchor.mention,
+                        entityType: anchor.entityType,
+                        requestedType: anchor.requestedType,
+                        id: anchor.id,
+                        name: anchor.name,
+                      })),
+                      allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 240),
+                      citations: citations.map((citation) => ({
+                        index: citation.index,
+                        kind: citation.kind,
+                        label: compactText(citation.label, 160),
+                        source: citation.source,
+                      })),
+                      approvedDrugEvidence: (input.approvedDrugEvidence ?? [])
+                        .slice(0, 20)
+                        .map((row) => ({
+                          drug: row.drug,
+                          phase: row.phase,
+                          status: row.status,
+                          target: row.target,
+                          source: row.source,
+                        })),
+                      outputContract: {
+                        pass: "boolean",
+                        confidence: "0-1",
+                        majorMismatch: "boolean",
+                        unsupportedClaims: "string[]",
+                        approvedDrugClaimIssues: "string[]",
+                        rationale: "string",
+                        revisedAnswer: "string",
+                      },
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "final_claim_gate",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  pass: { type: "boolean" },
+                  confidence: { type: "number" },
+                  majorMismatch: { type: "boolean" },
+                  unsupportedClaims: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  approvedDrugClaimIssues: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  rationale: { type: "string" },
+                  revisedAnswer: { type: "string" },
+                },
+                required: [
+                  "pass",
+                  "confidence",
+                  "majorMismatch",
+                  "unsupportedClaims",
+                  "approvedDrugClaimIssues",
+                  "rationale",
+                  "revisedAnswer",
+                ],
+              },
+            },
+          },
+        }),
+        timeoutMs,
+      ),
+  ).catch(() => null);
+
+  if (!response) {
+    return {
+      answer: normalizedAnswer,
+      gate: fallbackGate,
+    };
+  }
+
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const deterministicClaimIssues: string[] = [];
+  if (!hasInlineCitationMarker(normalizedAnswer)) {
+    deterministicClaimIssues.push(
+      "Final answer is missing inline numeric citations for major factual claims.",
+    );
+  }
+  const primaryThread = (input.brief.threadCandidates ?? [])[0] ?? null;
+  if (!primaryThread?.hypothesis || (primaryThread.hypothesis.chain ?? []).length < 2) {
+    deterministicClaimIssues.push(
+      "Primary mechanism thread lacks explicit chain support; causal language should remain cautious.",
+    );
+  }
+  const unsupportedClaims = [
+    ...(Array.isArray(parsed?.unsupportedClaims)
+      ? parsed.unsupportedClaims
+          .map((value) => clean(String(value ?? "")))
+          .filter(Boolean)
+      : []),
+    ...deterministicClaimIssues,
+  ]
+    .filter((value, index, all) => all.indexOf(value) === index)
+    .slice(0, 8);
+  const approvedDrugClaimIssues = Array.isArray(parsed?.approvedDrugClaimIssues)
+    ? parsed.approvedDrugClaimIssues
+        .map((value) => clean(String(value ?? "")))
+        .filter(Boolean)
+        .slice(0, 8)
+    : [];
+  const confidenceRaw = Number(parsed?.confidence ?? Number.NaN);
+  const gate: FinalClaimGateSnapshot = {
+    pass: Boolean(parsed?.pass) && unsupportedClaims.length === 0,
+    confidence: clamp01(Number.isFinite(confidenceRaw) ? confidenceRaw : 0.45),
+    majorMismatch: Boolean(parsed?.majorMismatch) || unsupportedClaims.length > 0,
+    unsupportedClaims,
+    approvedDrugClaimIssues,
+    rationale: clean(String(parsed?.rationale ?? "")) || fallbackGate.rationale,
+  };
+
+  const revisedCandidate = normalizeAnswerEnding(String(parsed?.revisedAnswer ?? ""));
+  const shouldUseRevision =
+    revisedCandidate.length > 0 &&
+    (!gate.pass || gate.majorMismatch || unsupportedClaims.length > 0 || approvedDrugClaimIssues.length > 0);
+  const revisedAnswer = shouldUseRevision ? revisedCandidate : normalizedAnswer;
+  const finalAnswer = capUncertaintySection(revisedAnswer);
+  return {
+    answer: finalAnswer || normalizedAnswer,
+    gate,
+  };
+}
+
+async function runGraphNarrativeAgreementGate(input: {
+  query: string;
+  answer: string;
+  brief: FinalBriefSnapshot;
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+  queryPlan?: ResolvedQueryPlan | null;
+  pathFocus?: PathFocusSnapshot | null;
+  timeoutMs: number;
+}): Promise<{ answer: string; gate: GraphNarrativeGateSnapshot }> {
+  const normalizedAnswer = normalizeAnswerEnding(input.answer);
+  const timeoutMs = Math.max(6_000, Math.min(30_000, input.timeoutMs));
+  const answerMentions = await extractRelationMentionsFast(normalizedAnswer, {
+    maxMentions: 12,
+    timeoutMs: 1_800,
+  }).catch(() => []);
+  const deterministic = collectGraphNarrativeMismatches({
+    answerMentions,
+    brief: input.brief,
+    nodeMap: input.nodeMap,
+    edgeMap: input.edgeMap,
+  });
+  const deterministicPass =
+    deterministic.unsupportedClaims.length === 0 &&
+    deterministic.missingGraphEntities.length === 0 &&
+    deterministic.missingGraphRelations.length === 0;
+  const fallbackGate: GraphNarrativeGateSnapshot = {
+    pass: deterministicPass,
+    confidence: deterministicPass ? 0.74 : 0.44,
+    majorMismatch:
+      deterministic.missingGraphEntities.length > 0 ||
+      deterministic.missingGraphRelations.length > 0,
+    unsupportedClaims: deterministic.unsupportedClaims.slice(0, 8),
+    missingGraphEntities: deterministic.missingGraphEntities.slice(0, 6),
+    missingGraphRelations: deterministic.missingGraphRelations.slice(0, 6),
+    rationale: deterministicPass
+      ? "Narrative entities and recommendation links are aligned with the final graph."
+      : "Narrative-graph mismatch detected by deterministic alignment checks.",
+  };
+
+  const primaryThread = (input.brief.threadCandidates ?? [])[0] ?? null;
+  const primaryChainLength = primaryThread?.hypothesis?.chain?.length ?? 0;
+  if (deterministicPass && primaryChainLength >= 2) {
+    return { answer: normalizedAnswer, gate: fallbackGate };
+  }
+
+  if (!normalizedAnswer || timeoutMs < 6_000) {
+    return { answer: normalizedAnswer, gate: fallbackGate };
+  }
+
+  const client = createTrackedOpenAIClient();
+  if (!client) {
+    return { answer: normalizedAnswer, gate: fallbackGate };
+  }
+
+  const nodeLabelById = new Map<string, string>();
+  for (const node of input.nodeMap.values()) {
+    const label =
+      node.type === "target"
+        ? clean(String(node.meta.targetSymbol ?? node.label ?? ""))
+        : clean(String(node.meta.displayName ?? node.label ?? ""));
+    nodeLabelById.set(node.id, label || node.label);
+  }
+  const graphNodeCatalog = buildGraphEntityRows(input.nodeMap)
+    .slice(0, 240)
+    .map((row) => ({
+      id: row.id,
+      type: row.type,
+      label: row.label,
+    }));
+  const graphEdgeCatalog = [...input.edgeMap.values()]
+    .slice(0, 280)
+    .map((edge) => ({
+      source: nodeLabelById.get(edge.source) ?? edge.source,
+      target: nodeLabelById.get(edge.target) ?? edge.target,
+      type: edge.type,
+    }));
+
+  const response = await withOpenAiOperationContext(
+    "run_case.graph_narrative_gate",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 1900,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "You verify final narrative consistency against the final biomedical graph.",
+                    "Only permit entities and relations present in graphNodeCatalog/graphEdgeCatalog.",
+                    "If the narrative includes unsupported entities or missing recommendation links, revise the answer to align with graph-supported evidence.",
+                    "Do not invent new graph nodes or relations.",
+                    "Preserve required scientific headings in revisedAnswer.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify(
+                    {
+                      query: input.query,
+                      answer: normalizedAnswer,
+                      recommendation: input.brief.recommendation ?? null,
+                      threadCandidates: (input.brief.threadCandidates ?? [])
+                        .slice(0, 3)
+                        .map((thread) => toThreadCandidatePromptRow(thread)),
+                      queryAnchors: (input.queryPlan?.anchors ?? []).slice(0, 8).map((anchor) => ({
+                        mention: anchor.mention,
+                        entityType: anchor.entityType,
+                        name: anchor.name,
+                      })),
+                      pathFocus: input.pathFocus
+                        ? {
+                            summary: sanitizePathSummaryForNarrative(input.pathFocus.summary),
+                            connectedAcrossAnchors: input.pathFocus.connectedAcrossAnchors,
+                            targets: input.pathFocus.targets.slice(0, 6),
+                            pathways: input.pathFocus.pathways.slice(0, 6),
+                            drugs: input.pathFocus.drugs.slice(0, 6),
+                          }
+                        : null,
+                      deterministicMismatches: deterministic,
+                      graphNodeCatalog,
+                      graphEdgeCatalog,
+                      outputContract: {
+                        pass: "boolean",
+                        confidence: "0-1",
+                        majorMismatch: "boolean",
+                        unsupportedClaims: "string[]",
+                        missingGraphEntities: "string[]",
+                        missingGraphRelations: "string[]",
+                        rationale: "string",
+                        revisedAnswer: "string",
+                      },
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "graph_narrative_gate",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  pass: { type: "boolean" },
+                  confidence: { type: "number" },
+                  majorMismatch: { type: "boolean" },
+                  unsupportedClaims: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  missingGraphEntities: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  missingGraphRelations: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  rationale: { type: "string" },
+                  revisedAnswer: { type: "string" },
+                },
+                required: [
+                  "pass",
+                  "confidence",
+                  "majorMismatch",
+                  "unsupportedClaims",
+                  "missingGraphEntities",
+                  "missingGraphRelations",
+                  "rationale",
+                  "revisedAnswer",
+                ],
+              },
+            },
+          },
+        }),
+        timeoutMs,
+      ),
+  ).catch(() => null);
+
+  if (!response) {
+    return { answer: normalizedAnswer, gate: fallbackGate };
+  }
+
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const mergeIssues = (rows: string[], extras: string[], limit: number): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const row of [...rows, ...extras]) {
+      const text = clean(String(row ?? ""));
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(text);
+      if (out.length >= limit) break;
+    }
+    return out;
+  };
+  const unsupportedClaims = mergeIssues(
+    Array.isArray(parsed?.unsupportedClaims) ? parsed.unsupportedClaims : [],
+    deterministic.unsupportedClaims,
+    8,
+  );
+  const missingGraphEntities = mergeIssues(
+    Array.isArray(parsed?.missingGraphEntities) ? parsed.missingGraphEntities : [],
+    deterministic.missingGraphEntities,
+    6,
+  );
+  const missingGraphRelations = mergeIssues(
+    Array.isArray(parsed?.missingGraphRelations) ? parsed.missingGraphRelations : [],
+    deterministic.missingGraphRelations,
+    6,
+  );
+  const confidenceRaw = Number(parsed?.confidence ?? Number.NaN);
+  const gate: GraphNarrativeGateSnapshot = {
+    pass: Boolean(parsed?.pass) && missingGraphEntities.length === 0 && missingGraphRelations.length === 0,
+    confidence: clamp01(Number.isFinite(confidenceRaw) ? confidenceRaw : fallbackGate.confidence),
+    majorMismatch:
+      Boolean(parsed?.majorMismatch) ||
+      missingGraphEntities.length > 0 ||
+      missingGraphRelations.length > 0,
+    unsupportedClaims,
+    missingGraphEntities,
+    missingGraphRelations,
+    rationale: clean(String(parsed?.rationale ?? "")) || fallbackGate.rationale,
+  };
+
+  const revisedCandidate = normalizeAnswerEnding(String(parsed?.revisedAnswer ?? ""));
+  const shouldUseRevision =
+    revisedCandidate.length > 0 &&
+    (!gate.pass ||
+      gate.majorMismatch ||
+      gate.unsupportedClaims.length > 0 ||
+      gate.missingGraphEntities.length > 0 ||
+      gate.missingGraphRelations.length > 0);
+  const revisedAnswer = shouldUseRevision ? revisedCandidate : normalizedAnswer;
+  return {
+    answer: capUncertaintySection(revisedAnswer) || normalizedAnswer,
+    gate,
+  };
+}
+
 async function groundFinalAnswerWithInlineCitations(input: {
   query: string;
   draft: DiscovererFinal;
@@ -2387,7 +4141,9 @@ async function groundFinalAnswerWithInlineCitations(input: {
     threadCandidates: input.brief.threadCandidates ?? [],
   });
   if (!synthesisClient || citations.length === 0) {
-    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null, {
+      allowedTargets: buildPathAlignmentAllowedTargets({ brief: input.brief }),
+    });
     const templated = enforceScientificTemplate(alignedDraft.answer, templateHints);
     return {
       ...alignedDraft,
@@ -2409,7 +4165,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 10000,
+            max_output_tokens: 4200,
             input: [
               {
                 role: "system",
@@ -2475,15 +4231,9 @@ async function groundFinalAnswerWithInlineCitations(input: {
                         activePathSummary: input.activePathSummary,
                         graphPathContext: input.graphPathContext ?? null,
                         pathFocus: input.pathFocus ?? null,
-                        threadCandidates: (input.brief.threadCandidates ?? []).slice(0, 3).map((thread) => ({
-                          summary: sanitizePathSummaryForNarrative(thread.summary),
-                          target: thread.target,
-                          pathway: thread.pathway,
-                          drug: thread.drug,
-                          diseases: thread.diseases,
-                          supportScore: thread.supportScore,
-                          connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
-                        })),
+                        threadCandidates: (input.brief.threadCandidates ?? [])
+                          .slice(0, 3)
+                          .map((thread) => toThreadCandidatePromptRow(thread)),
                         allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                         recommendation: input.brief.recommendation ?? null,
                         evidenceSummary: input.brief.evidenceSummary ?? null,
@@ -2514,7 +4264,9 @@ async function groundFinalAnswerWithInlineCitations(input: {
 
     let grounded = normalizeAnswerEnding(String(response.output_text ?? ""));
     if (!grounded) {
-      const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+      const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null, {
+        allowedTargets: buildPathAlignmentAllowedTargets({ brief: input.brief }),
+      });
       const templated = enforceScientificTemplate(alignedDraft.answer, templateHints);
       return {
         ...alignedDraft,
@@ -2574,7 +4326,7 @@ async function groundFinalAnswerWithInlineCitations(input: {
             synthesisClient.responses.create({
               model: appConfig.openai.smallModel,
               reasoning: { effort: "minimal" },
-              max_output_tokens: 10000,
+              max_output_tokens: 3200,
               input: [
                 {
                   role: "system",
@@ -2609,14 +4361,9 @@ async function groundFinalAnswerWithInlineCitations(input: {
                           query: input.query,
                           currentAnswer: grounded,
                           requiredPathFocus: input.pathFocus,
-                          threadCandidates: (input.brief.threadCandidates ?? []).slice(0, 3).map((thread) => ({
-                            summary: sanitizePathSummaryForNarrative(thread.summary),
-                            target: thread.target,
-                            pathway: thread.pathway,
-                            drug: thread.drug,
-                            diseases: thread.diseases,
-                            supportScore: thread.supportScore,
-                          })),
+                          threadCandidates: (input.brief.threadCandidates ?? [])
+                            .slice(0, 3)
+                            .map((thread) => toThreadCandidatePromptRow(thread)),
                           graphPathContext: input.graphPathContext ?? null,
                           allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                           recommendation: input.brief.recommendation ?? null,
@@ -2650,11 +4397,18 @@ async function groundFinalAnswerWithInlineCitations(input: {
     const critiqueBudgetMs = Math.max(
       0,
       Math.min(
+        INTERNAL_CRITIQUE_STAGE_CAP_MS,
         Math.max(12_000, Math.floor(groundingTimeoutMs * 0.45)),
         groundingTimeoutMs - elapsedMs,
       ),
     );
-    if (critiqueBudgetMs >= 12_000) {
+    const shouldRunDeepCritique =
+      critiqueBudgetMs >= 12_000 &&
+      (input.pathFocus?.connectedAcrossAnchors === true ||
+        input.brief.queryAlignment?.status === "mismatch" ||
+        (input.brief.selectionDiagnostics?.anchorCoverageScore ?? 1) < 0.75 ||
+        (input.brief.selectionDiagnostics?.recommendationAnchorMatchScore ?? 1) < 0.55);
+    if (shouldRunDeepCritique) {
       grounded = await internallyCritiqueAndReviseScientificAnswer({
         query: input.query,
         answer: grounded,
@@ -2673,14 +4427,18 @@ async function groundFinalAnswerWithInlineCitations(input: {
     if (!isScientificTemplateCompliant(grounded)) {
       grounded = enforceScientificTemplate(grounded, templateHints);
     }
-    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null, {
+      allowedTargets: buildPathAlignmentAllowedTargets({ brief: input.brief }),
+    });
     const templated = enforceScientificTemplate(grounded, templateHints);
     return {
       ...alignedDraft,
       answer: ensureInlineCitations(templated, citations, templateHints),
     };
   } catch {
-    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null);
+    const alignedDraft = alignFinalFocusThreadToPath(input.draft, input.pathFocus ?? null, {
+      allowedTargets: buildPathAlignmentAllowedTargets({ brief: input.brief }),
+    });
     const templated = enforceScientificTemplate(alignedDraft.answer, templateHints);
     return {
       ...alignedDraft,
@@ -2743,7 +4501,7 @@ async function synthesizeFallbackFinalAnswer(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 10000,
+            max_output_tokens: 4200,
             input: [
               {
                 role: "system",
@@ -2797,15 +4555,9 @@ async function synthesizeFallbackFinalAnswer(input: {
                         selectedDisease: input.selectedDiseaseName,
                         activePathSummary: input.activePathSummary,
                         pathFocus: input.pathFocus ?? null,
-                        threadCandidates: threadCandidates.map((thread) => ({
-                          summary: sanitizePathSummaryForNarrative(thread.summary),
-                          target: thread.target,
-                          pathway: thread.pathway,
-                          drug: thread.drug,
-                          diseases: thread.diseases,
-                          supportScore: thread.supportScore,
-                          connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
-                        })),
+                        threadCandidates: threadCandidates.map((thread) =>
+                          toThreadCandidatePromptRow(thread),
+                        ),
                         allowedEntityLabels: (input.allowedEntityLabels ?? []).slice(0, 220),
                         recommendation,
                         alternatives: (input.brief.alternatives ?? []).slice(0, 3),
@@ -2909,6 +4661,100 @@ async function synthesizeFallbackFinalAnswer(input: {
   }
 }
 
+function buildDeterministicFinalFromBrief(input: {
+  query: string;
+  selectedDiseaseName: string;
+  activePathSummary: string | null;
+  brief: FinalBriefSnapshot;
+  pathFocus?: PathFocusSnapshot | null;
+}): DiscovererFinal {
+  const recommendation = input.brief.recommendation ?? null;
+  const threads = (input.brief.threadCandidates ?? []).slice(0, 3);
+  const primaryThread = threads[0] ?? null;
+  const focusTarget =
+    recommendation?.target?.trim() ||
+    primaryThread?.target?.trim() ||
+    "not provided";
+  const focusPathway =
+    recommendation?.pathway?.trim() ||
+    primaryThread?.pathway?.trim() ||
+    "not provided";
+  const focusDrug =
+    recommendation?.drugHook?.trim() ||
+    primaryThread?.drug?.trim() ||
+    "not provided";
+  const citations = (input.brief.citations ?? []).slice(0, 6).map((row) => row.index);
+  const cite = (start: number, count = 2) =>
+    citations
+      .slice(start, start + count)
+      .map((index) => `[${index}]`)
+      .join("");
+  const pathSummary =
+    sanitizePathSummaryForNarrative(input.activePathSummary) ||
+    sanitizePathSummaryForNarrative(input.pathFocus?.summary) ||
+    sanitizePathSummaryForNarrative(primaryThread?.summary) ||
+    `${input.selectedDiseaseName} -> ${focusTarget}`;
+  const alternateLines = threads
+    .slice(1)
+    .map((thread, index) => {
+      const summary = sanitizePathSummaryForNarrative(thread.summary);
+      if (!summary) return "";
+      return `${index + 2}) ${summary}${cite(index + 1, 1)}`;
+    })
+    .filter(Boolean);
+  const uncertainty = prioritizeCaveatsForAnswer(input.brief.caveats ?? [], 2)
+    .filter(Boolean)
+    .slice(0, 2);
+
+  const answer = [
+    "### Working conclusion",
+    `A high-confidence mechanism thread in **${input.selectedDiseaseName}** is **${pathSummary}**, with **${focusTarget}** as the leading actionable mediator in this run${cite(0)}. Prioritize perturbation of ${focusTarget} with readouts linked to the query endpoints and compare against one alternate mediator thread to reduce nomination bias${cite(1)}.`,
+    "",
+    "### Evidence synthesis",
+    `Primary thread: ${pathSummary}${cite(0)}.`,
+    ...(alternateLines.length > 0 ? [`Alternate supported threads:`, ...alternateLines] : []),
+    `Recommendation signal: target=${focusTarget}, pathway=${focusPathway}, drug hook=${focusDrug}${cite(2)}.`,
+    "",
+    "### Biological interpretation",
+    `The graph supports a mediator-first interpretation where ${focusTarget} sits upstream of disease-relevant signaling with tractable intervention hooks. This is prioritization evidence, not standalone causal proof; causal direction should be tested experimentally in the specific model context${cite(3)}.`,
+    "",
+    "### What to test next",
+    `1. Perturb ${focusTarget} in the model and measure primary phenotype endpoints plus orthogonal stress/death markers (expected: directional rescue if mediator is causal).`,
+    `2. Run a comparator arm for the strongest alternate thread to test mechanism specificity and avoid overfitting to a single hub.`,
+    "3. Quantify pathway-proximal biomarkers and intervention response to separate upstream mediation from downstream association.",
+    "",
+    "### Residual uncertainty",
+    uncertainty.length > 0
+      ? uncertainty.map((item) => `- ${item}`).join("\n")
+      : "Evidence density varies across branches; treat the recommendation as a prioritized hypothesis pending direct perturbation validation.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return {
+    answer,
+    biomedicalCase: {
+      title: `${compactText(input.query, 96)}: deterministic synthesis fallback`,
+      whyAgentic:
+        "Primary synthesis exceeded runtime budget; generated deterministic final answer from ranked graph evidence and thread candidates.",
+    },
+    focusThread: {
+      pathway: focusPathway || "not provided",
+      target: focusTarget || "not provided",
+      drug: focusDrug || "not provided",
+    },
+    keyFindings: [
+      `Strongest thread: ${pathSummary}`,
+      `Recommendation signal: target=${focusTarget}, pathway=${focusPathway}, drug hook=${focusDrug}`,
+      ...threads
+        .slice(0, 3)
+        .map((thread, index) => `Thread ${index + 1}: ${sanitizePathSummaryForNarrative(thread.summary)}`),
+    ].filter(Boolean),
+    caveats: input.brief.caveats ?? [],
+    nextActions: input.brief.nextActions ?? [],
+  };
+}
+
 function extractDiseasePhrase(query: string): string {
   return query
     .toLowerCase()
@@ -2955,6 +4801,17 @@ function diseaseAcronym(name: string): string | null {
     .toLowerCase();
   if (acronym.length < 3) return null;
   return acronym;
+}
+
+function candidateMatchesDiseaseSeed(candidate: DiseaseCandidate, seedPhrase: string): boolean {
+  const candidateNorm = trimDiseaseNoise(candidate.name);
+  const seedNorm = trimDiseaseNoise(seedPhrase);
+  if (!candidateNorm || !seedNorm) return false;
+  if (candidateNorm.includes(seedNorm) || seedNorm.includes(candidateNorm)) return true;
+  if (tokenSetOverlapScore(candidateNorm, seedNorm) >= 0.45) return true;
+  const candidateAcronym = diseaseAcronym(candidate.name);
+  const seedTokens = new Set(tokenizeDiseaseText(seedNorm));
+  return Boolean(candidateAcronym && seedTokens.has(candidateAcronym));
 }
 
 function scoreDiseaseCandidate(query: string, candidate: DiseaseCandidate): number {
@@ -3006,6 +4863,956 @@ function rankDiseaseCandidates(
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
+}
+
+type DiseaseAnchorLockStatus = "locked" | "soft" | "failed";
+
+type DiseaseAnchorLockResult = {
+  status: DiseaseAnchorLockStatus;
+  confidence: number;
+  primaryId: string | null;
+  keepIds: string[];
+  discardIds: string[];
+  rationale: string;
+};
+
+async function lockDiseaseCandidatesToQueryContext(input: {
+  query: string;
+  candidates: DiseaseCandidate[];
+  queryPlan: ResolvedQueryPlan | null;
+  relationMentions: string[];
+  pinnedDiseaseId?: string | null;
+}): Promise<DiseaseAnchorLockResult> {
+  const trimmedPinnedDiseaseId = input.pinnedDiseaseId?.trim() || null;
+  const candidateIds = new Set(input.candidates.map((candidate) => candidate.id));
+  const defaultPrimaryId = input.candidates[0]?.id ?? null;
+  if (input.candidates.length === 0) {
+    return {
+      status: "failed",
+      confidence: 0,
+      primaryId: null,
+      keepIds: [],
+      discardIds: [],
+      rationale: "No disease candidates available for anchor lock.",
+    };
+  }
+  if (trimmedPinnedDiseaseId && candidateIds.has(trimmedPinnedDiseaseId)) {
+    const discardIds = input.candidates
+      .map((candidate) => candidate.id)
+      .filter((id) => id !== trimmedPinnedDiseaseId);
+    return {
+      status: "locked",
+      confidence: 1,
+      primaryId: trimmedPinnedDiseaseId,
+      keepIds: [trimmedPinnedDiseaseId],
+      discardIds,
+      rationale: "Disease anchor lock pinned to user-selected disease.",
+    };
+  }
+
+  const planDiseaseAnchors = (input.queryPlan?.anchors ?? [])
+    .filter((anchor) => anchor.entityType === "disease")
+    .map((anchor) => ({
+      id: anchor.id,
+      name: anchor.name,
+      mention: anchor.mention,
+      confidence: Number(anchor.confidence.toFixed(3)),
+    }));
+  const nonDiseaseAnchors = (input.queryPlan?.anchors ?? [])
+    .filter((anchor) => anchor.entityType !== "disease")
+    .slice(0, 8)
+    .map((anchor) => ({
+      entityType: anchor.entityType,
+      requestedType: anchor.requestedType,
+      mention: anchor.mention,
+      name: anchor.name,
+      confidence: Number(anchor.confidence.toFixed(3)),
+    }));
+
+  const client = createTrackedOpenAIClient();
+  if (!client) {
+    const planKeepIds = planDiseaseAnchors
+      .map((anchor) => anchor.id)
+      .filter((id) => candidateIds.has(id))
+      .slice(0, 4);
+    const keepIds = planKeepIds.length > 0 ? planKeepIds : [input.candidates[0]!.id];
+    const keepSet = new Set(keepIds);
+    return {
+      status: planKeepIds.length > 0 ? "locked" : "soft",
+      confidence: planKeepIds.length > 0 ? 0.66 : 0.4,
+      primaryId: keepIds[0] ?? defaultPrimaryId,
+      keepIds,
+      discardIds: input.candidates
+        .map((candidate) => candidate.id)
+        .filter((id) => !keepSet.has(id)),
+      rationale:
+        planKeepIds.length > 0
+          ? "Disease anchor lock used canonical plan disease anchors."
+          : "Disease anchor lock fallback kept top candidate due unavailable semantic model.",
+    };
+  }
+
+  const response = await withOpenAiOperationContext(
+    "run_case.lock_disease_anchor",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 450,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "You are validating disease anchors for biomedical discovery routing.",
+                    "Task: keep only disease candidates truly aligned with the query's disease/model context.",
+                    "Reject off-domain candidates even if they share generic terms.",
+                    "Do not keep genes, pathways, drugs, assays, cancer-only contexts, or unrelated disease domains when query context is specific.",
+                    "If confidence is high and context is specific, return status='locked'.",
+                    "If context is broad/ambiguous but still usable, return status='soft'.",
+                    "If none fit query disease context, return status='failed'.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify({
+                    query: input.query,
+                    planDiseaseAnchors,
+                    nonDiseaseAnchors,
+                    relationMentions: input.relationMentions.slice(0, 10),
+                    candidates: input.candidates.slice(0, 14).map((candidate) => ({
+                      id: candidate.id,
+                      name: candidate.name,
+                      description: candidate.description ?? "",
+                    })),
+                    outputContract: {
+                      status: "locked|soft|failed",
+                      confidence: "0-1",
+                      primaryId: "candidate id or null",
+                      keepIds: "candidate id array",
+                      discardIds: "candidate id array",
+                      rationale: "short reason",
+                    },
+                  }),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "disease_anchor_lock",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  status: {
+                    type: "string",
+                    enum: ["locked", "soft", "failed"],
+                  },
+                  confidence: {
+                    type: "number",
+                  },
+                  primaryId: {
+                    anyOf: [{ type: "string" }, { type: "null" }],
+                  },
+                  keepIds: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  discardIds: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  rationale: {
+                    type: "string",
+                  },
+                },
+                required: [
+                  "status",
+                  "confidence",
+                  "primaryId",
+                  "keepIds",
+                  "discardIds",
+                  "rationale",
+                ],
+              },
+            },
+          },
+        }),
+        8_500,
+      ),
+  ).catch(() => null);
+
+  if (!response) {
+    return {
+      status: "soft",
+      confidence: 0.42,
+      primaryId: defaultPrimaryId,
+      keepIds: [input.candidates[0]!.id],
+      discardIds: input.candidates.slice(1).map((candidate) => candidate.id),
+      rationale: "Disease anchor lock degraded due unavailable semantic lock response.",
+    };
+  }
+
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const normalizeIds = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value
+          .map((item) => String(item ?? "").trim())
+          .filter((id) => id.length > 0 && candidateIds.has(id))
+      : [];
+  const rawStatus = String(parsed?.status ?? "").trim().toLowerCase();
+  const status: DiseaseAnchorLockStatus =
+    rawStatus === "locked" || rawStatus === "soft" || rawStatus === "failed"
+      ? rawStatus
+      : "soft";
+  const keepIds = [...new Set(normalizeIds(parsed?.keepIds))];
+  const discardIds = [...new Set(normalizeIds(parsed?.discardIds))];
+  const confidenceRaw = Number(parsed?.confidence ?? Number.NaN);
+  const confidence = clamp01(Number.isFinite(confidenceRaw) ? confidenceRaw : 0.4);
+  const parsedPrimaryId = String(parsed?.primaryId ?? "").trim();
+  const primaryId =
+    (parsedPrimaryId && candidateIds.has(parsedPrimaryId) ? parsedPrimaryId : null) ??
+    keepIds[0] ??
+    defaultPrimaryId;
+
+  const keepSet = new Set(keepIds);
+  const normalizedDiscardIds = input.candidates
+    .map((candidate) => candidate.id)
+    .filter((id) => (keepSet.size > 0 ? !keepSet.has(id) : discardIds.includes(id)));
+  const rationale = clean(String(parsed?.rationale ?? ""));
+
+  if (status === "failed") {
+    return {
+      status,
+      confidence,
+      primaryId: null,
+      keepIds: [],
+      discardIds:
+        normalizedDiscardIds.length > 0
+          ? normalizedDiscardIds
+          : input.candidates.map((candidate) => candidate.id),
+      rationale: rationale || "No disease candidate aligned with query disease context.",
+    };
+  }
+
+  if (keepSet.size === 0) {
+    return {
+      status: "soft",
+      confidence: Math.min(0.45, confidence),
+      primaryId: defaultPrimaryId,
+      keepIds: [input.candidates[0]!.id],
+      discardIds: input.candidates.slice(1).map((candidate) => candidate.id),
+      rationale:
+        rationale ||
+        "Disease anchor lock produced no keep set; fallback kept top candidate.",
+    };
+  }
+
+  return {
+    status,
+    confidence,
+    primaryId,
+    keepIds,
+    discardIds: normalizedDiscardIds,
+    rationale: rationale || "Disease anchor lock retained semantically aligned candidates.",
+  };
+}
+
+type AnchorContextFilterResult = {
+  status: "kept_all" | "filtered" | "degraded";
+  confidence: number;
+  keepKeys: string[];
+  discardKeys: string[];
+  rationale: string;
+};
+
+type AnchorDiseaseRelevanceFilterResult = {
+  status: "kept_all" | "filtered" | "degraded";
+  confidence: number;
+  keepKeys: string[];
+  discardKeys: string[];
+  rationale: string;
+  diseaseTargetSymbolCount: number;
+};
+
+function anchorContextKey(anchor: ResolvedQueryPlan["anchors"][number]): string {
+  return `${anchor.entityType}:${anchor.id}:${trimDiseaseNoise(anchor.mention || anchor.name)}`;
+}
+
+function anchorHasDirectQuerySupport(query: string, mention: string, name: string): boolean {
+  const queryNorm = trimDiseaseNoise(query);
+  const mentionNorm = trimDiseaseNoise(mention);
+  const nameNorm = trimDiseaseNoise(name);
+  if (!queryNorm) return false;
+  if (mentionNorm && queryNorm.includes(mentionNorm)) return true;
+  if (nameNorm && queryNorm.includes(nameNorm)) return true;
+  const queryCompact = queryNorm.replace(/[^a-z0-9]/g, "");
+  const mentionCompact = mentionNorm.replace(/[^a-z0-9]/g, "");
+  const nameCompact = nameNorm.replace(/[^a-z0-9]/g, "");
+  if (mentionCompact.length >= 3 && queryCompact.includes(mentionCompact)) return true;
+  if (nameCompact.length >= 3 && queryCompact.includes(nameCompact)) return true;
+  return false;
+}
+
+function mentionIsGenericMechanisticConcept(mention: string): boolean {
+  const normalized = trimDiseaseNoise(mention);
+  if (!normalized) return false;
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 6) return false;
+  if (/\b(gene|protein|receptor|kinase|enzyme|channel|target)\b/i.test(normalized)) {
+    return false;
+  }
+  return /\b(cell death|mechanism|mediator|mediators|pathway|pathways|signaling|signal|response|responses|process|processes)\b/i.test(
+    normalized,
+  );
+}
+
+async function filterPlanAnchorsByQueryContext(input: {
+  query: string;
+  selectedDisease: DiseaseCandidate;
+  anchors: ResolvedQueryPlan["anchors"];
+}): Promise<AnchorContextFilterResult> {
+  const nonDiseaseAnchors = input.anchors
+    .filter((anchor) => anchor.entityType !== "disease")
+    .slice(0, 12);
+  if (nonDiseaseAnchors.length === 0) {
+    return {
+      status: "kept_all",
+      confidence: 1,
+      keepKeys: [],
+      discardKeys: [],
+      rationale: "No non-disease anchors to filter.",
+    };
+  }
+
+  const client = createTrackedOpenAIClient();
+  if (!client) {
+    return {
+      status: "degraded",
+      confidence: 0.4,
+      keepKeys: nonDiseaseAnchors.map((anchor) => anchorContextKey(anchor)),
+      discardKeys: [],
+      rationale: "Anchor context filter unavailable; retaining non-disease anchors.",
+    };
+  }
+
+  const keyedAnchors = nonDiseaseAnchors.map((anchor) => ({
+    key: anchorContextKey(anchor),
+    entityType: anchor.entityType,
+    requestedType: anchor.requestedType,
+    mention: anchor.mention,
+    id: anchor.id,
+    name: anchor.name,
+    description: anchor.description ?? "",
+    confidence: Number(anchor.confidence.toFixed(3)),
+  }));
+  const keySet = new Set(keyedAnchors.map((anchor) => anchor.key));
+
+  const response = await withOpenAiOperationContext(
+    "run_case.filter_plan_anchors_context",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 320,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Filter non-disease query anchors for biomedical mechanism discovery.",
+                    "Keep anchors that are likely true mechanistic entities in the query context.",
+                    "Discard anchors that look like assay/readout abbreviations, generic placeholders, or off-context entities.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify({
+                    query: input.query,
+                    selectedDisease: {
+                      id: input.selectedDisease.id,
+                      name: input.selectedDisease.name,
+                      description: input.selectedDisease.description ?? "",
+                    },
+                    anchors: keyedAnchors,
+                    outputContract: {
+                      status: "kept_all|filtered|degraded",
+                      confidence: "0-1",
+                      keepKeys: "array of provided keys to keep",
+                      discardKeys: "array of provided keys to discard",
+                      rationale: "short reason",
+                    },
+                  }),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "anchor_context_filter",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  status: {
+                    type: "string",
+                    enum: ["kept_all", "filtered", "degraded"],
+                  },
+                  confidence: { type: "number" },
+                  keepKeys: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  discardKeys: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  rationale: { type: "string" },
+                },
+                required: [
+                  "status",
+                  "confidence",
+                  "keepKeys",
+                  "discardKeys",
+                  "rationale",
+                ],
+              },
+            },
+          },
+        }),
+        9_000,
+      ),
+  ).catch(() => null);
+
+  if (!response) {
+    return {
+      status: "degraded",
+      confidence: 0.4,
+      keepKeys: keyedAnchors.map((anchor) => anchor.key),
+      discardKeys: [],
+      rationale: "Anchor context filter degraded due unavailable semantic validation.",
+    };
+  }
+
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const normalizeKeys = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value
+          .map((item) => String(item ?? "").trim())
+          .filter((key) => key.length > 0 && keySet.has(key))
+      : [];
+  const rawStatus = String(parsed?.status ?? "").trim().toLowerCase();
+  const status: AnchorContextFilterResult["status"] =
+    rawStatus === "kept_all" || rawStatus === "filtered" || rawStatus === "degraded"
+      ? rawStatus
+      : "degraded";
+  const confidenceRaw = Number(parsed?.confidence ?? Number.NaN);
+  const confidence = clamp01(Number.isFinite(confidenceRaw) ? confidenceRaw : 0.4);
+  const keepKeys = [...new Set(normalizeKeys(parsed?.keepKeys))];
+  const discardKeys = [...new Set(normalizeKeys(parsed?.discardKeys))];
+  const rationale = clean(String(parsed?.rationale ?? ""));
+
+  const keyedByKey = new Map(keyedAnchors.map((anchor) => [anchor.key, anchor]));
+  const refinedKeepKeys = keepKeys.filter((key) => {
+    const anchor = keyedByKey.get(key);
+    if (!anchor) return false;
+    if (anchor.entityType !== "target") return true;
+    const genericMention = mentionIsGenericMechanisticConcept(anchor.mention);
+    if (!genericMention) return true;
+    return anchorHasDirectQuerySupport(input.query, "", anchor.name);
+  });
+  const normalizedKeepKeys = refinedKeepKeys.length > 0 ? refinedKeepKeys : keepKeys;
+  const normalizedDiscardKeys = [...new Set([...discardKeys, ...keepKeys.filter((key) => !normalizedKeepKeys.includes(key))])];
+
+  if (normalizedKeepKeys.length === 0) {
+    return {
+      status: "degraded",
+      confidence: Math.min(0.45, confidence),
+      keepKeys: keyedAnchors.map((anchor) => anchor.key),
+      discardKeys: [],
+      rationale: rationale || "Anchor context filter returned no keep keys; retaining anchors.",
+    };
+  }
+
+  return {
+    status,
+    confidence,
+    keepKeys: normalizedKeepKeys,
+    discardKeys: normalizedDiscardKeys,
+    rationale: rationale || "Anchor context filter applied.",
+  };
+}
+
+async function filterTargetAnchorsByDiseaseRelevance(input: {
+  query: string;
+  selectedDisease: DiseaseCandidate;
+  anchors: ResolvedQueryPlan["anchors"];
+}): Promise<AnchorDiseaseRelevanceFilterResult> {
+  const targetAnchors = input.anchors
+    .filter((anchor) => anchor.entityType === "target")
+    .slice(0, 16);
+  if (targetAnchors.length === 0) {
+    return {
+      status: "kept_all",
+      confidence: 1,
+      keepKeys: [],
+      discardKeys: [],
+      rationale: "No target anchors to reconcile against disease context.",
+      diseaseTargetSymbolCount: 0,
+    };
+  }
+  if (!diseaseIdPattern.test(input.selectedDisease.id)) {
+    return {
+      status: "degraded",
+      confidence: 0.42,
+      keepKeys: targetAnchors.map((anchor) => anchorContextKey(anchor)),
+      discardKeys: [],
+      rationale:
+        "Selected disease anchor is synthetic; skipped disease-target relevance pruning.",
+      diseaseTargetSymbolCount: 0,
+    };
+  }
+
+  const diseaseTargetRows = await withTimeout(
+    getDiseaseTargetsSummary(input.selectedDisease.id, 220),
+    10_000,
+  ).catch(() => null);
+
+  if (!diseaseTargetRows || diseaseTargetRows.length === 0) {
+    return {
+      status: "degraded",
+      confidence: 0.46,
+      keepKeys: targetAnchors.map((anchor) => anchorContextKey(anchor)),
+      discardKeys: [],
+      rationale:
+        "Disease-target relevance check degraded; retained target anchors for recall.",
+      diseaseTargetSymbolCount: 0,
+    };
+  }
+
+  const diseaseTargetSymbols = new Set(
+    diseaseTargetRows
+      .map((row) => normalizeTargetSymbol(String(row.targetSymbol ?? "")))
+      .filter(Boolean),
+  );
+  const keepKeys: string[] = [];
+  const discardKeys: string[] = [];
+
+  for (const anchor of targetAnchors) {
+    const key = anchorContextKey(anchor);
+    const symbol = normalizeTargetSymbol(anchor.name);
+    const diseaseSupported = symbol ? diseaseTargetSymbols.has(symbol) : false;
+    const explicitSupport = anchorHasDirectQuerySupport(
+      input.query,
+      anchor.mention,
+      anchor.name,
+    );
+    const genericMention = mentionIsGenericMechanisticConcept(anchor.mention);
+    const confidentExplicit =
+      explicitSupport &&
+      anchor.confidence >= 0.72 &&
+      (anchor.requestedType === "target" ||
+        anchor.requestedType === "protein" ||
+        anchor.requestedType === "molecule");
+
+    if (diseaseSupported || (explicitSupport && !genericMention) || confidentExplicit) {
+      keepKeys.push(key);
+    } else {
+      discardKeys.push(key);
+    }
+  }
+
+  if (keepKeys.length === 0) {
+    const explicitFallback = targetAnchors
+      .filter((anchor) =>
+        anchorHasDirectQuerySupport(input.query, anchor.mention, anchor.name),
+      )
+      .map((anchor) => anchorContextKey(anchor));
+    const fallbackKeepKeys =
+      explicitFallback.length > 0
+        ? explicitFallback
+        : targetAnchors.map((anchor) => anchorContextKey(anchor));
+    return {
+      status: "degraded",
+      confidence: 0.45,
+      keepKeys: fallbackKeepKeys,
+      discardKeys: [],
+      rationale:
+        "Disease relevance pruning produced no safe keep-set; retained explicit query anchors.",
+      diseaseTargetSymbolCount: diseaseTargetSymbols.size,
+    };
+  }
+
+  return {
+    status: discardKeys.length > 0 ? "filtered" : "kept_all",
+    confidence: discardKeys.length > 0 ? 0.78 : 0.84,
+    keepKeys,
+    discardKeys,
+    rationale:
+      discardKeys.length > 0
+        ? "Pruned target anchors lacking disease-context support and direct query backing."
+        : "Target anchors retained after disease-context relevance validation.",
+    diseaseTargetSymbolCount: diseaseTargetSymbols.size,
+  };
+}
+
+async function filterDiseaseCandidatesBySemanticValidation(input: {
+  query: string;
+  candidates: DiseaseCandidate[];
+  queryPlan: ResolvedQueryPlan | null;
+}): Promise<DiseaseCandidate[]> {
+  const candidates = input.candidates.slice(0, 14);
+  if (candidates.length <= 1) return input.candidates;
+
+  const client = createTrackedOpenAIClient();
+  if (!client) return input.candidates;
+
+  const diseaseAnchors = (input.queryPlan?.anchors ?? [])
+    .filter((anchor) => anchor.entityType === "disease")
+    .slice(0, 8)
+    .map((anchor) => ({
+      id: anchor.id,
+      name: anchor.name,
+      mention: anchor.mention,
+      confidence: Number(anchor.confidence.toFixed(3)),
+    }));
+  const nonDiseaseAnchors = (input.queryPlan?.anchors ?? [])
+    .filter((anchor) => anchor.entityType !== "disease")
+    .slice(0, 8)
+    .map((anchor) => ({
+      entityType: anchor.entityType,
+      requestedType: anchor.requestedType,
+      name: anchor.name,
+      mention: anchor.mention,
+    }));
+
+  const response = await withOpenAiOperationContext(
+    "run_case.filter_disease_candidates_semantic",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 260,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Filter candidate ontology entities to those that are true diseases/conditions in the query context.",
+                    "Exclude candidates that are primarily genes/proteins, drugs/interventions, assays/readouts, or measurements.",
+                    "Preserve broad disease context when the query asks about mechanisms in a disease model.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify({
+                    query: input.query,
+                    diseaseAnchors,
+                    nonDiseaseAnchors,
+                    candidates: candidates.map((candidate) => ({
+                      id: candidate.id,
+                      name: candidate.name,
+                      description: candidate.description ?? "",
+                    })),
+                  }),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "disease_candidate_filter",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  keepIds: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                },
+                required: ["keepIds"],
+              },
+            },
+          },
+        }),
+        8_000,
+      ),
+  ).catch(() => null);
+
+  if (!response) return input.candidates;
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const keepIds = Array.isArray(parsed?.keepIds)
+    ? parsed.keepIds
+        .map((value) => String(value ?? "").trim())
+        .filter((value) => value.length > 0)
+    : [];
+  if (keepIds.length === 0) return input.candidates;
+  const keep = new Set(keepIds);
+  const filtered = input.candidates.filter((candidate) => keep.has(candidate.id));
+  if (filtered.length === 0) return input.candidates;
+
+  const planDiseaseAnchors = (input.queryPlan?.anchors ?? [])
+    .filter((anchor) => anchor.entityType === "disease")
+    .map((anchor) => ({
+      id: anchor.id,
+      name: anchor.name,
+      description: anchor.description,
+    }));
+  return mergeDiseaseCandidates(filtered, planDiseaseAnchors);
+}
+
+async function suggestDiseaseContextQueries(input: {
+  query: string;
+  queryPlan: ResolvedQueryPlan | null;
+  relationMentions: string[];
+}): Promise<string[]> {
+  const client = createTrackedOpenAIClient();
+  if (!client) return [];
+
+  const anchors = (input.queryPlan?.anchors ?? []).slice(0, 12).map((anchor) => ({
+    entityType: anchor.entityType,
+    requestedType: anchor.requestedType,
+    mention: anchor.mention,
+    name: anchor.name,
+    confidence: Number(anchor.confidence.toFixed(3)),
+  }));
+
+  const response = await withOpenAiOperationContext(
+    "run_case.suggest_disease_context_queries",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 220,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Infer disease/condition context phrases from the user query for ontology disease search.",
+                    "Return disease-condition phrases only, not genes, proteins, pathways, drugs, or assay readouts.",
+                    "Use broad but specific clinical or disease-model terms when needed.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify({
+                    query: input.query,
+                    anchors,
+                    relationMentions: input.relationMentions.slice(0, 10),
+                  }),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "disease_context_queries",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  queries: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                },
+                required: ["queries"],
+              },
+            },
+          },
+        }),
+        10_000,
+      ),
+  ).catch(() => null);
+
+  if (!response) return [];
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const rawQueries = Array.isArray(parsed?.queries) ? parsed.queries : [];
+  const normalized = rawQueries
+    .map((value) => trimDiseaseNoise(String(value ?? "")))
+    .filter((value) => value.length >= 3 && value.length <= 90);
+  return [...new Set(normalized)].slice(0, 4);
+}
+
+async function inferDiseaseSeedPhrases(query: string): Promise<string[]> {
+  const client = createTrackedOpenAIClient();
+  if (!client) return [];
+
+  const response = await withOpenAiOperationContext(
+    "run_case.infer_disease_seed_phrases",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 220,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Extract disease/condition seed phrases from a biomedical query for ontology search.",
+                    "Include disease-model names and canonical expansions of abbreviations when supported by query context.",
+                    "Exclude assay readouts, biomarkers, genes, drugs, pathways, and generic mechanism terms.",
+                    "Return only high-precision disease/condition phrases.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [{ type: "input_text", text: query }],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "disease_seed_phrases",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  phrases: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                },
+                required: ["phrases"],
+              },
+            },
+          },
+        }),
+        9_000,
+      ),
+  ).catch(() => null);
+
+  if (!response) return [];
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const rawPhrases = Array.isArray(parsed?.phrases) ? parsed.phrases : [];
+  const normalized = rawPhrases
+    .map((value) => trimDiseaseNoise(String(value ?? "")))
+    .filter((value) => value.length >= 3 && value.length <= 90);
+  return [...new Set(normalized)].slice(0, 6);
+}
+
+async function rescueDiseaseCandidatesFromQueryContext(input: {
+  query: string;
+  queryPlan: ResolvedQueryPlan | null;
+  relationMentions: string[];
+}): Promise<DiseaseCandidate[]> {
+  const queryCandidates = new Set<string>();
+  const fullQuery = trimDiseaseNoise(input.query);
+  if (allowWholeQueryDiseaseSearch(input.query) && fullQuery.length >= 3) {
+    queryCandidates.add(fullQuery);
+  }
+
+  const diseasePhrase = trimDiseaseNoise(extractDiseasePhrase(input.query));
+  if (diseasePhrase.length >= 3) {
+    queryCandidates.add(diseasePhrase);
+  }
+
+  for (const anchor of input.queryPlan?.anchors ?? []) {
+    if (anchor.entityType !== "disease") continue;
+    const mention = trimDiseaseNoise(anchor.mention || anchor.name);
+    const name = trimDiseaseNoise(anchor.name);
+    if (mention.length >= 3) queryCandidates.add(mention);
+    if (name.length >= 3) queryCandidates.add(name);
+  }
+
+  for (const mention of [
+    ...input.relationMentions,
+    ...extractDiseaseAnchorMentions(input.query),
+  ]) {
+    const normalized = trimDiseaseNoise(mention);
+    if (normalized.length >= 3) queryCandidates.add(normalized);
+  }
+
+  const aliasExpansion = await expandDiseaseAliases(input.query).catch(() => null);
+  if (aliasExpansion?.isDisease) {
+    for (const alias of aliasExpansion.aliases) {
+      const normalizedAlias = trimDiseaseNoise(alias);
+      if (normalizedAlias.length >= 3) queryCandidates.add(normalizedAlias);
+    }
+  }
+
+  const inferredSeedPhrases = await inferDiseaseSeedPhrases(input.query).catch(() => []);
+  for (const seed of inferredSeedPhrases) {
+    const normalizedSeed = trimDiseaseNoise(seed);
+    if (normalizedSeed.length >= 3) queryCandidates.add(normalizedSeed);
+  }
+
+  const modelSuggestedQueries = await suggestDiseaseContextQueries({
+    query: input.query,
+    queryPlan: input.queryPlan,
+    relationMentions: input.relationMentions,
+  }).catch(() => []);
+  for (const queryVariant of modelSuggestedQueries) {
+    const normalized = trimDiseaseNoise(queryVariant);
+    if (normalized.length >= 3) queryCandidates.add(normalized);
+  }
+
+  const orderedQueries = [...queryCandidates]
+    .filter((value) => value.length <= 120)
+    .slice(0, 10);
+  let candidates: DiseaseCandidate[] = [];
+  for (const diseaseQuery of orderedQueries) {
+    const matches = await searchDiseaseCandidates(diseaseQuery, 8, 1).catch(() => []);
+    if (matches.length > 0) {
+      candidates = mergeDiseaseCandidates(candidates, matches);
+    }
+    if (candidates.length >= 18) break;
+  }
+  return rerankDiseaseCandidates(input.query, candidates, 16);
 }
 
 function extractDiseaseAnchorMentions(query: string): string[] {
@@ -3110,18 +5917,6 @@ function allowWholeQueryDiseaseSearch(query: string): boolean {
     /\bbetween\b|\bconnect(?:ion)?\b|\brelationship\b|\brelat(?:ed|es?)\b|\blink\b|\boverlap\b|\bassociated\b|\bcorrelated\b|\bvs\b|\bversus\b/i;
   if (relationPattern.test(normalized) && tokenCount > 3) return false;
   return true;
-}
-
-function pickLiteralDiseaseCandidate(query: string, candidates: DiseaseCandidate[]): DiseaseCandidate | null {
-  const scored = rankDiseaseCandidates(query, candidates, 14);
-  const top = scored[0];
-  if (!top) return null;
-  if (top.score < 1.6) return null;
-  return {
-    id: top.id,
-    name: top.name,
-    description: top.description,
-  };
 }
 
 function toDiseaseCandidates(
@@ -4041,6 +6836,602 @@ function normalizeTargetSymbol(value: string): string {
   return value.trim().toUpperCase();
 }
 
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizeAnchorText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildQueryAnchorMentions(mentions: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const mentionRaw of mentions) {
+    const mention = normalizeAnchorText(mentionRaw);
+    if (!mention || mention.length < 3) continue;
+    if (!/[a-z]/i.test(mention)) continue;
+    if (mentionIsGenericMechanisticConcept(mention)) continue;
+    if (/^(?:approved\s+drugs?|upstream\s+mediators?|mechanistic\s+mediators?)$/i.test(mention)) {
+      continue;
+    }
+    if (seen.has(mention)) continue;
+    seen.add(mention);
+    out.push(mention);
+    if (out.length >= 18) break;
+  }
+  return out;
+}
+
+function deriveDefaultSelectionIntentFromQueryPlan(
+  queryPlan: ResolvedQueryPlan | null,
+  queryText?: string,
+): SelectionIntentSnapshot {
+  const anchors = queryPlan?.anchors ?? [];
+  const targetAnchors = anchors.filter((anchor) => anchor.entityType === "target");
+  const explicitTargetSymbols = [
+    ...new Set(
+      targetAnchors
+        .filter((anchor) =>
+          queryText
+            ? anchorHasDirectQuerySupport(queryText, anchor.mention, anchor.name)
+            : true,
+        )
+        .map((anchor) => normalizeTargetSymbol(anchor.name))
+        .filter(Boolean),
+    ),
+  ];
+  const targetSymbols = [
+    ...new Set(
+      (explicitTargetSymbols.length > 0 ? explicitTargetSymbols : targetAnchors
+        .map((anchor) => normalizeTargetSymbol(anchor.name))
+        .filter(Boolean)),
+    ),
+  ];
+  const phenotypeLikeAnchors = anchors.filter(
+    (anchor) =>
+      anchor.requestedType === "phenotype" ||
+      anchor.requestedType === "effect" ||
+      anchor.requestedType === "anatomy",
+  );
+  const hasInterventionConcept = anchors.some(
+    (anchor) =>
+      anchor.requestedType === "intervention" ||
+      anchor.requestedType === "drug" ||
+      anchor.entityType === "drug",
+  );
+  const optimizeConstraintPresent = (queryPlan?.constraints ?? []).some(
+    (constraint) => constraint.polarity === "optimize",
+  );
+  const dynamicStrategy = queryPlan?.dynamicStrategy;
+  const hasDiseaseAnchor = anchors.some((anchor) => anchor.entityType === "disease");
+  const requireConnectedAnchorEvidence =
+    anchors.length >= 2 ||
+    (queryPlan?.intent ?? "").toLowerCase().includes("multihop");
+  const prioritizeMediatorDiscovery =
+    targetSymbols.length >= 2 ||
+    (targetSymbols.length > 0 && phenotypeLikeAnchors.length > 0) ||
+    (hasDiseaseAnchor && phenotypeLikeAnchors.length > 0);
+  const objective = dynamicStrategy?.objective ?? "mixed_discovery";
+  const safetyConstrainedObjective = objective === "safety_constrained_selection";
+  const mechanismObjective = objective === "mechanism_explanation";
+  const interventionObjective = objective === "drug_prioritization";
+  const comparativeObjective = objective === "comparative_analysis";
+  const strategyMediatorBias = mechanismObjective || comparativeObjective;
+  const strategyInterventionBias = interventionObjective || safetyConstrainedObjective;
+  const endpointTargetSymbols =
+    prioritizeMediatorDiscovery && phenotypeLikeAnchors.length > 0
+      ? targetSymbols.slice(0, 6)
+      : [];
+  return {
+    prioritizeMediatorDiscovery:
+      prioritizeMediatorDiscovery || strategyMediatorBias,
+    prioritizeInterventionReadiness:
+      hasInterventionConcept || optimizeConstraintPresent || strategyInterventionBias,
+    requireConnectedAnchorEvidence:
+      requireConnectedAnchorEvidence || safetyConstrainedObjective,
+    endpointTargetSymbols,
+    objective,
+    reasoningStyle: dynamicStrategy?.reasoningStyle ?? "balanced",
+    rankingAxes:
+      (dynamicStrategy?.rankingAxes ?? []).slice(0, 8).length > 0
+        ? dynamicStrategy!.rankingAxes.slice(0, 8)
+        : [
+            "disease_context_fit",
+            "mechanistic_plausibility",
+            "cross_source_evidence",
+            "intervention_readiness",
+            "population_safety_when_relevant",
+          ],
+    chainSummary: (dynamicStrategy?.chain ?? [])
+      .slice(0, 5)
+      .map((step) => `${step.priority}. ${clean(step.goal)}`)
+      .filter(Boolean),
+    confidence: 0.58,
+    rationale:
+      dynamicStrategy?.rationale
+        ? `Default intent derived from dynamic strategy: ${compactText(dynamicStrategy.rationale, 180)}`
+        : "Default intent inferred from anchor structure: multi-target phenotype context treated as mediator-focused discovery.",
+  };
+}
+
+async function inferSelectionIntentSemantic(input: {
+  query: string;
+  queryPlan: ResolvedQueryPlan | null;
+}): Promise<SelectionIntentSnapshot> {
+  const fallback = deriveDefaultSelectionIntentFromQueryPlan(input.queryPlan, input.query);
+  const client = createTrackedOpenAIClient();
+  if (!client) return fallback;
+
+  const targetAnchors = (input.queryPlan?.anchors ?? [])
+    .filter((anchor) => anchor.entityType === "target")
+    .slice(0, 10)
+    .map((anchor) => ({
+      id: anchor.id,
+      name: anchor.name,
+      mention: anchor.mention,
+      confidence: Number(anchor.confidence.toFixed(3)),
+    }));
+
+  const phenotypeAnchors = (input.queryPlan?.anchors ?? [])
+    .filter(
+      (anchor) =>
+        anchor.requestedType === "phenotype" ||
+        anchor.requestedType === "effect" ||
+        anchor.requestedType === "anatomy",
+    )
+    .slice(0, 10)
+    .map((anchor) => ({
+      mention: anchor.mention,
+      name: anchor.name,
+      requestedType: anchor.requestedType,
+      confidence: Number(anchor.confidence.toFixed(3)),
+    }));
+
+  const response = await withOpenAiOperationContext(
+    "run_case.infer_selection_intent_semantic",
+    () =>
+      withTimeout(
+        client.responses.create({
+          model: appConfig.openai.smallModel,
+          reasoning: { effort: "minimal" },
+          max_output_tokens: 280,
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: [
+                    "Infer biomedical selection intent for mechanism discovery.",
+                    "Classify whether ranking should prioritize upstream mediators over endpoint/readout markers.",
+                    "Classify whether intervention-readiness should be prioritized.",
+                    "Classify whether cross-anchor connected evidence is required for confidence.",
+                    "Target anchors may be empty; still infer intent flags from disease/phenotype context when possible.",
+                    "For endpointTargetSymbols, return only symbols from provided targetAnchors that are endpoint/readout markers in this query context.",
+                    "Do not invent symbols outside provided targetAnchors.",
+                    "Return JSON only.",
+                  ].join(" "),
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify({
+                    query: input.query,
+                    intent: input.queryPlan?.intent ?? "",
+                    constraints: (input.queryPlan?.constraints ?? []).slice(0, 8),
+                    targetAnchors,
+                    phenotypeAnchors,
+                    outputContract: {
+                      prioritizeMediatorDiscovery: "boolean",
+                      prioritizeInterventionReadiness: "boolean",
+                      requireConnectedAnchorEvidence: "boolean",
+                      endpointTargetSymbols: "string[] subset of target anchor symbols",
+                      confidence: "0-1",
+                      rationale: "string",
+                    },
+                  }),
+                },
+              ],
+            },
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "selection_intent",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  prioritizeMediatorDiscovery: { type: "boolean" },
+                  prioritizeInterventionReadiness: { type: "boolean" },
+                  requireConnectedAnchorEvidence: { type: "boolean" },
+                  endpointTargetSymbols: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  confidence: { type: "number" },
+                  rationale: { type: "string" },
+                },
+                required: [
+                  "prioritizeMediatorDiscovery",
+                  "prioritizeInterventionReadiness",
+                  "requireConnectedAnchorEvidence",
+                  "endpointTargetSymbols",
+                  "confidence",
+                  "rationale",
+                ],
+              },
+            },
+          },
+        }),
+        9_000,
+      ),
+  ).catch(() => null);
+  if (!response) return fallback;
+
+  const parsed = parseModelJsonObject(String(response.output_text ?? ""));
+  const allowedTargetSymbols = new Set(
+    targetAnchors
+      .map((anchor) => normalizeTargetSymbol(anchor.name))
+      .filter(Boolean),
+  );
+  const parsedEndpointTargetSymbols = Array.isArray(parsed?.endpointTargetSymbols)
+    ? [...new Set(
+        parsed.endpointTargetSymbols
+          .map((value) => normalizeTargetSymbol(String(value ?? "")))
+          .filter((value) => value.length > 0 && allowedTargetSymbols.has(value)),
+      )].slice(0, 12)
+    : [];
+  const explicitTargetSymbolSet = new Set(
+    targetAnchors
+      .filter((anchor) =>
+        anchorHasDirectQuerySupport(input.query, anchor.mention, anchor.name),
+      )
+      .map((anchor) => normalizeTargetSymbol(anchor.name))
+      .filter(Boolean),
+  );
+  const endpointTargetSymbolsRaw =
+    parsedEndpointTargetSymbols.length > 0
+      ? parsedEndpointTargetSymbols
+      : fallback.endpointTargetSymbols;
+  const endpointTargetSymbols =
+    explicitTargetSymbolSet.size > 0
+      ? endpointTargetSymbolsRaw
+          .filter((symbol) => explicitTargetSymbolSet.has(symbol))
+          .slice(0, 12)
+      : endpointTargetSymbolsRaw;
+  const confidenceRaw = Number(parsed?.confidence ?? Number.NaN);
+  const confidence = clamp01(Number.isFinite(confidenceRaw) ? confidenceRaw : fallback.confidence);
+  const parsedMediatorPriority = Boolean(parsed?.prioritizeMediatorDiscovery);
+  const parsedInterventionPriority = Boolean(parsed?.prioritizeInterventionReadiness);
+  const parsedConnectedEvidence = Boolean(parsed?.requireConnectedAnchorEvidence);
+  const dynamicStrategy = input.queryPlan?.dynamicStrategy ?? null;
+  const strategyRankingAxes = (dynamicStrategy?.rankingAxes ?? []).slice(0, 8);
+  const strategyChainSummary = (dynamicStrategy?.chain ?? [])
+    .slice(0, 5)
+    .map((step) => `${step.priority}. ${clean(step.goal)}`)
+    .filter(Boolean);
+
+  return {
+    prioritizeMediatorDiscovery:
+      parsedMediatorPriority || fallback.prioritizeMediatorDiscovery,
+    prioritizeInterventionReadiness:
+      parsedInterventionPriority || fallback.prioritizeInterventionReadiness,
+    requireConnectedAnchorEvidence:
+      parsedConnectedEvidence || fallback.requireConnectedAnchorEvidence,
+    endpointTargetSymbols,
+    objective: dynamicStrategy?.objective ?? fallback.objective,
+    reasoningStyle: dynamicStrategy?.reasoningStyle ?? fallback.reasoningStyle,
+    rankingAxes: strategyRankingAxes.length > 0 ? strategyRankingAxes : fallback.rankingAxes,
+    chainSummary: strategyChainSummary.length > 0 ? strategyChainSummary : fallback.chainSummary,
+    confidence,
+    rationale:
+      clean(String(parsed?.rationale ?? "")) ||
+      fallback.rationale,
+  };
+}
+
+function buildPathFocusMergeOptions(input: {
+  selectionIntent: SelectionIntentSnapshot | null;
+  pathFocusTargetSymbols?: string[];
+}): {
+  allowConnectedPathOverride: boolean;
+  blockedOverrideTargets: string[];
+  endpointAnchorTargets: string[];
+} {
+  const endpointAnchorTargets = [
+    ...new Set(
+      (input.selectionIntent?.endpointTargetSymbols ?? [])
+        .map((value) => normalizeTargetSymbol(value))
+        .filter(Boolean),
+    ),
+  ];
+  const prioritizeMediatorDiscovery = Boolean(
+    input.selectionIntent?.prioritizeMediatorDiscovery,
+  );
+  const strictMediatorNoEndpointMode =
+    prioritizeMediatorDiscovery && endpointAnchorTargets.length === 0;
+  const pathFocusSet = new Set(
+    (input.pathFocusTargetSymbols ?? [])
+      .map((value) => normalizeTargetSymbol(value))
+      .filter(Boolean),
+  );
+  const allowConnectedPathOverrideByEndpoint = !endpointAnchorTargets.some((symbol) =>
+    pathFocusSet.has(symbol),
+  );
+  const allowConnectedPathOverride = strictMediatorNoEndpointMode
+    ? false
+    : prioritizeMediatorDiscovery
+      ? allowConnectedPathOverrideByEndpoint
+      : true;
+  return {
+    allowConnectedPathOverride,
+    blockedOverrideTargets: prioritizeMediatorDiscovery ? endpointAnchorTargets : [],
+    endpointAnchorTargets,
+  };
+}
+
+function readEvidenceRefNumber(
+  row: RankingResponse["rankedTargets"][number] | undefined,
+  field: string,
+): number {
+  const ref = row?.evidenceRefs.find((item) => item.field === field);
+  return typeof ref?.value === "number" ? clamp01(ref.value) : 0;
+}
+
+function computeTargetNoveltyScore(
+  row: RankingResponse["rankedTargets"][number] | undefined,
+): number {
+  const networkCentrality = readEvidenceRefNumber(row, "networkCentrality");
+  const literatureSupport = readEvidenceRefNumber(row, "literatureSupport");
+  const drugActionability = readEvidenceRefNumber(row, "drugActionability");
+  return clamp01(
+    (1 - networkCentrality) * 0.55 + literatureSupport * 0.25 + drugActionability * 0.2,
+  );
+}
+
+function computeThreadAnchorMatch(
+  candidate: MechanismThreadCandidate,
+  anchorMentions: string[],
+): { score: number; matched: string[] } {
+  if (anchorMentions.length === 0) {
+    return { score: 0, matched: [] };
+  }
+  const haystack = normalizeAnchorText(
+    [
+      candidate.summary,
+      candidate.target,
+      candidate.pathway,
+      candidate.drug,
+      ...candidate.diseases,
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+  if (!haystack) {
+    return { score: 0, matched: [] };
+  }
+
+  const haystackTokens = new Set(haystack.split(" ").filter(Boolean));
+  const matched: string[] = [];
+  for (const mention of anchorMentions) {
+    if (!mention) continue;
+    const mentionTokens = mention.split(" ").filter(Boolean);
+    if (mentionTokens.length === 1) {
+      if (haystackTokens.has(mentionTokens[0]!)) {
+        matched.push(mention);
+      }
+      continue;
+    }
+    if (haystack.includes(mention)) {
+      matched.push(mention);
+    }
+  }
+
+  const denominator = Math.max(1, Math.min(anchorMentions.length, 5));
+  return {
+    score: clamp01(matched.length / denominator),
+    matched: matched.slice(0, 6),
+  };
+}
+
+function computeThreadMediatorDrugConsistency(input: {
+  candidate: MechanismThreadCandidate;
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+}): number {
+  const isGenericDrugHook = (value: string): boolean => {
+    const label = clean(value).toLowerCase();
+    if (!label || label === "not provided") return true;
+    if (/^\d+\s+compounds?$/.test(label)) return true;
+    return /\bcompounds?\b/.test(label) && /\d+/.test(label);
+  };
+  const targetSymbol = input.candidate.target.trim().toUpperCase();
+  if (!targetSymbol || targetSymbol === "NOT PROVIDED") return 0;
+  const targetNode = findTargetNodeBySymbol(input.nodeMap, targetSymbol);
+  const genericDrugHook = isGenericDrugHook(input.candidate.drug);
+  if (!targetNode) return input.candidate.drug !== "not provided" ? 0.4 : 0.2;
+  const hasDrugEdge = [...input.edgeMap.values()].some(
+    (edge) => edge.type === "target_drug" && edge.source === targetNode.id,
+  );
+  if (hasDrugEdge) {
+    if (genericDrugHook) return 0.52;
+    return input.candidate.drug !== "not provided" ? 1 : 0.72;
+  }
+  if (genericDrugHook) return 0.2;
+  return input.candidate.drug !== "not provided" ? 0.55 : 0.25;
+}
+
+function normalizeDrugHook(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function isApprovedDrugNode(drugNode: GraphNode): boolean {
+  if (drugNode.type !== "drug") return false;
+  const phaseRaw = Number(drugNode.meta.phase ?? Number.NaN);
+  const phase = Number.isFinite(phaseRaw) ? Math.max(0, Math.min(4, Math.floor(phaseRaw))) : 0;
+  const status = clean(String(drugNode.meta.status ?? ""));
+  const statusSupportsApproval = Boolean(
+    status && /\b(approved|marketed|authorized)\b/i.test(status),
+  );
+  return statusSupportsApproval || phase >= 4;
+}
+
+function computeThreadInterventionReadinessScore(input: {
+  candidate: MechanismThreadCandidate;
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+}): number {
+  const targetSymbol = normalizeTargetSymbol(input.candidate.target);
+  if (!targetSymbol) return 0;
+  const targetNode = findTargetNodeBySymbol(input.nodeMap, targetSymbol);
+  if (!targetNode) return 0;
+
+  const approvedDrugNames: string[] = [];
+  for (const edge of input.edgeMap.values()) {
+    if (edge.type !== "target_drug" || edge.source !== targetNode.id) continue;
+    const drugNode = input.nodeMap.get(edge.target);
+    if (!drugNode || drugNode.type !== "drug") continue;
+    if (!isApprovedDrugNode(drugNode)) continue;
+    const label = clean(String(drugNode.meta.displayName ?? drugNode.label ?? ""));
+    if (!label) continue;
+    approvedDrugNames.push(label);
+  }
+
+  const candidateDrug = clean(input.candidate.drug);
+  const candidateNorm = normalizeDrugHook(candidateDrug);
+  const genericDrugHook = !candidateNorm || /^\d+\s+compounds?$/.test(candidateNorm);
+  const approvedNormSet = new Set(approvedDrugNames.map((label) => normalizeDrugHook(label)));
+  const matchesApproved =
+    candidateNorm.length > 0 &&
+    [...approvedNormSet].some(
+      (approved) =>
+        approved === candidateNorm ||
+        approved.includes(candidateNorm) ||
+        candidateNorm.includes(approved),
+    );
+
+  const score =
+    (approvedNormSet.size > 0 ? 0.5 : 0) +
+    (matchesApproved ? 0.4 : 0) +
+    (!genericDrugHook ? 0.12 : 0) -
+    (genericDrugHook ? 0.28 : 0);
+  return clamp01(score);
+}
+
+function collectTargetNeighbors(edgeMap: Map<string, GraphEdge>, nodeId: string): Set<string> {
+  const neighbors = new Set<string>();
+  for (const edge of edgeMap.values()) {
+    if (edge.type !== "target_target") continue;
+    if (edge.source === nodeId) neighbors.add(edge.target);
+    if (edge.target === nodeId) neighbors.add(edge.source);
+  }
+  return neighbors;
+}
+
+function collectTargetPathways(edgeMap: Map<string, GraphEdge>, nodeId: string): Set<string> {
+  const pathways = new Set<string>();
+  for (const edge of edgeMap.values()) {
+    if (edge.type !== "target_pathway") continue;
+    if (edge.source === nodeId) pathways.add(edge.target);
+  }
+  return pathways;
+}
+
+function collectTargetDiseases(edgeMap: Map<string, GraphEdge>, nodeId: string): Set<string> {
+  const diseases = new Set<string>();
+  for (const edge of edgeMap.values()) {
+    if (edge.type !== "disease_target") continue;
+    if (edge.target === nodeId) diseases.add(edge.source);
+  }
+  return diseases;
+}
+
+function hasSetIntersection(left: Set<string>, right: Set<string>): boolean {
+  if (left.size === 0 || right.size === 0) return false;
+  const [small, large] = left.size <= right.size ? [left, right] : [right, left];
+  for (const value of small) {
+    if (large.has(value)) return true;
+  }
+  return false;
+}
+
+function computeThreadEndpointLinkScore(input: {
+  candidate: MechanismThreadCandidate;
+  endpointTargetSymbols: string[];
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+}): number {
+  const candidateSymbol = normalizeTargetSymbol(input.candidate.target);
+  if (!candidateSymbol) return 0;
+  const endpointSymbols = [
+    ...new Set(
+      (input.endpointTargetSymbols ?? [])
+        .map((value) => normalizeTargetSymbol(value))
+        .filter((value) => value.length > 0 && value !== candidateSymbol),
+    ),
+  ].slice(0, 8);
+  if (endpointSymbols.length === 0) return 0;
+
+  const candidateNode = findTargetNodeBySymbol(input.nodeMap, candidateSymbol);
+  if (!candidateNode) return 0;
+  const candidateNeighbors = collectTargetNeighbors(input.edgeMap, candidateNode.id);
+  const candidatePathways = collectTargetPathways(input.edgeMap, candidateNode.id);
+  const candidateDiseases = collectTargetDiseases(input.edgeMap, candidateNode.id);
+
+  let matched = 0;
+  let best = 0;
+  let total = 0;
+
+  for (const endpointSymbol of endpointSymbols) {
+    const endpointNode = findTargetNodeBySymbol(input.nodeMap, endpointSymbol);
+    if (!endpointNode) continue;
+
+    let score = 0;
+    if (candidateNeighbors.has(endpointNode.id)) {
+      score = 1;
+    } else {
+      const endpointPathways = collectTargetPathways(input.edgeMap, endpointNode.id);
+      if (hasSetIntersection(candidatePathways, endpointPathways)) {
+        score = 0.78;
+      } else {
+        const endpointNeighbors = collectTargetNeighbors(input.edgeMap, endpointNode.id);
+        if (hasSetIntersection(candidateNeighbors, endpointNeighbors)) {
+          score = 0.58;
+        } else {
+          const endpointDiseases = collectTargetDiseases(input.edgeMap, endpointNode.id);
+          if (hasSetIntersection(candidateDiseases, endpointDiseases)) {
+            score = 0.52;
+          }
+        }
+      }
+    }
+
+    if (score > 0) matched += 1;
+    best = Math.max(best, score);
+    total += score;
+  }
+
+  if (best <= 0) return 0;
+  const mean = total / Math.max(1, matched);
+  const coverage = matched / Math.max(1, endpointSymbols.length);
+  return clamp01(best * 0.5 + mean * 0.3 + coverage * 0.2);
+}
+
 function getTargetSymbolFromNode(node: GraphNode): string | null {
   if (node.type !== "target") return null;
   const symbol = String(node.meta.targetSymbol ?? node.label ?? "").trim();
@@ -4056,6 +7447,153 @@ function findTargetNodeBySymbol(nodeMap: Map<string, GraphNode>, symbol: string)
     }
   }
   return null;
+}
+
+function collectDiseaseEdgeUpstreamFallbackSymbols(input: {
+  nodeMap: Map<string, GraphNode>;
+  edgeMap: Map<string, GraphEdge>;
+  blockedSymbols?: string[];
+  limit?: number;
+}): string[] {
+  const blocked = new Set(
+    (input.blockedSymbols ?? []).map((value) => normalizeTargetSymbol(value)).filter(Boolean),
+  );
+  const limit = Math.max(1, Math.min(12, input.limit ?? 6));
+  const scored = new Map<string, number>();
+  for (const edge of input.edgeMap.values()) {
+    if (edge.type !== "disease_target") continue;
+    const targetNode = input.nodeMap.get(edge.target);
+    if (!targetNode || targetNode.type !== "target") continue;
+    const symbol = normalizeTargetSymbol(
+      String(targetNode.meta.targetSymbol ?? targetNode.label ?? ""),
+    );
+    if (!symbol || blocked.has(symbol)) continue;
+    const hasDrugEdge = [...input.edgeMap.values()].some(
+      (candidate) => candidate.type === "target_drug" && candidate.source === targetNode.id,
+    );
+    const hasPathwayEdge = [...input.edgeMap.values()].some(
+      (candidate) => candidate.type === "target_pathway" && candidate.source === targetNode.id,
+    );
+    const edgeWeight = Math.max(0, edge.weight ?? 0.2);
+    const score = edgeWeight + (hasDrugEdge ? 0.24 : 0) + (hasPathwayEdge ? 0.12 : 0);
+    const current = scored.get(symbol) ?? 0;
+    if (score > current) scored.set(symbol, score);
+  }
+  return [...scored.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .map(([symbol]) => symbol)
+    .slice(0, limit);
+}
+
+function graphNodeDisplayLabel(node: GraphNode | null | undefined): string {
+  if (!node) return "not provided";
+  return clean(
+    String(
+      node.meta.displayName ??
+        node.meta.targetSymbol ??
+        node.meta.targetName ??
+        node.label ??
+        "not provided",
+    ),
+  ) || "not provided";
+}
+
+function graphEdgeRelationLabel(edge: GraphEdge): string {
+  switch (edge.type) {
+    case "disease_target":
+      return "associates with";
+    case "target_pathway":
+      return "maps to pathway";
+    case "target_drug":
+      return "has intervention";
+    case "target_target":
+      return "interacts with";
+    default:
+      return edge.type.replace(/_/g, " ");
+  }
+}
+
+function buildMechanismHypothesisFromThread(input: {
+  targetNode: GraphNode;
+  nodeMap: Map<string, GraphNode>;
+  primaryDiseaseEdge: GraphEdge;
+  secondaryDiseaseEdge: GraphEdge | null;
+  pathwayEdge: GraphEdge | null;
+  drugEdge: GraphEdge | null;
+}): MechanismThreadCandidate["hypothesis"] {
+  const chain: NonNullable<MechanismThreadCandidate["hypothesis"]>["chain"] = [];
+  const diseaseNode = input.nodeMap.get(input.primaryDiseaseEdge.source);
+  const pathwayNode = input.pathwayEdge ? input.nodeMap.get(input.pathwayEdge.target) : null;
+  const drugNode = input.drugEdge ? input.nodeMap.get(input.drugEdge.target) : null;
+
+  const appendStep = (edge: GraphEdge, sourceNode: GraphNode | null | undefined, targetNode: GraphNode | null | undefined) => {
+    chain.push({
+      from: graphNodeDisplayLabel(sourceNode),
+      relation: graphEdgeRelationLabel(edge),
+      to: graphNodeDisplayLabel(targetNode),
+      edgeId: edge.id,
+      weight: Math.max(0, Number(edge.weight ?? 0)),
+    });
+  };
+
+  appendStep(input.primaryDiseaseEdge, diseaseNode, input.targetNode);
+  if (input.pathwayEdge) {
+    appendStep(input.pathwayEdge, input.targetNode, pathwayNode);
+  }
+  if (input.drugEdge) {
+    appendStep(input.drugEdge, input.targetNode, drugNode);
+  }
+
+  const hypothesisNode = normalizeTargetSymbol(
+    String(input.targetNode.meta.targetSymbol ?? input.targetNode.label ?? ""),
+  ) || "target";
+  const missingLinks: string[] = [];
+  if (!input.pathwayEdge) {
+    missingLinks.push("No explicit target-to-pathway edge in current graph.");
+  }
+  if (!input.drugEdge) {
+    missingLinks.push("No explicit target-to-drug edge in current graph.");
+  }
+  if (!input.secondaryDiseaseEdge) {
+    missingLinks.push("No second disease anchor edge supporting cross-anchor continuity.");
+  }
+
+  const meanWeight =
+    chain.length > 0
+      ? chain.reduce((sum, step) => sum + Math.max(0, step.weight), 0) / chain.length
+      : 0;
+  const evidenceScore = clamp01(
+    meanWeight * 0.78 +
+      (chain.length >= 3 ? 0.24 : chain.length === 2 ? 0.14 : 0.06) +
+      (input.secondaryDiseaseEdge ? 0.1 : 0),
+  );
+
+  const targetLabel = graphNodeDisplayLabel(input.targetNode);
+  const pathwayLabel = graphNodeDisplayLabel(pathwayNode);
+  const drugLabel = graphNodeDisplayLabel(drugNode);
+  const diseaseLabel = graphNodeDisplayLabel(diseaseNode);
+  const statement = chain.length >= 2
+    ? `${diseaseLabel} -> ${targetLabel} -> ${pathwayLabel} with intervention context ${drugLabel}.`
+    : `${diseaseLabel} -> ${targetLabel} mechanism candidate requires additional graph support.`;
+
+  const falsificationChecks: string[] = [
+    `If perturbing ${targetLabel} does not shift disease-relevant phenotypes, downgrade this thread.`,
+    input.pathwayEdge
+      ? `If ${pathwayLabel} remains unchanged after ${targetLabel} perturbation, pathway linkage is weakened.`
+      : `Add pathway evidence before treating this mechanism as causal.`,
+    input.drugEdge
+      ? `If intervention at ${targetLabel} fails to modulate expected readouts, translational support is weak.`
+      : `No direct intervention evidence in graph; avoid strong drug claims.`,
+  ].map((value) => compactText(value, 220));
+
+  return {
+    id: `${hypothesisNode.toLowerCase()}_mechanistic_hypothesis`,
+    statement: compactText(statement, 240),
+    chain,
+    evidenceScore: Number(evidenceScore.toFixed(4)),
+    falsificationChecks,
+    missingLinks: missingLinks.slice(0, 3),
+  };
 }
 
 function buildMechanismThreadCandidateFromTargetSymbol(input: {
@@ -4079,10 +7617,32 @@ function buildMechanismThreadCandidateFromTargetSymbol(input: {
     edges
       .filter((edge) => edge.type === "target_pathway" && edge.source === targetNode.id)
       .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))[0] ?? null;
-  const drugEdge =
-    edges
-      .filter((edge) => edge.type === "target_drug" && edge.source === targetNode.id)
-      .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))[0] ?? null;
+  const drugEdge = (() => {
+    const targetDrugEdges = edges.filter(
+      (edge) => edge.type === "target_drug" && edge.source === targetNode.id,
+    );
+    if (targetDrugEdges.length === 0) return null;
+    const scoreEdge = (edge: GraphEdge): number => {
+      const drugNode = input.nodeMap.get(edge.target);
+      if (!drugNode || drugNode.type !== "drug") {
+        return Math.max(0, edge.weight ?? 0) * 0.5;
+      }
+      const label = clean(String(drugNode.meta.displayName ?? drugNode.label ?? ""));
+      const genericHook =
+        !label ||
+        /^\d+\s+compounds?$/i.test(label) ||
+        (/\bcompounds?\b/i.test(label) && /\d+/.test(label));
+      const phaseRaw = Number(drugNode.meta.phase ?? Number.NaN);
+      const phase = Number.isFinite(phaseRaw) ? Math.max(0, Math.min(4, Math.floor(phaseRaw))) : 0;
+      const approved = isApprovedDrugNode(drugNode);
+      return (
+        Math.max(0, edge.weight ?? 0) * 0.5 +
+        (approved ? 0.9 : phase >= 3 ? 0.35 : 0) +
+        (genericHook ? -0.7 : 0.15)
+      );
+    };
+    return [...targetDrugEdges].sort((left, right) => scoreEdge(right) - scoreEdge(left))[0] ?? null;
+  })();
 
   const primaryDiseaseNode = input.nodeMap.get(primaryDiseaseEdge.source);
   const pathwayNode = pathwayEdge ? input.nodeMap.get(pathwayEdge.target) : null;
@@ -4125,6 +7685,14 @@ function buildMechanismThreadCandidateFromTargetSymbol(input: {
     Math.max(0, targetScore) * 0.6 +
     (secondaryDiseaseEdge ? 0.25 : 0) +
     input.focusBoost;
+  const hypothesis = buildMechanismHypothesisFromThread({
+    targetNode,
+    nodeMap: input.nodeMap,
+    primaryDiseaseEdge,
+    secondaryDiseaseEdge,
+    pathwayEdge,
+    drugEdge,
+  });
 
   return {
     summary: threadLabels.join(" -> "),
@@ -4136,6 +7704,7 @@ function buildMechanismThreadCandidateFromTargetSymbol(input: {
     edgeIds,
     supportScore: Number(supportScore.toFixed(4)),
     connectedAcrossAnchors: Boolean(secondaryDiseaseEdge),
+    hypothesis,
   };
 }
 
@@ -4145,10 +7714,22 @@ function buildMechanismThreadCandidates(input: {
   selectedSymbol: string | null;
   rankedSymbols: string[];
   pathFocusTargetSymbols: string[];
+  prioritizeInterventionReadiness?: boolean;
+  endpointTargetSymbols?: string[];
+  rankingBySymbol?: Map<string, RankingResponse["rankedTargets"][number]>;
+  queryAnchorMentions?: string[];
+  avoidTargetSymbols?: string[];
+  avoidTargetPenalty?: number;
   limit?: number;
 }): MechanismThreadCandidate[] {
   const limit = Math.max(1, Math.min(5, input.limit ?? 3));
   const focusSet = new Set(input.pathFocusTargetSymbols.map((item) => item.trim().toUpperCase()));
+  const anchorMentions = buildQueryAnchorMentions(input.queryAnchorMentions ?? []);
+  const rankingBySymbol = input.rankingBySymbol ?? new Map();
+  const avoidSet = new Set(
+    (input.avoidTargetSymbols ?? []).map((value) => value.trim().toUpperCase()).filter(Boolean),
+  );
+  const avoidTargetPenalty = Math.max(0, input.avoidTargetPenalty ?? 0.3);
   const seedSymbols = [
     ...(input.pathFocusTargetSymbols ?? []),
     input.selectedSymbol ?? "",
@@ -4168,7 +7749,77 @@ function buildMechanismThreadCandidates(input: {
       }),
     )
     .filter((value): value is MechanismThreadCandidate => Boolean(value))
-    .sort((left, right) => right.supportScore - left.supportScore);
+    .map((candidate) => {
+      const targetSymbol = candidate.target.trim().toUpperCase();
+      const rankedTarget = rankingBySymbol.get(targetSymbol);
+      const noveltyScore = computeTargetNoveltyScore(rankedTarget);
+      const anchorMatch = computeThreadAnchorMatch(candidate, anchorMentions);
+      const mediatorDrugConsistency = computeThreadMediatorDrugConsistency({
+        candidate,
+        nodeMap: input.nodeMap,
+        edgeMap: input.edgeMap,
+      });
+      const interventionReadinessScore = computeThreadInterventionReadinessScore({
+        candidate,
+        nodeMap: input.nodeMap,
+        edgeMap: input.edgeMap,
+      });
+      const endpointLinkScore = computeThreadEndpointLinkScore({
+        candidate,
+        endpointTargetSymbols: input.endpointTargetSymbols ?? [],
+        nodeMap: input.nodeMap,
+        edgeMap: input.edgeMap,
+      });
+      const endpointAnchorPenalty = avoidSet.has(targetSymbol)
+        ? focusSet.has(targetSymbol)
+          ? avoidTargetPenalty * 0.55
+          : avoidTargetPenalty
+        : 0;
+      const hypothesisEvidenceScore = clamp01(candidate.hypothesis?.evidenceScore ?? 0);
+      const hypothesisChainLength = candidate.hypothesis?.chain.length ?? 0;
+      const hypothesisCompletenessBoost =
+        hypothesisChainLength >= 3
+          ? 0.34
+          : hypothesisChainLength >= 2
+            ? 0.2
+            : 0;
+      const weakHypothesisPenalty = hypothesisChainLength >= 2 ? 0 : 0.42;
+      const endpointLinkBoost =
+        endpointLinkScore * (anchorMentions.length > 0 ? 0.52 : 0.34);
+      const interventionBoost = input.prioritizeInterventionReadiness
+        ? interventionReadinessScore * 0.45
+        : interventionReadinessScore * 0.08;
+      const weakInterventionPenalty =
+        input.prioritizeInterventionReadiness && interventionReadinessScore < 0.2 ? 0.28 : 0;
+      const compositeScore =
+        candidate.supportScore * 0.72 +
+        hypothesisEvidenceScore * 1.45 +
+        hypothesisCompletenessBoost +
+        (candidate.connectedAcrossAnchors ? 0.38 : 0) +
+        anchorMatch.score * 1.15 +
+        noveltyScore * 0.12 +
+        endpointLinkBoost +
+        mediatorDrugConsistency * 0.32 +
+        interventionBoost -
+        endpointAnchorPenalty -
+        weakHypothesisPenalty -
+        weakInterventionPenalty;
+      return {
+        ...candidate,
+        anchorMatchScore: Number(anchorMatch.score.toFixed(4)),
+        noveltyScore: Number(noveltyScore.toFixed(4)),
+        mediatorDrugConsistency: Number(mediatorDrugConsistency.toFixed(4)),
+        interventionReadinessScore: Number(interventionReadinessScore.toFixed(4)),
+        endpointLinkScore: Number(endpointLinkScore.toFixed(4)),
+        genericHubPenalty: Number(endpointAnchorPenalty.toFixed(4)),
+        compositeScore: Number(compositeScore.toFixed(4)),
+        matchedAnchors: anchorMatch.matched,
+      };
+    })
+    .sort(
+      (left, right) =>
+        (right.compositeScore ?? right.supportScore) - (left.compositeScore ?? left.supportScore),
+    );
 
   if (candidates.length === 0) return [];
 
@@ -4178,8 +7829,14 @@ function buildMechanismThreadCandidates(input: {
       (candidate) => candidate.target.toUpperCase() === selectedSymbol,
     );
     if (selectedIndex > 0) {
-      const [selected] = candidates.splice(selectedIndex, 1);
-      if (selected) candidates.unshift(selected);
+      const selectedCandidate = candidates[selectedIndex];
+      const currentTop = candidates[0];
+      const selectedScore = selectedCandidate?.compositeScore ?? selectedCandidate?.supportScore ?? 0;
+      const topScore = currentTop?.compositeScore ?? currentTop?.supportScore ?? 0;
+      if (selectedCandidate && selectedScore >= topScore - 0.08) {
+        const [selected] = candidates.splice(selectedIndex, 1);
+        if (selected) candidates.unshift(selected);
+      }
     }
   }
 
@@ -4682,6 +8339,7 @@ type GeneratedBriefSections = {
     };
   };
   threadCandidates: MechanismThreadCandidate[];
+  selectionDiagnostics: BriefSelectionDiagnostics;
   caveats: string[];
   nextActions: string[];
   queryAlignment: {
@@ -4693,6 +8351,52 @@ type GeneratedBriefSections = {
     note: string;
   };
 };
+
+type LiveExplainabilitySnapshot = {
+  provisional: boolean;
+  leadTarget: string;
+  leadScore: number;
+  mechanismThread: string;
+  pathSummary: string;
+  selectionDiagnostics: BriefSelectionDiagnostics;
+  queryAlignment: GeneratedBriefSections["queryAlignment"];
+  degradedSources: string[];
+};
+
+function buildLiveExplainabilitySnapshot(input: {
+  brief: GeneratedBriefSections;
+  sourceHealth: SourceHealth;
+  pathSummary?: string | null;
+  provisional: boolean;
+}): LiveExplainabilitySnapshot {
+  const recommendation = input.brief.recommendation;
+  const leadTarget = recommendation?.target ?? "not provided";
+  const leadScore = Number((recommendation?.score ?? 0).toFixed(4));
+  const threadSummary =
+    input.brief.threadCandidates[0]?.summary ??
+    [recommendation?.target, recommendation?.pathway, recommendation?.drugHook]
+      .filter((value) => Boolean(value && value !== "not provided"))
+      .join(" -> ");
+  const mechanismThread =
+    sanitizePathSummaryForNarrative(threadSummary) ||
+    "Mechanism thread not yet stabilized";
+  const pathSummary =
+    sanitizePathSummaryForNarrative(input.pathSummary) ||
+    mechanismThread;
+  const degradedSources = Object.entries(input.sourceHealth)
+    .filter(([, health]) => health !== "green")
+    .map(([source]) => source);
+  return {
+    provisional: input.provisional,
+    leadTarget,
+    leadScore,
+    mechanismThread,
+    pathSummary,
+    selectionDiagnostics: input.brief.selectionDiagnostics,
+    queryAlignment: input.brief.queryAlignment,
+    degradedSources,
+  };
+}
 
 type ThreadArbitrationDecision = {
   primaryIndex: number;
@@ -4773,6 +8477,29 @@ function reorderAlternativesFromThreads(
   return ordered.slice(0, 5);
 }
 
+function pruneStaleRecommendationCaveats(
+  caveats: string[],
+  recommendationTarget: string,
+): string[] {
+  const normalizedTarget = normalizeTargetSymbol(recommendationTarget);
+  if (!normalizedTarget) return caveats.slice(0, 8);
+  return caveats
+    .filter((line) => {
+      const pathConsistent = line.match(/Path-consistent recommendation selected \(([^)]+)\)/i);
+      if (pathConsistent) {
+        const referenced = normalizeTargetSymbol(pathConsistent[1] ?? "");
+        return referenced === normalizedTarget;
+      }
+      const promoted = line.match(/Thread-evidence override applied: promoted\s+([A-Za-z0-9-]+)/i);
+      if (promoted) {
+        const referenced = normalizeTargetSymbol(promoted[1] ?? "");
+        return referenced === normalizedTarget;
+      }
+      return true;
+    })
+    .slice(0, 8);
+}
+
 function applyThreadSelectionToBrief(
   brief: GeneratedBriefSections,
   threads: MechanismThreadCandidate[],
@@ -4792,21 +8519,60 @@ function applyThreadSelectionToBrief(
   const recommendationScore = Number(
     (traceForPrimary?.score ?? brief.recommendation.score ?? 0).toFixed(4),
   );
+  const recommendationTarget = primary.target || brief.recommendation.target;
   const recommendationWhy = clean(
     `${brief.recommendation.why ?? ""} Primary thread selected via query-aligned evidence arbitration.`,
   );
+  const updatedDiagnostics = {
+    ...brief.selectionDiagnostics,
+    anchorMatchedByRecommendation:
+      (primary.anchorMatchScore ?? brief.selectionDiagnostics.recommendationAnchorMatchScore) >=
+        0.35 || brief.selectionDiagnostics.anchorMatchedByRecommendation,
+    recommendationAnchorMatchScore: Number(
+      Math.max(
+        brief.selectionDiagnostics.recommendationAnchorMatchScore,
+        primary.anchorMatchScore ?? 0,
+      ).toFixed(4),
+    ),
+    recommendationDrugMediatorConsistency: Number(
+      (primary.mediatorDrugConsistency ??
+        brief.selectionDiagnostics.recommendationDrugMediatorConsistency).toFixed(4),
+    ),
+    recommendationEndpointLinkScore: Number(
+      (primary.endpointLinkScore ??
+        brief.selectionDiagnostics.recommendationEndpointLinkScore ??
+        0).toFixed(4),
+    ),
+    recommendationNoveltyScore: Number(
+      (primary.noveltyScore ?? brief.selectionDiagnostics.recommendationNoveltyScore).toFixed(4),
+    ),
+    genericHubPenaltyApplied:
+      brief.selectionDiagnostics.genericHubPenaltyApplied ||
+      (primary.genericHubPenalty ?? 0) > 0,
+  } satisfies BriefSelectionDiagnostics;
   return {
     ...brief,
     recommendation: {
       ...brief.recommendation,
-      target: primary.target || brief.recommendation.target,
+      target: recommendationTarget,
       pathway: primary.pathway || brief.recommendation.pathway,
       drugHook: primary.drug || brief.recommendation.drugHook,
       score: recommendationScore,
       why: recommendationWhy || brief.recommendation.why,
     },
     threadCandidates: threads,
+    caveats: pruneStaleRecommendationCaveats(brief.caveats, recommendationTarget),
+    selectionDiagnostics: updatedDiagnostics,
     alternatives: reorderAlternativesFromThreads(brief, threads),
+    queryAlignment: {
+      ...brief.queryAlignment,
+      status: recommendationTarget ? "anchored" : brief.queryAlignment.status,
+      matchedTarget: recommendationTarget,
+      baselineTop: brief.queryAlignment.baselineTop ?? brief.recommendation.target,
+      note: recommendationTarget
+        ? `Primary thread arbitration selected ${recommendationTarget} as the final recommendation target.`
+        : brief.queryAlignment.note,
+    },
   };
 }
 
@@ -4871,13 +8637,9 @@ async function arbitratePrimaryThreadCandidate(input: {
                     queryAnchors,
                     candidates: threads.map((thread, index) => ({
                       index,
-                      summary: sanitizePathSummaryForNarrative(thread.summary),
-                      target: thread.target,
-                      pathway: thread.pathway,
-                      drug: thread.drug,
-                      diseases: thread.diseases,
-                      supportScore: thread.supportScore,
-                      connectedAcrossAnchors: Boolean(thread.connectedAcrossAnchors),
+                      ...toThreadCandidatePromptRow(thread),
+                      compositeScore: thread.compositeScore ?? thread.supportScore,
+                      noveltyScore: thread.noveltyScore ?? 0,
                     })),
                     evidenceTrace,
                   }),
@@ -4923,16 +8685,19 @@ async function arbitratePrimaryThreadCandidate(input: {
 
 function generateBriefSections(options: {
   ranking: RankingResponse | null;
+  queryText?: string;
   nodeMap: Map<string, GraphNode>;
   edgeMap: Map<string, GraphEdge>;
   sourceHealth: SourceHealth;
   semanticConceptMentions: string[];
+  semanticPhenotypeMentions: string[];
   semanticTargetSymbols: string[];
   hasInterventionConcept: boolean;
   queryAnchorCount?: number;
   pathFocusTargetSymbols?: string[];
   pathConnectedAcrossAnchors?: boolean;
   unresolvedAnchorPairCount?: number;
+  selectionIntent?: SelectionIntentSnapshot | null;
   enrichmentLinksByNodeId: EnrichmentLinksByNodeId;
 }): GeneratedBriefSections {
   const {
@@ -4941,12 +8706,14 @@ function generateBriefSections(options: {
     edgeMap,
     sourceHealth,
     semanticConceptMentions,
+    semanticPhenotypeMentions,
     semanticTargetSymbols,
     hasInterventionConcept,
     queryAnchorCount,
     pathFocusTargetSymbols,
     pathConnectedAcrossAnchors,
     unresolvedAnchorPairCount,
+    selectionIntent,
     enrichmentLinksByNodeId,
   } = options;
   const nodes = [...nodeMap.values()];
@@ -4968,9 +8735,16 @@ function generateBriefSections(options: {
   }));
   const resolvedRanking =
     ranking ?? (rankingInputRows.length > 0 ? rankTargetsFallback(rankingInputRows) : null);
+  const evidenceBySymbol = new Map(
+    rankingInputRows.map((row) => [row.symbol.trim().toUpperCase(), row]),
+  );
 
   if (!resolvedRanking) {
     const evidenceSummary = summarizeEvidenceCoverage(enrichmentLinksByNodeId, []);
+    const anchorMentions = buildQueryAnchorMentions([
+      ...semanticPhenotypeMentions,
+      ...semanticConceptMentions,
+    ]);
     return {
       recommendation: null,
       alternatives: [],
@@ -4978,6 +8752,20 @@ function generateBriefSections(options: {
       citations: [],
       evidenceSummary,
       threadCandidates: [],
+      selectionDiagnostics: {
+        anchorCoverageScore: 0,
+        pathFocusConfidence: 0,
+        pathFocusApplied: false,
+        anchorMentionCount: anchorMentions.length,
+        anchorMentions: anchorMentions.slice(0, 8),
+        endpointAnchorTargets: [],
+        upstreamMediatorModeApplied: false,
+        anchorMatchedByRecommendation: false,
+        recommendationAnchorMatchScore: 0,
+        recommendationDrugMediatorConsistency: 0,
+        recommendationNoveltyScore: 0,
+        genericHubPenaltyApplied: false,
+      },
       caveats: ["No ranked target evidence available yet."],
       nextActions: [
         "Increase run depth or retry with more specific disease phrasing.",
@@ -4995,6 +8783,68 @@ function generateBriefSections(options: {
   const semanticTargetSet = new Set(
     semanticTargetSymbols.map((value) => value.toUpperCase()),
   );
+  const queryAnchorMentions = buildQueryAnchorMentions([
+    ...semanticConceptMentions,
+    ...semanticPhenotypeMentions,
+  ]);
+  const effectiveSelectionIntent =
+    selectionIntent ?? {
+      prioritizeMediatorDiscovery:
+        semanticTargetSymbols.length >= 2 ||
+        (semanticPhenotypeMentions.length > 0 &&
+          semanticTargetSymbols.length > 0),
+      prioritizeInterventionReadiness: hasInterventionConcept,
+      requireConnectedAnchorEvidence: (queryAnchorCount ?? 0) >= 2,
+      endpointTargetSymbols:
+        semanticPhenotypeMentions.length > 0
+          ? semanticTargetSymbols
+              .map((value) => normalizeTargetSymbol(value))
+              .filter(Boolean)
+              .slice(0, 6)
+          : [],
+      objective: "mixed_discovery" as const,
+      reasoningStyle: "balanced" as const,
+      rankingAxes: [
+        "disease_context_fit",
+        "mechanistic_plausibility",
+        "cross_source_evidence",
+        "intervention_readiness",
+      ],
+      chainSummary: [],
+      confidence: 0.45,
+      rationale:
+        "Selection intent unavailable; using structure-derived defaults.",
+    };
+  const endpointAnchorTargetSymbols = [
+    ...new Set(
+      (effectiveSelectionIntent.endpointTargetSymbols ?? [])
+        .map((value) => normalizeTargetSymbol(value))
+        .filter(Boolean),
+    ),
+  ];
+  const endpointAnchorTargetSet = new Set(endpointAnchorTargetSymbols);
+  const isEndpointAnchorTarget = (symbolRaw: string): boolean => {
+    const symbol = normalizeTargetSymbol(symbolRaw);
+    return endpointAnchorTargetSet.has(symbol);
+  };
+  const hasEndpointAnchorTargets = endpointAnchorTargetSet.size > 0;
+  const dynamicObjective = effectiveSelectionIntent.objective ?? "mixed_discovery";
+  const objectiveRequiresMechanism =
+    dynamicObjective === "mechanism_explanation" ||
+    dynamicObjective === "comparative_analysis";
+  const objectiveRequiresIntervention =
+    dynamicObjective === "drug_prioritization" ||
+    dynamicObjective === "safety_constrained_selection";
+  const objectiveRequiresSafety = dynamicObjective === "safety_constrained_selection";
+  const prioritizeMediatorDiscovery = Boolean(
+    effectiveSelectionIntent.prioritizeMediatorDiscovery ||
+      objectiveRequiresMechanism,
+  );
+  const prioritizeInterventionReadiness = Boolean(
+    effectiveSelectionIntent.prioritizeInterventionReadiness ||
+      hasInterventionConcept ||
+      objectiveRequiresIntervention,
+  );
   const pathFocusSet = new Set(
     (pathFocusTargetSymbols ?? []).map((value) => value.trim().toUpperCase()),
   );
@@ -5010,35 +8860,154 @@ function generateBriefSections(options: {
   const pathFocusConfidence = pathConnectedAcrossAnchors
     ? 1
     : Math.max(0.2, anchorCoverageScore * 0.65);
+  const baselineTop = resolvedRanking.rankedTargets[0];
   const boostedRanking = [...resolvedRanking.rankedTargets]
-    .map((item) => ({
-      item,
-      boost:
-        (semanticTargetSet.has(item.symbol.toUpperCase())
-          ? 0.06 * Math.max(0.6, anchorCoverageScore)
-          : 0) +
-        (pathFocusSet.has(item.symbol.toUpperCase()) ? 0.12 * pathFocusConfidence : 0),
-    }))
-    .sort((a, b) => b.item.score + b.boost - (a.item.score + a.boost))
-    .map((row, index) => ({
-      ...row.item,
-      rank: index + 1,
-    }));
+    .map((item) => {
+      const symbolUpper = item.symbol.toUpperCase();
+      const evidenceRow = evidenceBySymbol.get(symbolUpper);
+      const semanticBoost = semanticTargetSet.has(symbolUpper)
+        ? 0.08 * Math.max(0.6, anchorCoverageScore)
+        : 0;
+      const pathBoost = pathFocusSet.has(symbolUpper)
+        ? 0.14 * pathFocusConfidence
+        : 0;
+      const sourceBreadthScore = clamp01(
+        (Number(evidenceRow?.articleCount ?? 0) > 0 ? 0.45 : 0) +
+          (Number(evidenceRow?.trialCount ?? 0) > 0 ? 0.35 : 0) +
+          (Number(evidenceRow?.interactionCount ?? 0) >= 3 ? 0.2 : 0),
+      );
+      const sourceBreadthBoost = sourceBreadthScore * 0.1;
+      const translationalDepth = clamp01(
+        (Number(evidenceRow?.trialCount ?? 0) > 0 ? 0.62 : 0) +
+          (Number(evidenceRow?.articleCount ?? 0) >= 2 ? 0.38 : 0),
+      );
+      const endpointAnchorPenalty =
+        prioritizeMediatorDiscovery &&
+        hasEndpointAnchorTargets &&
+        isEndpointAnchorTarget(symbolUpper)
+          ? pathFocusSet.has(symbolUpper)
+            ? 0.22
+            : 0.38
+          : 0;
+      const mediatorBoost =
+        prioritizeMediatorDiscovery &&
+        (!hasEndpointAnchorTargets || !isEndpointAnchorTarget(symbolUpper))
+          ? 0.08 +
+            sourceBreadthScore * 0.07 +
+            (item.pathwayHooks.length > 0 ? 0.05 : 0)
+          : 0;
+      const objectiveMechanismBoost =
+        objectiveRequiresMechanism &&
+        (!hasEndpointAnchorTargets || !isEndpointAnchorTarget(symbolUpper))
+          ? 0.06 + (item.pathwayHooks.length > 0 ? 0.04 : 0)
+          : 0;
+      const interventionBoost = prioritizeInterventionReadiness
+        ? readEvidenceRefNumber(item, "drugActionability") * 0.12
+        : readEvidenceRefNumber(item, "drugActionability") * 0.04;
+      const objectiveInterventionBoost = objectiveRequiresIntervention
+        ? clamp01(
+            readEvidenceRefNumber(item, "drugActionability") * 0.72 +
+              translationalDepth * 0.28,
+          ) * 0.12
+        : 0;
+      const pathCompletenessBoost = clamp01(
+        (item.pathwayHooks.length > 0 ? 0.55 : 0) +
+          (item.drugHooks.length > 0 ? 0.45 : 0),
+      ) * 0.08;
+      const noveltyScore = computeTargetNoveltyScore(item);
+      const lowEvidencePenalty =
+        effectiveSelectionIntent.requireConnectedAnchorEvidence &&
+        !pathFocusSet.has(symbolUpper) &&
+        sourceBreadthScore < 0.2
+          ? 0.1
+          : 0;
+      const objectiveSafetyPenalty =
+        objectiveRequiresSafety && translationalDepth < 0.2 ? 0.08 : 0;
+      const selectionCompositeScore =
+        item.score +
+        semanticBoost +
+        pathBoost +
+        sourceBreadthBoost +
+        mediatorBoost +
+        objectiveMechanismBoost +
+        interventionBoost +
+        objectiveInterventionBoost +
+        pathCompletenessBoost +
+        noveltyScore * 0.09 -
+        endpointAnchorPenalty -
+        lowEvidencePenalty -
+        objectiveSafetyPenalty;
+      return {
+        ...item,
+        selectionCompositeScore: Number(selectionCompositeScore.toFixed(4)),
+        selectionNoveltyScore: Number(noveltyScore.toFixed(4)),
+        selectionHubPenalty: Number(
+          (endpointAnchorPenalty + lowEvidencePenalty).toFixed(4),
+        ),
+      };
+    })
+    .sort((a, b) => b.selectionCompositeScore - a.selectionCompositeScore)
+    .map((row, index) => ({ ...row, rank: index + 1 }));
 
-  const baselineTop = boostedRanking[0];
+  const adjustedTop = boostedRanking[0];
   const matchedQueryTarget = boostedRanking.find((item) =>
     semanticTargetSet.has(item.symbol.toUpperCase()),
   );
+  const preferredInterventionTarget = boostedRanking.find((item) => {
+    const drugActionability = readEvidenceRefNumber(item, "drugActionability");
+    const hasDrugHook = Array.isArray(item.drugHooks) && item.drugHooks.length > 0;
+    return drugActionability >= 0.33 || hasDrugHook;
+  });
+  const mediatorRanked = [...boostedRanking]
+    .map((item) => {
+      const symbolUpper = item.symbol.trim().toUpperCase();
+      const endpointPenalty =
+        hasEndpointAnchorTargets && isEndpointAnchorTarget(symbolUpper) ? 0.28 : 0;
+      const literatureSupport = readEvidenceRefNumber(item, "literatureSupport");
+      const openTargetsEvidence = readEvidenceRefNumber(item, "openTargetsEvidence");
+      const interactionBreadth = clamp01(
+        (item.interactionHooks.length > 0 ? 0.7 : 0) +
+          (item.pathwayHooks.length > 0 ? 0.3 : 0),
+      );
+      const mechanisticCompleteness = clamp01(
+        (item.pathwayHooks.length > 0 ? 0.65 : 0) +
+          (item.interactionHooks.length > 0 ? 0.35 : 0),
+      );
+      const interventionBiasPenalty =
+        item.pathwayHooks.length === 0 && item.interactionHooks.length === 0
+          ? readEvidenceRefNumber(item, "drugActionability") * 0.1
+          : 0;
+      const mediatorPriorityScore =
+        literatureSupport * 0.34 +
+        openTargetsEvidence * 0.24 +
+        interactionBreadth * 0.16 +
+        mechanisticCompleteness * 0.16 +
+        (pathFocusSet.has(symbolUpper) ? 0.08 : 0) -
+        endpointPenalty -
+        interventionBiasPenalty;
+      return {
+        row: item,
+        mediatorPriorityScore: Number(mediatorPriorityScore.toFixed(4)),
+      };
+    })
+    .sort((left, right) => right.mediatorPriorityScore - left.mediatorPriorityScore)
+    .map((entry) => entry.row);
+  const preferredMediatorTarget = mediatorRanked.find((item) => {
+    if (!hasEndpointAnchorTargets) return true;
+    return !isEndpointAnchorTarget(item.symbol.toUpperCase());
+  }) ?? mediatorRanked[0] ?? preferredInterventionTarget;
   const pathFocusedTarget = boostedRanking.find((item) =>
     pathFocusSet.has(item.symbol.toUpperCase()),
   );
 
   const shouldAnchorToQuery =
-    hasInterventionConcept &&
     !!matchedQueryTarget &&
-    anchorCoverageScore >= 0.45 &&
-    (matchedQueryTarget.score >= 0.32 || matchedQueryTarget.rank <= 12) &&
-    (baselineTop?.score ?? 0) - matchedQueryTarget.score <= 0.26;
+    (semanticTargetSet.size > 0 || queryAnchorMentions.length > 0) &&
+    anchorCoverageScore >= (multiAnchorQuery ? 0.35 : 0.25) &&
+    (matchedQueryTarget.score >= 0.28 || matchedQueryTarget.rank <= 14) &&
+    ((adjustedTop?.selectionCompositeScore ?? 0) - matchedQueryTarget.selectionCompositeScore <=
+      0.24 ||
+      (adjustedTop?.score ?? 0) - matchedQueryTarget.score <= 0.32);
   const hasConnectedAnchorPath = Boolean(
     pathConnectedAcrossAnchors && (pathFocusTargetSymbols ?? []).length > 0,
   );
@@ -5050,24 +9019,271 @@ function generateBriefSections(options: {
         !shouldAnchorToQuery &&
         (pathFocusedTarget.score >= 0.28 || pathFocusedTarget.rank <= 12)));
 
-  const selectedTop = hasConnectedAnchorPath
-    ? pathFocusedTarget ?? baselineTop
-    : shouldAnchorToQuery
-      ? matchedQueryTarget
-      : shouldPreferPathFocused
-        ? pathFocusedTarget
-        : baselineTop;
+  let selectedTop = (() => {
+    if (dynamicObjective === "mechanism_explanation" && preferredMediatorTarget) {
+      return preferredMediatorTarget;
+    }
+    if (
+      (dynamicObjective === "drug_prioritization" ||
+        dynamicObjective === "safety_constrained_selection") &&
+      preferredInterventionTarget
+    ) {
+      return preferredInterventionTarget;
+    }
+    if (
+      dynamicObjective === "comparative_analysis" &&
+      (pathFocusedTarget || hasConnectedAnchorPath)
+    ) {
+      return pathFocusedTarget ?? adjustedTop;
+    }
+    if (prioritizeMediatorDiscovery && preferredMediatorTarget) {
+      return preferredMediatorTarget;
+    }
+    if (hasConnectedAnchorPath) {
+      return pathFocusedTarget ?? adjustedTop;
+    }
+    if (prioritizeInterventionReadiness && preferredInterventionTarget) {
+      return preferredInterventionTarget;
+    }
+    if (shouldAnchorToQuery) {
+      return matchedQueryTarget;
+    }
+    if (shouldPreferPathFocused) {
+      return pathFocusedTarget;
+    }
+    return adjustedTop;
+  })();
 
-  const pathways = selectedTop?.pathwayHooks ?? [];
+  if (
+    prioritizeMediatorDiscovery &&
+    selectedTop &&
+    isEndpointAnchorTarget(selectedTop.symbol) &&
+    preferredMediatorTarget
+  ) {
+    selectedTop = preferredMediatorTarget;
+  }
+
   const dataGaps = resolvedRanking.systemSummary.dataGaps;
-  const threadCandidates = buildMechanismThreadCandidates({
+  const endpointAvoidSymbols = endpointAnchorTargetSymbols.slice(0, 12);
+  let threadCandidates = buildMechanismThreadCandidates({
     nodeMap,
     edgeMap,
     selectedSymbol: selectedTop?.symbol ?? null,
     rankedSymbols: boostedRanking.map((item) => item.symbol),
     pathFocusTargetSymbols: [...pathFocusSet],
+    prioritizeInterventionReadiness,
+    endpointTargetSymbols: endpointAnchorTargetSymbols,
+    rankingBySymbol: new Map(
+      boostedRanking.map((item) => [item.symbol.trim().toUpperCase(), item]),
+    ),
+    queryAnchorMentions,
+    avoidTargetSymbols: prioritizeMediatorDiscovery
+      ? endpointAvoidSymbols
+      : [],
+    avoidTargetPenalty: prioritizeMediatorDiscovery ? 0.4 : 0,
     limit: 3,
   });
+  let mediatorThreadOverrideApplied = false;
+  const selectedThreadScore =
+    threadCandidates.find(
+      (candidate) =>
+        candidate.target.trim().toUpperCase() === selectedTop?.symbol?.trim().toUpperCase(),
+    )?.compositeScore ??
+    threadCandidates[0]?.compositeScore ??
+    0;
+  const mediatorThreadCandidate = threadCandidates.find((candidate) => {
+    const symbolUpper = candidate.target.trim().toUpperCase();
+    if (!symbolUpper || isEndpointAnchorTarget(symbolUpper)) return false;
+    if (!prioritizeMediatorDiscovery) return false;
+    if (prioritizeInterventionReadiness) {
+      return (candidate.mediatorDrugConsistency ?? 0) >= 0.55;
+    }
+    return true;
+  });
+  if (
+    prioritizeMediatorDiscovery &&
+    selectedTop &&
+    isEndpointAnchorTarget(selectedTop.symbol.toUpperCase()) &&
+    mediatorThreadCandidate
+  ) {
+    const mediatorThreadScore =
+      mediatorThreadCandidate.compositeScore ?? mediatorThreadCandidate.supportScore;
+    const mediatorRankingRow = boostedRanking.find(
+      (item) =>
+        item.symbol.trim().toUpperCase() ===
+        mediatorThreadCandidate.target.trim().toUpperCase(),
+    );
+    if (
+      mediatorRankingRow &&
+      mediatorThreadScore >= Math.max(0.6, selectedThreadScore + 0.04)
+    ) {
+      selectedTop = mediatorRankingRow;
+      mediatorThreadOverrideApplied = true;
+      threadCandidates = mergeThreadCandidates(
+        [mediatorThreadCandidate],
+        threadCandidates,
+        3,
+      );
+    }
+  }
+  const allThreadCandidatesEndpoint =
+    threadCandidates.length > 0 &&
+    threadCandidates
+      .slice(0, 3)
+      .every((candidate) => isEndpointAnchorTarget(candidate.target));
+  if (
+    prioritizeMediatorDiscovery &&
+    selectedTop &&
+    isEndpointAnchorTarget(selectedTop.symbol.toUpperCase()) &&
+    allThreadCandidatesEndpoint
+  ) {
+    const rankingUpstreamFallback = boostedRanking.find((item) => {
+      if (isEndpointAnchorTarget(item.symbol.toUpperCase())) return false;
+      const drugActionability = readEvidenceRefNumber(item, "drugActionability");
+      const literatureSupport = readEvidenceRefNumber(item, "literatureSupport");
+      return drugActionability >= 0.2 || literatureSupport >= 0.25;
+    });
+    const diseaseEdgeFallbackSymbol =
+      collectDiseaseEdgeUpstreamFallbackSymbols({
+        nodeMap,
+        edgeMap,
+        blockedSymbols: endpointAvoidSymbols,
+        limit: 6,
+      })[0] ?? null;
+    const fallbackRankingRow =
+      rankingUpstreamFallback ??
+      (diseaseEdgeFallbackSymbol
+        ? boostedRanking.find(
+            (item) =>
+              item.symbol.trim().toUpperCase() === diseaseEdgeFallbackSymbol.toUpperCase(),
+          )
+        : null);
+    if (fallbackRankingRow) {
+      selectedTop = fallbackRankingRow;
+      mediatorThreadOverrideApplied = true;
+      const fallbackThread =
+        buildMechanismThreadCandidates({
+          nodeMap,
+          edgeMap,
+          selectedSymbol: fallbackRankingRow.symbol,
+          rankedSymbols: [fallbackRankingRow.symbol, ...boostedRanking.map((item) => item.symbol)],
+          pathFocusTargetSymbols: [...pathFocusSet],
+          prioritizeInterventionReadiness,
+          endpointTargetSymbols: endpointAnchorTargetSymbols,
+          rankingBySymbol: new Map(
+            boostedRanking.map((item) => [item.symbol.trim().toUpperCase(), item]),
+          ),
+          queryAnchorMentions,
+          avoidTargetSymbols: endpointAvoidSymbols,
+          avoidTargetPenalty: 0.45,
+          limit: 1,
+        })[0] ?? null;
+      if (fallbackThread) {
+        threadCandidates = mergeThreadCandidates([fallbackThread], threadCandidates, 3);
+      }
+    }
+  }
+  let evidenceThreadOverrideApplied = false;
+  const leadingThreadCandidate = threadCandidates[0] ?? null;
+  if (leadingThreadCandidate) {
+    const leadingThreadSymbol = leadingThreadCandidate.target.trim().toUpperCase();
+    const leadingThreadIsEndpoint =
+      hasEndpointAnchorTargets && isEndpointAnchorTarget(leadingThreadSymbol);
+    const leadingRankingRow = boostedRanking.find(
+      (item) => item.symbol.trim().toUpperCase() === leadingThreadSymbol,
+    );
+    const selectedThreadCandidate = selectedTop
+      ? threadCandidates.find(
+          (candidate) =>
+            candidate.target.trim().toUpperCase() ===
+            selectedTop?.symbol.trim().toUpperCase(),
+        ) ?? null
+      : null;
+    const selectedThreadScore =
+      selectedThreadCandidate?.compositeScore ?? selectedThreadCandidate?.supportScore ?? 0;
+    const leadingThreadScore =
+      leadingThreadCandidate.compositeScore ?? leadingThreadCandidate.supportScore;
+    const blockEndpointThreadOverride =
+      prioritizeMediatorDiscovery && leadingThreadIsEndpoint;
+    if (
+      leadingRankingRow &&
+      !blockEndpointThreadOverride &&
+      (!selectedThreadCandidate || leadingThreadScore >= selectedThreadScore + 0.06)
+    ) {
+      selectedTop = leadingRankingRow;
+      evidenceThreadOverrideApplied = true;
+      threadCandidates = mergeThreadCandidates(
+        [leadingThreadCandidate],
+        threadCandidates,
+        3,
+      );
+    }
+  }
+  let connectedEvidenceOverrideApplied = false;
+  if (
+    prioritizeMediatorDiscovery &&
+    effectiveSelectionIntent.requireConnectedAnchorEvidence &&
+    endpointAnchorTargetSymbols.length > 0 &&
+    threadCandidates.length > 0
+  ) {
+    const selectedSymbolUpper = selectedTop?.symbol?.trim().toUpperCase() ?? "";
+    const selectedThreadCandidateForLink = selectedSymbolUpper
+      ? threadCandidates.find(
+          (candidate) =>
+            candidate.target.trim().toUpperCase() === selectedSymbolUpper,
+        ) ?? null
+      : threadCandidates[0] ?? null;
+    const selectedThreadScoreForLink =
+      selectedThreadCandidateForLink?.compositeScore ??
+      selectedThreadCandidateForLink?.supportScore ??
+      0;
+    const selectedEndpointLinkScore = selectedThreadCandidateForLink?.endpointLinkScore ?? 0;
+    const selectedIsEndpointTarget =
+      selectedTop ? isEndpointAnchorTarget(selectedTop.symbol.toUpperCase()) : false;
+    const preferredConnectedMediator =
+      [...threadCandidates]
+        .filter((candidate) => {
+          const symbolUpper = candidate.target.trim().toUpperCase();
+          if (!symbolUpper || isEndpointAnchorTarget(symbolUpper)) return false;
+          const endpointLinkScore = candidate.endpointLinkScore ?? 0;
+          const anchorMatchScore = candidate.anchorMatchScore ?? 0;
+          return (
+            endpointLinkScore >= 0.35 ||
+            anchorMatchScore >= 0.25 ||
+            candidate.connectedAcrossAnchors
+          );
+        })
+        .sort(
+          (left, right) =>
+            (right.compositeScore ?? right.supportScore) -
+            (left.compositeScore ?? left.supportScore),
+        )[0] ?? null;
+    const weakCurrentEndpointLink =
+      selectedIsEndpointTarget || selectedEndpointLinkScore < 0.25;
+    if (preferredConnectedMediator && weakCurrentEndpointLink) {
+      const connectedMediatorScore =
+        preferredConnectedMediator.compositeScore ??
+        preferredConnectedMediator.supportScore;
+      const connectedMediatorRankingRow = boostedRanking.find(
+        (row) =>
+          row.symbol.trim().toUpperCase() ===
+          preferredConnectedMediator.target.trim().toUpperCase(),
+      );
+      if (
+        connectedMediatorRankingRow &&
+        connectedMediatorScore >= selectedThreadScoreForLink - 0.18
+      ) {
+        selectedTop = connectedMediatorRankingRow;
+        connectedEvidenceOverrideApplied = true;
+        threadCandidates = mergeThreadCandidates(
+          [preferredConnectedMediator],
+          threadCandidates,
+          3,
+        );
+      }
+    }
+  }
+  const pathways = selectedTop?.pathwayHooks ?? [];
 
   const alternatives = boostedRanking
     .filter((item) => item.symbol !== selectedTop?.symbol)
@@ -5095,6 +9311,61 @@ function generateBriefSections(options: {
     enrichmentLinksByNodeId,
   });
   const evidenceSummary = summarizeEvidenceCoverage(enrichmentLinksByNodeId, citations);
+  const selectedThreadCandidate =
+    threadCandidates.find(
+      (candidate) =>
+        candidate.target.trim().toUpperCase() === selectedTop?.symbol?.trim().toUpperCase(),
+    ) ??
+    threadCandidates[0] ??
+    null;
+  const recommendationAnchorMatchScore = Number(
+    (
+      selectedThreadCandidate?.anchorMatchScore ??
+      (selectedTop && semanticTargetSet.has(selectedTop.symbol.toUpperCase()) ? 1 : 0)
+    ).toFixed(4),
+  );
+  const recommendationDrugMediatorConsistency = Number(
+    (
+      selectedThreadCandidate?.mediatorDrugConsistency ??
+      (selectedTop?.drugHooks?.length ? 0.7 : 0.25)
+    ).toFixed(4),
+  );
+  const recommendationNoveltyScore = Number(
+    (
+      selectedThreadCandidate?.noveltyScore ??
+      selectedTop?.selectionNoveltyScore ??
+      0
+    ).toFixed(4),
+  );
+  const recommendationEndpointLinkScore = Number(
+    (selectedThreadCandidate?.endpointLinkScore ?? 0).toFixed(4),
+  );
+  const genericHubPenaltyApplied = Boolean(
+    (selectedThreadCandidate?.genericHubPenalty ?? selectedTop?.selectionHubPenalty ?? 0) > 0,
+  );
+  const selectionDiagnostics: BriefSelectionDiagnostics = {
+    anchorCoverageScore: Number(anchorCoverageScore.toFixed(4)),
+    pathFocusConfidence: Number(pathFocusConfidence.toFixed(4)),
+    pathFocusApplied: Boolean(
+      hasConnectedAnchorPath ||
+        shouldPreferPathFocused ||
+        (prioritizeMediatorDiscovery && mediatorThreadOverrideApplied) ||
+        connectedEvidenceOverrideApplied,
+    ),
+    anchorMentionCount: queryAnchorMentions.length,
+    anchorMentions: queryAnchorMentions.slice(0, 8),
+    endpointAnchorTargets: endpointAnchorTargetSymbols.slice(0, 8),
+    upstreamMediatorModeApplied: prioritizeMediatorDiscovery,
+    anchorMatchedByRecommendation:
+      recommendationAnchorMatchScore >= 0.35 ||
+      (!prioritizeMediatorDiscovery &&
+        (selectedTop ? semanticTargetSet.has(selectedTop.symbol.toUpperCase()) : false)),
+    recommendationAnchorMatchScore,
+    recommendationDrugMediatorConsistency,
+    recommendationNoveltyScore,
+    recommendationEndpointLinkScore,
+    genericHubPenaltyApplied,
+  };
 
   const degradedSources = Object.entries(sourceHealth)
     .filter(([, health]) => health !== "green")
@@ -5118,13 +9389,64 @@ function generateBriefSections(options: {
           `Path-consistent recommendation selected (${pathFocusedTarget.symbol}) while baseline top was ${baselineTop.symbol}; compare both threads before nomination.`,
         ]
       : []),
-    ...(semanticTargetSet.size > 0 &&
+    ...(!prioritizeMediatorDiscovery &&
+    semanticTargetSet.size > 0 &&
     selectedTop &&
     !semanticTargetSet.has(selectedTop.symbol.toUpperCase())
       ? [
-          `Query concept mismatch: requested target/intervention mentions (${semanticConceptMentions.join(
-            ", ",
-          )}) were not top-ranked in this disease graph.`,
+          `Query concept mismatch: requested anchor mentions (${(queryAnchorMentions.length > 0
+            ? queryAnchorMentions
+            : semanticConceptMentions
+          )
+            .slice(0, 8)
+            .join(
+              ", ",
+            )}) were not top-ranked in this disease graph.`,
+        ]
+      : []),
+    ...(selectionDiagnostics.anchorMentionCount > 0 &&
+    !selectionDiagnostics.anchorMatchedByRecommendation
+      ? [
+          `Primary recommendation had weak anchor match (${selectionDiagnostics.recommendationAnchorMatchScore.toFixed(
+            2,
+          )}); treat this as a low-fidelity query match.`,
+        ]
+      : []),
+    ...(prioritizeMediatorDiscovery &&
+    endpointAnchorTargetSymbols.length > 0 &&
+    recommendationEndpointLinkScore > 0 &&
+    recommendationEndpointLinkScore < 0.35
+      ? [
+          `Primary mediator showed weak mechanistic linkage to endpoint anchors (${recommendationEndpointLinkScore.toFixed(
+            2,
+          )}); prioritize validation of mediator-to-endpoint path coherence.`,
+        ]
+      : []),
+    ...(selectionDiagnostics.genericHubPenaltyApplied
+      ? [
+          "Endpoint/readout penalty was applied to preserve mediator-focused mechanism ranking.",
+        ]
+      : []),
+    ...(mediatorThreadOverrideApplied
+      ? [
+          `Mediator thread override applied: promoted ${selectedTop?.symbol ?? "non-endpoint mediator"} over endpoint-readout markers.`,
+        ]
+      : []),
+    ...(evidenceThreadOverrideApplied
+      ? [
+          `Thread-evidence override applied: promoted ${selectedTop?.symbol ?? "top candidate"} based on stronger cross-anchor mechanism thread support.`,
+        ]
+      : []),
+    ...(connectedEvidenceOverrideApplied
+      ? [
+          `Connected-evidence override applied: promoted ${selectedTop?.symbol ?? "top candidate"} because mediator-to-endpoint linkage was stronger under the current query intent.`,
+        ]
+      : []),
+    ...(prioritizeMediatorDiscovery &&
+    selectedTop &&
+    isEndpointAnchorTarget(selectedTop.symbol.toUpperCase())
+      ? [
+          "Mediator-priority mode remained constrained to endpoint-aligned targets due limited upstream evidence in this run.",
         ]
       : []),
     ...dataGaps.slice(0, 2),
@@ -5147,6 +9469,20 @@ function generateBriefSections(options: {
     "Compare top 3 alternatives for tractability and mechanistic orthogonality.",
     "Run Deep mode for richer interaction and literature context before program decision.",
   ];
+  const mediatorAlignmentOverride =
+    prioritizeMediatorDiscovery &&
+    selectedTop &&
+    !isEndpointAnchorTarget(selectedTop.symbol.toUpperCase())
+      ? {
+          status: "anchored" as const,
+          requestedMentions:
+            queryAnchorMentions.length > 0 ? queryAnchorMentions : semanticConceptMentions,
+          requestedTargetSymbols: endpointAnchorTargetSymbols,
+          matchedTarget: selectedTop.symbol,
+          baselineTop: baselineTop?.symbol,
+          note: `Semantic intent favored mediator discovery over endpoint readouts; selected ${selectedTop.symbol}.`,
+        }
+      : null;
 
   const queryAlignment: {
     status: "matched" | "anchored" | "mismatch" | "none";
@@ -5155,13 +9491,16 @@ function generateBriefSections(options: {
     matchedTarget?: string;
     baselineTop?: string;
     note: string;
-  } = semanticConceptMentions.length
+  } = mediatorAlignmentOverride
+    ? mediatorAlignmentOverride
+    : queryAnchorMentions.length
     ? semanticTargetSet.size > 0
       ? matchedQueryTarget
         ? shouldAnchorToQuery
           ? {
               status: matchedQueryTarget.symbol === baselineTop?.symbol ? "matched" : "anchored",
-              requestedMentions: semanticConceptMentions,
+              requestedMentions:
+                queryAnchorMentions.length > 0 ? queryAnchorMentions : semanticConceptMentions,
               requestedTargetSymbols: [...semanticTargetSet],
               matchedTarget: matchedQueryTarget.symbol,
               baselineTop: baselineTop?.symbol,
@@ -5172,7 +9511,8 @@ function generateBriefSections(options: {
             }
           : {
               status: "mismatch",
-              requestedMentions: semanticConceptMentions,
+              requestedMentions:
+                queryAnchorMentions.length > 0 ? queryAnchorMentions : semanticConceptMentions,
               requestedTargetSymbols: [...semanticTargetSet],
               matchedTarget: matchedQueryTarget.symbol,
               baselineTop: baselineTop?.symbol,
@@ -5180,14 +9520,16 @@ function generateBriefSections(options: {
             }
         : {
             status: "mismatch",
-            requestedMentions: semanticConceptMentions,
+            requestedMentions:
+              queryAnchorMentions.length > 0 ? queryAnchorMentions : semanticConceptMentions,
             requestedTargetSymbols: [...semanticTargetSet],
             baselineTop: baselineTop?.symbol,
             note: "Requested concept target was not present in ranked disease evidence.",
           }
       : {
           status: "none",
-          requestedMentions: semanticConceptMentions,
+          requestedMentions:
+            queryAnchorMentions.length > 0 ? queryAnchorMentions : semanticConceptMentions,
           requestedTargetSymbols: [],
           baselineTop: baselineTop?.symbol,
           note: "No explicit target-level concept extracted from query.",
@@ -5214,6 +9556,7 @@ function generateBriefSections(options: {
     citations,
     evidenceSummary,
     threadCandidates,
+    selectionDiagnostics,
     caveats: reconciledCaveats,
     nextActions,
     queryAlignment,
@@ -5230,9 +9573,9 @@ export async function GET(request: NextRequest) {
 
   if (action === "interrupt") {
     const active = activeSessionRuns.get(sessionKey);
-    if (active) {
+    if (active && active.status === "running") {
       active.abortController.abort("interrupted by user");
-      activeSessionRuns.delete(sessionKey);
+      markSessionRunStatus(active, "interrupted", "interrupted by user");
       return Response.json({ ok: true, interrupted: true });
     }
     return Response.json({ ok: true, interrupted: false });
@@ -5241,12 +9584,25 @@ export async function GET(request: NextRequest) {
     const active = activeSessionRuns.get(sessionKey);
     return Response.json({
       ok: true,
-      active: Boolean(active),
+      active: Boolean(active && active.status === "running"),
       runId: active?.runId ?? null,
+      query: active?.query ?? null,
+      status: active?.status ?? null,
+      startedAt: active ? new Date(active.startedAt).toISOString() : null,
+      finishedAt:
+        typeof active?.finishedAt === "number"
+          ? new Date(active.finishedAt).toISOString()
+          : null,
+      detachedAt:
+        typeof active?.detachedAt === "number"
+          ? new Date(active.detachedAt).toISOString()
+          : null,
+      terminalMessage: active?.terminalMessage ?? null,
+      resumable: Boolean(active),
       hasSessionApiKey: Boolean(requestApiKey),
     });
   }
-  const query = params.get("query")?.trim();
+  const requestedQuery = params.get("query")?.trim();
   const mode: RunMode = "multihop";
   const diseaseIdHint = params.get("diseaseId")?.trim();
   const diseaseNameHint = params.get("diseaseName")?.trim();
@@ -5255,6 +9611,10 @@ export async function GET(request: NextRequest) {
   const runId =
     params.get("runId")?.trim() ??
     `run-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+  const existingRun = activeSessionRuns.get(sessionKey);
+  const query =
+    requestedQuery ??
+    (existingRun && existingRun.runId === runId ? existingRun.query : undefined);
   const log = startRequestLog("/api/runCaseStream", {
     mode,
     queryLength: query?.length ?? 0,
@@ -5275,8 +9635,27 @@ export async function GET(request: NextRequest) {
     return new Response("Unknown replay id", { status: 400 });
   }
 
-  const existingRun = activeSessionRuns.get(sessionKey);
-  if (existingRun && existingRun.runId !== runId) {
+  if (existingRun && existingRun.runId === runId) {
+    if (existingRun.status === "running") {
+      clearDetachedAbortTimer(existingRun);
+    }
+    endRequestLog(log, {
+      reusedRun: true,
+      runStatus: existingRun.status,
+      nodeCount: 0,
+      edgeCount: 0,
+    });
+    return new Response(createRunSubscriberStream(existingRun), {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }
+
+  if (existingRun && existingRun.status === "running" && existingRun.runId !== runId) {
     warnRequestLog(log, "run_case.rejected_active_session", {
       existingRunId: existingRun.runId,
     });
@@ -5285,16 +9664,36 @@ export async function GET(request: NextRequest) {
       status: 409,
     });
   }
+  if (existingRun && existingRun.runId !== runId) {
+    clearDetachedAbortTimer(existingRun);
+    activeSessionRuns.delete(sessionKey);
+  }
 
   const streamState = { closed: false };
   const streamAbort = new AbortController();
-  activeSessionRuns.set(sessionKey, {
+  const activeRun = createSessionRunState({
     runId,
     sessionKey,
-    startedAt: Date.now(),
+    query,
+    mode,
+    diseaseIdHint,
+    diseaseNameHint,
+    replayId,
     abortController: streamAbort,
   });
-  const cleanupSessionRun = () => {
+  activeSessionRuns.set(sessionKey, activeRun);
+  const cleanupSessionRun = (status?: SessionRunStatus, message?: string | null) => {
+    const current = activeSessionRuns.get(sessionKey);
+    if (!current || current.runId !== runId) return;
+    if (status) {
+      markSessionRunStatus(current, status, message ?? null);
+      if (current.status !== "running") {
+        for (const subscriber of current.subscribers.values()) {
+          subscriber.close();
+        }
+        current.subscribers.clear();
+      }
+    }
     clearSessionRunLock(sessionKey, runId);
   };
 
@@ -5316,12 +9715,16 @@ export async function GET(request: NextRequest) {
       };
       let lastPathSignature = "";
       let lastRecommendationSignature = "";
+      let lastExplainabilitySignature = "";
+      let lastHypothesisNarrationSignature = "";
       let lastProvisionalEmitMs = 0;
       let lastAgentStepSignature = "";
       let lastForwardedBaselinePct = 2;
       let preStreamHeartbeatMessage = "Resolving biomedical anchors";
       let preStreamHeartbeatPct = 2;
       let preStreamHeartbeat: ReturnType<typeof setInterval> | null = null;
+      let lastPreStreamNarrationAt = 0;
+      let lastPreStreamNarrationKey = "";
       let discovererPromise: Promise<DiscovererFinal | null> | null = null;
       let discovererTimeoutMs = 0;
       let discovererFinal: DiscovererFinal | null = null;
@@ -5332,11 +9735,30 @@ export async function GET(request: NextRequest) {
 
       const emit = (event: string, data: unknown) => {
         if (streamState.closed) return;
-        try {
-          controller.enqueue(encodeEvent(event, data));
-        } catch {
-          streamState.closed = true;
-        }
+        appendSessionRunEvent(activeRun, event, data);
+      };
+
+      const emitRecoverableWarning = (phase: string, message: string) => {
+        emit("warning", {
+          phase,
+          message,
+          recoverable: true,
+        });
+        emit("agent_step", {
+          phase,
+          title: "Recoverable issue handled",
+          detail: compactText(message, 180),
+        });
+        emit("narration_delta", {
+          id: `run-${runId}-${phase}-warning-${Date.now()}`,
+          ts: new Date().toISOString(),
+          kind: "warning",
+          title: "Recoverable issue handled",
+          detail: compactText(message, 220),
+          source: "agent",
+          pathState: "candidate",
+          entities: [],
+        });
       };
 
       const emitGraphDelta = (nodes: GraphNode[], edges: GraphEdge[]) => {
@@ -5401,12 +9823,19 @@ export async function GET(request: NextRequest) {
       const close = () => {
         if (streamState.closed) return;
         streamState.closed = true;
+        const current = activeSessionRuns.get(sessionKey);
+        const defaultStatus: SessionRunStatus =
+          streamAbort.signal.aborted ? "interrupted" : "completed";
+        if (current && current.runId === runId && current.status === "running") {
+          cleanupSessionRun(defaultStatus);
+        } else {
+          cleanupSessionRun();
+        }
         try {
           controller.close();
         } catch {
           // no-op
         }
-        cleanupSessionRun();
       };
 
       if (replayFixture) {
@@ -5468,12 +9897,14 @@ export async function GET(request: NextRequest) {
         withOpenAiRunContext(runId, async () => {
       try {
         let resolvedQueryPlan: ResolvedQueryPlan | null = null;
+        let selectionIntentSnapshot: SelectionIntentSnapshot | null = null;
         const emitPreStreamStatus = () => {
+          const elapsedMs = Date.now() - startedAt;
           emit("status", {
             phase: "P0",
             message: preStreamHeartbeatMessage,
             pct: preStreamHeartbeatPct,
-            elapsedMs: Date.now() - startedAt,
+            elapsedMs,
             partial: true,
             counts: {
               nodes: nodeMap.size,
@@ -5481,6 +9912,24 @@ export async function GET(request: NextRequest) {
             },
             sourceHealth,
           });
+          const narrationKey = `${preStreamHeartbeatPct}:${preStreamHeartbeatMessage}`;
+          if (
+            narrationKey !== lastPreStreamNarrationKey ||
+            elapsedMs - lastPreStreamNarrationAt >= 7_000
+          ) {
+            lastPreStreamNarrationAt = elapsedMs;
+            lastPreStreamNarrationKey = narrationKey;
+            emit("narration_delta", {
+              id: `run-${runId}-prestream-${elapsedMs}`,
+              ts: new Date().toISOString(),
+              kind: "phase",
+              title: "Planner progress",
+              detail: preStreamHeartbeatMessage,
+              source: "planner",
+              pathState: "active",
+              entities: [],
+            });
+          }
         };
 
         emit("run_started", {
@@ -5521,10 +9970,15 @@ export async function GET(request: NextRequest) {
           );
         } catch {
           const fallbackDiseasePhrase = trimDiseaseNoise(extractDiseasePhrase(query));
-          const relationMentions =
+          const relationMentionsBase =
             llmRelationMentions.length > 0
               ? llmRelationMentions
               : extractDiseaseAnchorMentions(query);
+          const relationMentions = [
+            ...new Set([
+              ...relationMentionsBase,
+            ]),
+          ];
           const includeWholeQueryFallback = allowWholeQueryDiseaseSearch(query);
           let timeoutFallbackCandidates: DiseaseCandidate[] = [];
           const timeoutMentions = [
@@ -5639,20 +10093,23 @@ export async function GET(request: NextRequest) {
             if (candidates.length >= 12) break;
           }
         }
-        const relationQueryLexical =
-          /\b(and|between|vs|versus|connect|connection|relationship|link|overlap|common|shared|affect|impact|influence|modulate|mediate|associated|correlated)\b/i.test(
+        const relationIntentDetected =
+          /\b(between|vs|versus|compared?\s+to|comparison|overlap|shared|common)\b/i.test(
             query,
           );
         const queryPlanAnchorCount = (resolvedQueryPlan?.anchors ?? []).length;
-        const relationQuery =
-          relationQueryLexical ||
-          queryPlanAnchorCount >= 2 ||
-          (resolvedQueryPlan?.intent ?? "").toLowerCase().includes("multihop");
         const diseaseAnchorCountInPlan = (resolvedQueryPlan?.anchors ?? []).filter(
           (anchor) => anchor.entityType === "disease",
         ).length;
+        const relationQuery =
+          diseaseAnchorCountInPlan >= 2 ||
+          (relationIntentDetected && diseaseAnchorCountInPlan >= 1);
+        const multiAnchorQuery =
+          queryPlanAnchorCount >= 2 ||
+          (resolvedQueryPlan?.intent ?? "").toLowerCase().includes("multihop");
         const allowMentionAnchoredDiseaseExpansion =
           relationQuery &&
+          relationIntentDetected &&
           diseaseAnchorCountInPlan < 2;
         const typedDiseaseMentions = (resolvedQueryPlan?.anchors ?? [])
           .filter((anchor) => anchor.entityType === "disease")
@@ -5688,24 +10145,167 @@ export async function GET(request: NextRequest) {
             );
           })
           .slice(0, 10);
+        const inferredDiseaseSeedPhrases = await inferDiseaseSeedPhrases(query).catch(() => []);
+        const modelDiseaseContextQueries = await suggestDiseaseContextQueries({
+          query,
+          queryPlan: resolvedQueryPlan,
+          relationMentions,
+        }).catch(() => []);
+        const diseaseContextQueries = [
+          ...new Set([
+            ...inferredDiseaseSeedPhrases,
+            ...modelDiseaseContextQueries,
+          ]),
+        ].slice(0, 8);
+        let diseaseContextCandidates: DiseaseCandidate[] = [];
+        for (const contextQuery of diseaseContextQueries) {
+          const contextMatches = await searchDiseaseCandidates(contextQuery, 8, 1).catch(() => []);
+          if (contextMatches.length > 0) {
+            diseaseContextCandidates = mergeDiseaseCandidates(
+              diseaseContextCandidates,
+              contextMatches,
+            );
+          }
+          if (diseaseContextCandidates.length >= 16) break;
+        }
         const mentionAnchoredMatches = allowMentionAnchoredDiseaseExpansion
           ? await resolveMentionAnchoredDiseases(relationMentions, 3)
           : [];
         const mentionAnchoredDiseasesRaw = mentionAnchoredMatches.map((item) => item.disease);
+        const semanticCandidatePool = mergeDiseaseCandidates(
+          mergeDiseaseCandidates(candidates, mentionAnchoredDiseasesRaw),
+          diseaseContextCandidates,
+        );
+        const semanticallyValidatedCandidates = await filterDiseaseCandidatesBySemanticValidation({
+          query,
+          candidates: semanticCandidatePool,
+          queryPlan: resolvedQueryPlan,
+        }).catch(() => semanticCandidatePool);
         candidates = rerankDiseaseCandidates(
           query,
-          mergeDiseaseCandidates(candidates, mentionAnchoredDiseasesRaw),
+          semanticallyValidatedCandidates,
           14,
         );
-        const scoredCandidates = rankDiseaseCandidates(query, candidates, 14);
+        let scoredCandidates = rankDiseaseCandidates(query, candidates, 14);
+        let diseaseAnchorLock = await lockDiseaseCandidatesToQueryContext({
+          query,
+          candidates: scoredCandidates.map((item) => ({
+            id: item.id,
+            name: item.name,
+            description: item.description,
+          })),
+          queryPlan: resolvedQueryPlan,
+          relationMentions,
+          pinnedDiseaseId: diseaseIdHint,
+        }).catch((): DiseaseAnchorLockResult => ({
+          status: "soft",
+          confidence: 0.4,
+          primaryId: scoredCandidates[0]?.id ?? null,
+          keepIds: scoredCandidates[0] ? [scoredCandidates[0].id] : [],
+          discardIds: scoredCandidates.slice(1).map((item) => item.id),
+          rationale: "Disease anchor lock degraded due internal validation failure.",
+        }));
+        let anchorLockRetried = false;
+        if (
+          diseaseAnchorLock.status === "failed" &&
+          diseaseAnchorLock.keepIds.length === 0 &&
+          !diseaseIdHint
+        ) {
+          const rescuedContextCandidates = await rescueDiseaseCandidatesFromQueryContext({
+            query,
+            queryPlan: resolvedQueryPlan,
+            relationMentions,
+          }).catch(() => []);
+          if (rescuedContextCandidates.length > 0) {
+            const rescuePool = mergeDiseaseCandidates(candidates, rescuedContextCandidates);
+            const rescueValidated = await filterDiseaseCandidatesBySemanticValidation({
+              query,
+              candidates: rescuePool,
+              queryPlan: resolvedQueryPlan,
+            }).catch(() => rescuePool);
+            const rescueReranked = rerankDiseaseCandidates(query, rescueValidated, 14);
+            let rescueScored = rankDiseaseCandidates(query, rescueReranked, 14);
+            let rescueLock = await lockDiseaseCandidatesToQueryContext({
+              query,
+              candidates: rescueScored.map((item) => ({
+                id: item.id,
+                name: item.name,
+                description: item.description,
+              })),
+              queryPlan: resolvedQueryPlan,
+              relationMentions,
+              pinnedDiseaseId: diseaseIdHint,
+            }).catch(() => null);
+            if (!rescueLock) {
+              rescueLock = {
+                status: "soft",
+                confidence: 0.4,
+                primaryId: rescueScored[0]?.id ?? null,
+                keepIds: rescueScored[0] ? [rescueScored[0].id] : [],
+                discardIds: rescueScored.slice(1).map((item) => item.id),
+                rationale: "Disease anchor lock degraded during context rescue.",
+              };
+            }
+            if (rescueLock.keepIds.length > 0) {
+              const keepSet = new Set(rescueLock.keepIds);
+              const filtered = rescueScored.filter((item) => keepSet.has(item.id));
+              if (filtered.length > 0) {
+                rescueScored = filtered;
+              }
+            }
+            const improvedPool = rescuePool.length > candidates.length;
+            const changedLeadCandidate = rescueScored[0]?.id !== scoredCandidates[0]?.id;
+            if ((improvedPool || changedLeadCandidate) && rescueScored.length > 0) {
+              scoredCandidates = rescueScored;
+              candidates = scoredCandidates.map((item) => ({
+                id: item.id,
+                name: item.name,
+                description: item.description,
+              }));
+              diseaseAnchorLock = rescueLock;
+              anchorLockRetried = true;
+            }
+          }
+        }
+        if (diseaseAnchorLock.keepIds.length > 0) {
+          const keepSet = new Set(diseaseAnchorLock.keepIds);
+          const lockedCandidates = scoredCandidates.filter((item) => keepSet.has(item.id));
+          if (lockedCandidates.length > 0) {
+            scoredCandidates = lockedCandidates;
+          }
+        }
         const diseaseScoreById = new Map(scoredCandidates.map((item) => [item.id, item.score]));
         candidates = scoredCandidates.map((item) => ({
           id: item.id,
           name: item.name,
           description: item.description,
         }));
-        const topCandidateScore = scoredCandidates[0]?.score ?? -Infinity;
-        const literalDiseaseCandidate = pickLiteralDiseaseCandidate(query, candidates);
+        emit("anchor_lock", {
+          query,
+          status: diseaseAnchorLock.status,
+          confidence: Number(diseaseAnchorLock.confidence.toFixed(3)),
+          primaryId: diseaseAnchorLock.primaryId,
+          keepIds: diseaseAnchorLock.keepIds,
+          discardIds: diseaseAnchorLock.discardIds,
+          rationale: diseaseAnchorLock.rationale,
+          retried: anchorLockRetried,
+        });
+        if (diseaseAnchorLock.discardIds.length > 0) {
+          emit("narration_delta", {
+            id: `run-${runId}-anchor-lock-prune`,
+            ts: new Date().toISOString(),
+            kind: "branch",
+            title: "Anchor lock pruned off-context disease branches",
+            detail: `Discarded ${diseaseAnchorLock.discardIds.length} disease candidates: ${diseaseAnchorLock.discardIds.join(", ")}`,
+            source: "planner",
+            pathState: "discarded",
+            entities: diseaseAnchorLock.discardIds.slice(0, 6).map((id) => ({
+              type: "disease",
+              label: id,
+              primaryId: id,
+            })),
+          });
+        }
         const mentionAnchoredDiseases = mentionAnchoredMatches
           .filter((item) =>
             candidates.some((candidate) => candidate.id === item.disease.id),
@@ -5746,6 +10346,13 @@ export async function GET(request: NextRequest) {
         const semanticTargetSymbolsEarly = (resolvedQueryPlan?.anchors ?? [])
           .filter((anchor) => anchor.entityType === "target")
           .map((anchor) => anchor.name);
+        const semanticPhenotypeMentionsEarly = (resolvedQueryPlan?.anchors ?? [])
+          .filter((anchor) =>
+            anchor.requestedType === "effect" ||
+            anchor.requestedType === "phenotype" ||
+            anchor.requestedType === "anatomy",
+          )
+          .map((anchor) => anchor.mention);
         const semanticConceptMentionsEarly = [
           ...(resolvedQueryPlan?.anchors ?? []).map((anchor) => anchor.mention),
           ...llmRelationMentions,
@@ -5768,18 +10375,30 @@ export async function GET(request: NextRequest) {
           (resolvedQueryPlan?.anchors ?? []).find((anchor) => anchor.entityType !== "disease") ??
           null;
         const forceConceptCentricMode =
-          !diseaseIdHint && hasNonDiseaseAnchorInPlan && !hasDiseaseAnchorInPlan;
+          !diseaseIdHint &&
+          hasNonDiseaseAnchorInPlan &&
+          !hasDiseaseAnchorInPlan &&
+          !scoredCandidates.some(
+            (candidate) =>
+              diseaseIdPattern.test(candidate.id) &&
+              !/^HP_/i.test(candidate.id),
+          );
         const planDiseaseAnchors = (resolvedQueryPlan?.anchors ?? []).filter(
           (anchor) => anchor.entityType === "disease",
         );
-        const planOntologyDiseaseAnchors = planDiseaseAnchors.filter(
+        const anchorLockKeepSet = new Set(diseaseAnchorLock.keepIds);
+        const lockConstrainedPlanDiseaseAnchors =
+          anchorLockKeepSet.size > 0
+            ? planDiseaseAnchors.filter((anchor) => anchorLockKeepSet.has(anchor.id))
+            : planDiseaseAnchors;
+        const planOntologyDiseaseAnchors = lockConstrainedPlanDiseaseAnchors.filter(
           (anchor) => !/^HP_/i.test(anchor.id),
         );
         const topPlanDiseaseAnchor = (() => {
           const pool =
             planOntologyDiseaseAnchors.length > 0
               ? planOntologyDiseaseAnchors
-              : planDiseaseAnchors;
+              : lockConstrainedPlanDiseaseAnchors;
           if (pool.length === 0) return null;
           const ranked = [...pool].sort((a, b) => b.confidence - a.confidence);
           if (!(relationQuery && pool.length > 1)) {
@@ -5804,17 +10423,32 @@ export async function GET(request: NextRequest) {
           );
           return firstMentioned?.anchor ?? ranked[0] ?? null;
         })();
-        const topPlanDiseaseCandidate =
-          (topPlanDiseaseAnchor
-            ? candidates.find((candidate) => candidate.id === topPlanDiseaseAnchor.id) ?? null
-            : null) ??
-          (topPlanDiseaseAnchor
+        const topPlanDiseaseCandidate = topPlanDiseaseAnchor
+          ? candidates.find((candidate) => candidate.id === topPlanDiseaseAnchor.id) ?? null
+          : null;
+        const strictFallbackPlanDiseaseCandidate =
+          topPlanDiseaseAnchor && anchorLockKeepSet.size === 0
             ? {
                 id: topPlanDiseaseAnchor.id,
                 name: topPlanDiseaseAnchor.name,
                 description: topPlanDiseaseAnchor.description,
               }
-            : null);
+            : null;
+        const strictDiseaseAnchorLockFailed = Boolean(
+          diseaseAnchorLock.status === "failed" &&
+            (planDiseaseAnchors.length > 0 || relationMentions.length > 0),
+        );
+        const lockPrimaryCandidate =
+          (diseaseAnchorLock.primaryId
+            ? candidates.find((item) => item.id === diseaseAnchorLock.primaryId) ?? null
+            : null) ??
+          candidates[0] ??
+          null;
+        const normalizedDiseaseSeedPhrases = inferredDiseaseSeedPhrases
+          .map((value) => trimDiseaseNoise(value))
+          .filter((value) => value.length >= 3)
+          .slice(0, 6);
+        let querySeedOverrideApplied = false;
         let chosen:
           | {
               selected: DiseaseCandidate;
@@ -5858,6 +10492,41 @@ export async function GET(request: NextRequest) {
         const planAnchorSelectionThreshold =
           relationQuery || hasNonDiseaseAnchorInPlan ? 0.42 : 0.6;
         if (!chosen) {
+          if (strictDiseaseAnchorLockFailed) {
+            if (lockPrimaryCandidate) {
+              chosen = {
+                selected: lockPrimaryCandidate,
+                rationale:
+                  "Disease anchor lock returned no keep-set; constrained to top semantically validated disease candidate.",
+              };
+            } else if (topPlanDiseaseCandidate) {
+              chosen = {
+                selected: topPlanDiseaseCandidate,
+                rationale: `Disease anchor lock rejected off-context candidates; constrained to explicit plan disease anchor (${topPlanDiseaseCandidate.name}).`,
+              };
+            } else if (strictFallbackPlanDiseaseCandidate) {
+              chosen = {
+                selected: strictFallbackPlanDiseaseCandidate,
+                rationale: `Disease anchor lock rejected off-context candidates; constrained to explicit plan disease anchor (${strictFallbackPlanDiseaseCandidate.name}).`,
+              };
+            } else {
+              const lockFallbackName =
+                extractDiseasePhrase(query)?.trim() ||
+                resolvedQueryPlan?.anchors.find((anchor) => anchor.entityType === "disease")?.name?.trim() ||
+                query;
+              chosen = {
+                selected: {
+                  id: querySyntheticDiseaseId(query),
+                  name: lockFallbackName,
+                },
+                rationale:
+                  "Disease anchor lock found no confident ontology disease match; proceeding in constrained query-seeded mode.",
+              };
+            }
+          }
+        }
+
+        if (!chosen) {
           if (
             topPlanDiseaseCandidate &&
             (topPlanDiseaseAnchor?.confidence ?? 0) >= planAnchorSelectionThreshold
@@ -5865,6 +10534,13 @@ export async function GET(request: NextRequest) {
             chosen = {
               selected: topPlanDiseaseCandidate,
               rationale: "Selected highest-confidence disease anchor from canonical entity resolution.",
+            };
+          } else if (verifierPrimaryCandidate) {
+            chosen = {
+              selected: verifierPrimaryCandidate,
+              rationale:
+                resolverLoop?.rationale ??
+                "Selected primary disease from semantic resolver verification loop.",
             };
           } else if (
             relationQuery &&
@@ -5875,11 +10551,6 @@ export async function GET(request: NextRequest) {
               selected: rankedMentionAnchoredDiseases[0]!.disease,
               rationale:
                 "Selected primary disease from mention-level anchor resolution for multi-anchor query.",
-            };
-          } else if (literalDiseaseCandidate && topCandidateScore >= 1.6) {
-            chosen = {
-              selected: literalDiseaseCandidate,
-              rationale: "Selected strongest lexical disease candidate from the query phrase.",
             };
           }
         }
@@ -5905,23 +10576,24 @@ export async function GET(request: NextRequest) {
               };
             } else if (
               bundledSelectionRank >= 0 &&
-              (bundledSelectionRank <= 2 || topCandidateScore < 2.8)
+              bundledSelectionRank <= 2
             ) {
               chosen = {
                 selected: bundled.selectedDisease,
                 rationale: bundled.rationale,
               };
-            } else if (literalDiseaseCandidate && topCandidateScore >= 1.6) {
+            } else if (verifierPrimaryCandidate) {
               chosen = {
-                selected: literalDiseaseCandidate,
+                selected: verifierPrimaryCandidate,
                 rationale:
-                  "Bundled primary disease conflicted with lexical ranking; selected strongest query-literal candidate.",
+                  resolverLoop?.rationale ??
+                  "Bundled primary disease was superseded by semantic resolver verification.",
               };
-            } else if (topCandidate && topCandidateScore >= 1.8) {
+            } else if (topCandidate) {
               chosen = {
                 selected: topCandidate,
                 rationale:
-                  "Bundled primary disease conflicted with lexical ranking; selected strongest canonical candidate.",
+                  "Bundled primary disease conflicted with semantic candidate ranking; selected top validated candidate.",
               };
             } else {
               const syntheticDiseaseName =
@@ -5939,11 +10611,10 @@ export async function GET(request: NextRequest) {
             }
           } else if (
             candidates.length > 0 &&
-            topCandidateScore >= 1.8 &&
             !(hasNonDiseaseAnchorInPlan && !hasDiseaseAnchorInPlan)
           ) {
             chosen = {
-              selected: literalDiseaseCandidate ?? candidates[0]!,
+              selected: candidates[0]!,
               rationale: "Bundled resolver returned no primary disease; selected top candidate.",
             };
           } else {
@@ -5965,48 +10636,20 @@ export async function GET(request: NextRequest) {
         if (
           !forceConceptCentricMode &&
           chosen &&
-          literalDiseaseCandidate &&
-          chosen.selected.id !== literalDiseaseCandidate.id
-        ) {
-          const chosenScore =
-            diseaseScoreById.get(chosen.selected.id) ??
-            scoreDiseaseCandidate(query, chosen.selected);
-          const literalScore =
-            diseaseScoreById.get(literalDiseaseCandidate.id) ??
-            scoreDiseaseCandidate(query, literalDiseaseCandidate);
-          const preservePlanAnchorSelection = Boolean(
-            topPlanDiseaseAnchor &&
-              chosen.selected.id === topPlanDiseaseAnchor.id &&
-              (topPlanDiseaseAnchor.confidence ?? 0) >=
-                (relationQuery || hasNonDiseaseAnchorInPlan ? 0.45 : 0.65),
-          );
-          if (!preservePlanAnchorSelection && literalScore - chosenScore >= 0.8) {
-            chosen = {
-              selected: literalDiseaseCandidate,
-              rationale:
-                "Resolver arbitration corrected to the strongest query-literal disease candidate.",
-            };
-          }
-        }
-
-        if (
-          !forceConceptCentricMode &&
-          chosen &&
           verifierPrimaryCandidate &&
           chosen.selected.id !== verifierPrimaryCandidate.id
         ) {
-          const chosenScore =
-            diseaseScoreById.get(chosen.selected.id) ??
-            scoreDiseaseCandidate(query, chosen.selected);
-          const verifierScore =
-            diseaseScoreById.get(verifierPrimaryCandidate.id) ??
-            scoreDiseaseCandidate(query, verifierPrimaryCandidate);
-          const chosenIsSynthetic = /^QUERY_/i.test(chosen.selected.id);
+          const chosenId = chosen.selected.id;
+          const chosenRank = candidates.findIndex((candidate) => candidate.id === chosenId);
+          const verifierRank = candidates.findIndex(
+            (candidate) => candidate.id === verifierPrimaryCandidate.id,
+          );
+          const chosenIsSynthetic = /^QUERY_/i.test(chosenId);
           const relationOrMultiAnchorQuery =
-            relationQuery || (resolvedQueryPlan?.anchors ?? []).length >= 2;
+            relationQuery || multiAnchorQuery;
           const preservePlanDiseaseAnchor = Boolean(
             topPlanDiseaseAnchor &&
-              chosen.selected.id === topPlanDiseaseAnchor.id &&
+              chosenId === topPlanDiseaseAnchor.id &&
               (topPlanDiseaseAnchor.confidence ?? 0) >=
                 (relationQuery || hasNonDiseaseAnchorInPlan ? 0.45 : 0.65),
           );
@@ -6014,7 +10657,8 @@ export async function GET(request: NextRequest) {
             !preservePlanDiseaseAnchor &&
             (chosenIsSynthetic ||
               (relationOrMultiAnchorQuery &&
-                (verifierScore >= chosenScore - 0.55 ||
+                ((verifierRank >= 0 &&
+                  (chosenRank < 0 || verifierRank <= chosenRank + 1)) ||
                   verifierMustKeepCandidates.some(
                     (candidate) => candidate.id === verifierPrimaryCandidate.id,
                   ))));
@@ -6028,11 +10672,208 @@ export async function GET(request: NextRequest) {
           }
         }
 
+        if (
+          chosen &&
+          !diseaseIdHint &&
+          normalizedDiseaseSeedPhrases.length > 0 &&
+          (diseaseAnchorLock.status !== "locked" || diseaseAnchorLock.confidence < 0.9)
+        ) {
+          const chosenMatchesSeed = normalizedDiseaseSeedPhrases.some((seed) =>
+            candidateMatchesDiseaseSeed(chosen!.selected, seed),
+          );
+          if (!chosenMatchesSeed) {
+            const seedLabel = normalizedDiseaseSeedPhrases[0]!;
+            chosen = {
+              selected: {
+                id: querySyntheticDiseaseId(query),
+                name: seedLabel,
+              },
+              rationale:
+                "Low-confidence ontology disease match conflicted with query disease seed; preserving query-seeded disease context for discovery routing.",
+            };
+            querySeedOverrideApplied = true;
+          }
+        }
+
+        if (
+          chosen &&
+          !diseaseIdHint &&
+          !querySeedOverrideApplied &&
+          diseaseAnchorLock.status !== "failed" &&
+          anchorLockKeepSet.size > 0 &&
+          !anchorLockKeepSet.has(chosen.selected.id) &&
+          lockPrimaryCandidate
+        ) {
+          chosen = {
+            selected: lockPrimaryCandidate,
+            rationale:
+              "Selection reconciled to disease anchor lock to prevent off-context disease routing.",
+          };
+        }
+
+        if (
+          resolvedQueryPlan &&
+          !querySeedOverrideApplied &&
+          anchorLockKeepSet.size > 0 &&
+          diseaseAnchorLock.status !== "failed"
+        ) {
+          const filteredAnchors = resolvedQueryPlan.anchors.filter(
+            (anchor) => anchor.entityType !== "disease" || anchorLockKeepSet.has(anchor.id),
+          );
+          const hasAnyDiseaseAnchor = filteredAnchors.some(
+            (anchor) => anchor.entityType === "disease",
+          );
+          if (!hasAnyDiseaseAnchor && lockPrimaryCandidate) {
+            filteredAnchors.unshift({
+              mention: lockPrimaryCandidate.name,
+              requestedType: "disease",
+              entityType: "disease",
+              id: lockPrimaryCandidate.id,
+              name: lockPrimaryCandidate.name,
+              description: lockPrimaryCandidate.description,
+              confidence: 0.86,
+              source: "planner",
+            });
+          }
+          const filteredFollowups = (resolvedQueryPlan.followups ?? []).filter((followup) => {
+            const diseaseSeedIds = followup.seedEntityIds.filter((id) => diseaseIdPattern.test(id));
+            if (diseaseSeedIds.length === 0) return true;
+            return diseaseSeedIds.every((id) => anchorLockKeepSet.has(id));
+          });
+          resolvedQueryPlan = {
+            ...resolvedQueryPlan,
+            anchors: filteredAnchors.slice(0, 16),
+            followups: filteredFollowups.slice(0, 8),
+          };
+        }
+
+        let anchorContextFilterResult: AnchorContextFilterResult | null = null;
+        let anchorDiseaseRelevanceFilterResult: AnchorDiseaseRelevanceFilterResult | null = null;
+        if (resolvedQueryPlan && chosen) {
+          anchorContextFilterResult = await filterPlanAnchorsByQueryContext({
+            query,
+            selectedDisease: chosen.selected,
+            anchors: resolvedQueryPlan.anchors,
+          }).catch(() => null);
+          if (anchorContextFilterResult && anchorContextFilterResult.keepKeys.length > 0) {
+            const keepSet = new Set(anchorContextFilterResult.keepKeys);
+            const filteredAnchors = resolvedQueryPlan.anchors.filter(
+              (anchor) =>
+                anchor.entityType === "disease" || keepSet.has(anchorContextKey(anchor)),
+            );
+            const prunedCount = Math.max(0, resolvedQueryPlan.anchors.length - filteredAnchors.length);
+            if (filteredAnchors.length > 0 && prunedCount > 0) {
+              resolvedQueryPlan = {
+                ...resolvedQueryPlan,
+                anchors: filteredAnchors.slice(0, 16),
+              };
+              emit("narration_delta", {
+                id: `run-${runId}-anchor-context-filter`,
+                ts: new Date().toISOString(),
+                kind: "branch",
+                title: "Anchor context filter pruned off-context non-disease anchors",
+                detail: `Pruned ${prunedCount} non-disease anchors after semantic context validation.`,
+                source: "planner",
+                pathState: "discarded",
+                entities: anchorContextFilterResult.discardKeys.slice(0, 6).map((key) => ({
+                  type: "target",
+                  label: key,
+                })),
+              });
+            }
+          }
+
+          anchorDiseaseRelevanceFilterResult =
+            await filterTargetAnchorsByDiseaseRelevance({
+              query,
+              selectedDisease: chosen.selected,
+              anchors: resolvedQueryPlan.anchors,
+            }).catch(() => null);
+          if (
+            anchorDiseaseRelevanceFilterResult &&
+            anchorDiseaseRelevanceFilterResult.keepKeys.length > 0
+          ) {
+            const keepSet = new Set(anchorDiseaseRelevanceFilterResult.keepKeys);
+            const filteredAnchors = resolvedQueryPlan.anchors.filter(
+              (anchor) =>
+                anchor.entityType !== "target" || keepSet.has(anchorContextKey(anchor)),
+            );
+            const prunedTargetCount = Math.max(
+              0,
+              resolvedQueryPlan.anchors.filter((anchor) => anchor.entityType === "target").length -
+                filteredAnchors.filter((anchor) => anchor.entityType === "target").length,
+            );
+            if (filteredAnchors.length > 0 && prunedTargetCount > 0) {
+              resolvedQueryPlan = {
+                ...resolvedQueryPlan,
+                anchors: filteredAnchors.slice(0, 16),
+              };
+              emit("narration_delta", {
+                id: `run-${runId}-anchor-disease-relevance`,
+                ts: new Date().toISOString(),
+                kind: "branch",
+                title: "Disease relevance filter pruned off-context target anchors",
+                detail: `Pruned ${prunedTargetCount} target anchors lacking disease-context support while preserving explicit query anchors.`,
+                source: "planner",
+                pathState: "discarded",
+                entities: anchorDiseaseRelevanceFilterResult.discardKeys
+                  .slice(0, 6)
+                  .map((key) => ({
+                    type: "target",
+                    label: key,
+                  })),
+              });
+            }
+          }
+        }
+
+        selectionIntentSnapshot = await inferSelectionIntentSemantic({
+          query,
+          queryPlan: resolvedQueryPlan,
+        }).catch(() => deriveDefaultSelectionIntentFromQueryPlan(resolvedQueryPlan, query));
+        const resolvedSelectionIntent =
+          selectionIntentSnapshot ?? deriveDefaultSelectionIntentFromQueryPlan(resolvedQueryPlan, query);
+        emit("narration_delta", {
+          id: `run-${runId}-selection-intent`,
+          ts: new Date().toISOString(),
+          kind: "insight",
+          title: "Selection intent inferred",
+          detail: [
+            resolvedSelectionIntent.rationale,
+            `Objective=${resolvedSelectionIntent.objective.replace(/_/g, " ")}, reasoning=${resolvedSelectionIntent.reasoningStyle}.`,
+            `Mediator priority=${resolvedSelectionIntent.prioritizeMediatorDiscovery ? "yes" : "no"}, intervention priority=${resolvedSelectionIntent.prioritizeInterventionReadiness ? "yes" : "no"}, connected-evidence required=${resolvedSelectionIntent.requireConnectedAnchorEvidence ? "yes" : "no"}.`,
+            resolvedSelectionIntent.chainSummary.length > 0
+              ? `Dynamic chain: ${resolvedSelectionIntent.chainSummary
+                  .slice(0, 3)
+                  .join(" | ")}.`
+              : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+          source: "planner",
+          pathState: "active",
+          entities: resolvedSelectionIntent.endpointTargetSymbols.slice(0, 6).map((symbol) => ({
+            type: "target",
+            label: symbol,
+          })),
+        });
+
         emit("resolver_selected", {
           query,
           selected: chosen.selected,
           rationale: chosen.rationale,
           candidates,
+          anchorLock: {
+            status: diseaseAnchorLock.status,
+            confidence: Number(diseaseAnchorLock.confidence.toFixed(3)),
+            primaryId: diseaseAnchorLock.primaryId,
+            keepIds: diseaseAnchorLock.keepIds,
+            discardIds: diseaseAnchorLock.discardIds,
+            rationale: diseaseAnchorLock.rationale,
+          },
+          anchorContextFilter: anchorContextFilterResult,
+          anchorDiseaseRelevanceFilter: anchorDiseaseRelevanceFilterResult,
+          selectionIntent: resolvedSelectionIntent,
           alternatives: verifierAlternativeCandidates,
           mustKeep: verifierMustKeepCandidates,
           verificationRationale: resolverLoop?.rationale ?? null,
@@ -6040,17 +10881,30 @@ export async function GET(request: NextRequest) {
         emit("plan_ready", {
           runId,
           query,
-          queryPlan: bundled.queryPlan,
+          queryPlan: resolvedQueryPlan ?? bundled.queryPlan,
           resolver: {
             selected: chosen.selected,
             rationale: chosen.rationale,
             candidates,
+            anchorLock: {
+              status: diseaseAnchorLock.status,
+              confidence: Number(diseaseAnchorLock.confidence.toFixed(3)),
+              primaryId: diseaseAnchorLock.primaryId,
+              keepIds: diseaseAnchorLock.keepIds,
+              discardIds: diseaseAnchorLock.discardIds,
+              rationale: diseaseAnchorLock.rationale,
+            },
+            anchorContextFilter: anchorContextFilterResult,
+            anchorDiseaseRelevanceFilter: anchorDiseaseRelevanceFilterResult,
+            selectionIntent: resolvedSelectionIntent,
           },
         });
         stepRequestLog(log, "run_case.resolver_selected", {
           selectedDiseaseId: chosen.selected.id,
           selectedDiseaseName: chosen.selected.name,
           candidateCount: candidates.length,
+          anchorLockStatus: diseaseAnchorLock.status,
+          anchorLockConfidence: Number(diseaseAnchorLock.confidence.toFixed(3)),
         });
 
         emit("narration_delta", {
@@ -6110,11 +10964,7 @@ export async function GET(request: NextRequest) {
                 message,
                 discovererTimeoutMs,
               });
-              emit("run_error", {
-                phase: "agent_discoverer",
-                message,
-                recoverable: true,
-              });
+              emitRecoverableWarning("agent_discoverer", message);
               emit("narration_delta", {
                 id: `run-${runId}-agent-warning`,
                 ts: new Date().toISOString(),
@@ -6128,12 +10978,10 @@ export async function GET(request: NextRequest) {
               return null;
             });
         } else {
-          emit("run_error", {
-            phase: "agent_discoverer",
-            message:
-              "Time budget reserved for final synthesis; skipping deep discoverer branch expansion.",
-            recoverable: true,
-          });
+          emitRecoverableWarning(
+            "agent_discoverer",
+            "Time budget reserved for final synthesis; skipping deep discoverer branch expansion.",
+          );
         }
 
         let plannedTargetSeeds = [
@@ -6185,7 +11033,11 @@ export async function GET(request: NextRequest) {
             candidate.id !== chosen.selected.id &&
             !/^HP_/i.test(candidate.id),
         );
-        const secondaryDiseaseCandidates = ((): DiseaseCandidate[] => {
+        const anchorLockedDiseaseSet = new Set(diseaseAnchorLock.keepIds);
+        const queryImpliedSecondaryDiseaseIds = new Set(
+          planSecondaryCandidatesScoped.map((candidate) => candidate.id),
+        );
+        const rawSecondaryDiseaseCandidates = ((): DiseaseCandidate[] => {
           if (forceConceptCentricMode) return [];
           if (!relationQuery) return [];
           if (strictExplicitAnchorMode) {
@@ -6205,9 +11057,37 @@ export async function GET(request: NextRequest) {
             .filter((candidate) => !isSameDiseaseCandidate(candidate, chosen.selected))
             .slice(0, SECONDARY_ANCHOR_CANDIDATE_LIMIT);
         })();
-        const queryImpliedSecondaryDiseaseIds = new Set(
-          planSecondaryCandidatesScoped.map((candidate) => candidate.id),
-        );
+        const secondaryDiseaseCandidates =
+          anchorLockedDiseaseSet.size > 0
+            ? rawSecondaryDiseaseCandidates.filter(
+                (candidate) =>
+                  anchorLockedDiseaseSet.has(candidate.id) ||
+                  queryImpliedSecondaryDiseaseIds.has(candidate.id),
+              )
+            : rawSecondaryDiseaseCandidates;
+        const prunedSecondaryDiseaseCandidates =
+          rawSecondaryDiseaseCandidates.length > secondaryDiseaseCandidates.length
+            ? rawSecondaryDiseaseCandidates.filter(
+                (candidate) =>
+                  !secondaryDiseaseCandidates.some((kept) => kept.id === candidate.id),
+              )
+            : [];
+        if (prunedSecondaryDiseaseCandidates.length > 0) {
+          emit("narration_delta", {
+            id: `run-${runId}-secondary-anchor-pruned`,
+            ts: new Date().toISOString(),
+            kind: "branch",
+            title: "Secondary disease branches pruned by anchor lock",
+            detail: `Pruned ${prunedSecondaryDiseaseCandidates.length} secondary disease candidates not aligned with locked disease context.`,
+            source: "planner",
+            pathState: "discarded",
+            entities: prunedSecondaryDiseaseCandidates.slice(0, 4).map((candidate) => ({
+              type: "disease",
+              label: candidate.name,
+              primaryId: candidate.id,
+            })),
+          });
+        }
         const secondaryAnchorSeedCandidates = secondaryDiseaseCandidates.filter((candidate) =>
           queryImpliedSecondaryDiseaseIds.has(candidate.id),
         );
@@ -6444,21 +11324,95 @@ export async function GET(request: NextRequest) {
             pathUpdate: livePathUpdate,
             nodeMap,
           });
+          const livePathFocusTargets = extractPathFocusTargetSymbols(
+            livePathUpdate,
+            nodeMap,
+          );
+          const pathFocusMergeOptions = buildPathFocusMergeOptions({
+            selectionIntent: selectionIntentSnapshot,
+            pathFocusTargetSymbols: livePathFocusTargets,
+          });
           const brief = generateBriefSections({
             ranking: currentRanking,
+            queryText: query,
             nodeMap,
             edgeMap,
             sourceHealth,
             semanticConceptMentions: semanticConceptMentionsEarly,
+            semanticPhenotypeMentions: semanticPhenotypeMentionsEarly,
             semanticTargetSymbols: semanticTargetSymbolsEarly,
             hasInterventionConcept: hasInterventionConceptEarly,
             queryAnchorCount: (resolvedQueryPlan?.anchors ?? []).length,
-            pathFocusTargetSymbols: extractPathFocusTargetSymbols(livePathUpdate, nodeMap),
+            pathFocusTargetSymbols: livePathFocusTargets,
             pathConnectedAcrossAnchors: Boolean(livePathUpdate?.connectedAcrossAnchors),
             unresolvedAnchorPairCount: livePathUpdate?.unresolvedAnchorPairs?.length ?? 0,
+            selectionIntent: selectionIntentSnapshot,
             enrichmentLinksByNodeId,
           });
-          const pathAlignedBrief = mergePathFocusIntoBrief(brief, pathFocus);
+          const pathAlignedBrief = mergePathFocusIntoBrief(
+            brief,
+            pathFocus,
+            pathFocusMergeOptions,
+          );
+          const explainabilitySnapshot = buildLiveExplainabilitySnapshot({
+            brief: pathAlignedBrief,
+            sourceHealth,
+            pathSummary: livePathUpdate?.summary ?? pathFocus?.summary,
+            provisional,
+          });
+          const explainabilitySignature = [
+            provisional ? "provisional" : "final",
+            explainabilitySnapshot.leadTarget,
+            explainabilitySnapshot.leadScore.toFixed(3),
+            explainabilitySnapshot.selectionDiagnostics.anchorCoverageScore.toFixed(3),
+            explainabilitySnapshot.selectionDiagnostics.recommendationAnchorMatchScore.toFixed(3),
+            explainabilitySnapshot.pathSummary,
+            explainabilitySnapshot.degradedSources.join(","),
+          ].join("::");
+          if (explainabilitySignature !== lastExplainabilitySignature) {
+            lastExplainabilitySignature = explainabilitySignature;
+            emit("brief_section", {
+              section: "explainability",
+              data: explainabilitySnapshot,
+            });
+          }
+          const primaryThread = (pathAlignedBrief.threadCandidates ?? [])[0] ?? null;
+          if (primaryThread) {
+            const hypothesisSummary =
+              primaryThread.hypothesis?.statement ||
+              sanitizePathSummaryForNarrative(primaryThread.summary) ||
+              `${primaryThread.target} mechanism thread`;
+            const hypothesisSignature = [
+              provisional ? "provisional" : "final",
+              primaryThread.target,
+              primaryThread.pathway,
+              primaryThread.drug,
+              hypothesisSummary,
+            ].join("::");
+            if (hypothesisSignature !== lastHypothesisNarrationSignature) {
+              lastHypothesisNarrationSignature = hypothesisSignature;
+              emit("narration_delta", {
+                id: `run-${runId}-hypothesis-${Date.now()}`,
+                ts: new Date().toISOString(),
+                kind: "branch",
+                title: provisional
+                  ? "Provisional mechanism hypothesis"
+                  : "Primary mechanism hypothesis updated",
+                detail: compactText(hypothesisSummary, 220),
+                source: "agent",
+                pathState: provisional ? "candidate" : "active",
+                entities: [
+                  { type: "target", label: primaryThread.target },
+                  ...(primaryThread.pathway && primaryThread.pathway !== "not provided"
+                    ? [{ type: "pathway", label: primaryThread.pathway }]
+                    : []),
+                  ...(primaryThread.drug && primaryThread.drug !== "not provided"
+                    ? [{ type: "drug", label: primaryThread.drug }]
+                    : []),
+                ],
+              });
+            }
+          }
 
           if (
             !pathAlignedBrief.recommendation ||
@@ -6486,6 +11440,79 @@ export async function GET(request: NextRequest) {
               provisional,
             },
           });
+        };
+
+        const applyBiomedicalMechanismGateToBrief = async (
+          briefSnapshot: ReturnType<typeof generateBriefSections>,
+          pathFocus: PathFocusSnapshot | null,
+          reserveMs: number,
+        ): Promise<ReturnType<typeof generateBriefSections>> => {
+          const mechanismGateTimeoutMs = boundedStageTimeoutMs(startedAt, 12_000, {
+            reserveMs,
+            minMs: 4_000,
+          });
+          if (mechanismGateTimeoutMs <= 0) {
+            return briefSnapshot;
+          }
+          const gated = await runBiomedicalMechanismGate({
+            query,
+            brief: briefSnapshot,
+            selectedDiseaseName: chosen.selected.name,
+            queryPlan: resolvedQueryPlan,
+            selectionIntent: selectionIntentSnapshot,
+            pathFocus,
+            timeoutMs: mechanismGateTimeoutMs,
+          }).catch(() => null);
+          if (!gated) return briefSnapshot;
+
+          emit("brief_section", {
+            section: "quality_gate",
+            data: {
+              stage: "biomedical_mechanism_gate",
+              pass: gated.gate.pass,
+              confidence: gated.gate.confidence,
+              majorMismatch: gated.gate.majorMismatch,
+              unsupportedClaims: gated.gate.offContextIssues,
+              approvedDrugClaimIssues: gated.gate.evidenceGapIssues,
+              rationale: gated.gate.rationale,
+            },
+          });
+          if (
+            gated.changed ||
+            gated.gate.offContextIssues.length > 0 ||
+            gated.gate.evidenceGapIssues.length > 0 ||
+            gated.gate.majorMismatch
+          ) {
+            emit("narration_delta", {
+              id: `run-${runId}-biomedical-mechanism-gate-${Date.now()}`,
+              ts: new Date().toISOString(),
+              kind: gated.gate.majorMismatch ? "warning" : "insight",
+              title: "Biomedical mechanism gate applied",
+              detail: `${gated.gate.rationale} ${
+                gated.changed
+                  ? `Primary thread updated to ${gated.brief.recommendation?.target ?? "not provided"}.`
+                  : "Primary thread retained."
+              }`,
+              source: "agent",
+              pathState: gated.gate.majorMismatch ? "candidate" : "active",
+              entities:
+                gated.brief.recommendation?.target
+                  ? [
+                      {
+                        type: "target",
+                        label: gated.brief.recommendation.target,
+                      },
+                    ]
+                  : [],
+            });
+          }
+          if (!gated.gate.pass || gated.gate.majorMismatch) {
+            emitRecoverableWarning(
+              "biomedical_mechanism_gate",
+              "Mechanism validity gate flagged context/evidence issues; recommendation was adjusted.",
+            );
+          }
+          return gated.brief;
         };
 
         while (true) {
@@ -7280,6 +12307,13 @@ export async function GET(request: NextRequest) {
                 const semanticTargetSymbols = (resolvedQueryPlan?.anchors ?? [])
                   .filter((anchor) => anchor.entityType === "target")
                   .map((anchor) => anchor.name);
+                const semanticPhenotypeMentions = (resolvedQueryPlan?.anchors ?? [])
+                  .filter((anchor) =>
+                    anchor.requestedType === "effect" ||
+                    anchor.requestedType === "phenotype" ||
+                    anchor.requestedType === "anatomy",
+                  )
+                  .map((anchor) => anchor.mention);
                 const semanticConceptMentions = [
                   ...(resolvedQueryPlan?.anchors ?? []).map((anchor) => anchor.mention),
                   ...llmRelationMentions,
@@ -7301,28 +12335,40 @@ export async function GET(request: NextRequest) {
                   pathUpdate: initialPathUpdate,
                   nodeMap,
                 });
+                const initialPathFocusTargets = extractPathFocusTargetSymbols(
+                  initialPathUpdate,
+                  nodeMap,
+                );
+                const initialPathFocusMergeOptions = buildPathFocusMergeOptions({
+                  selectionIntent: selectionIntentSnapshot,
+                  pathFocusTargetSymbols: initialPathFocusTargets,
+                });
 
                 let brief = mergeSupplementalEvidenceIntoBrief(
                   generateBriefSections({
                     ranking,
+                    queryText: query,
                     nodeMap,
                     edgeMap,
                     sourceHealth,
                     semanticConceptMentions,
+                    semanticPhenotypeMentions,
                     semanticTargetSymbols,
                     hasInterventionConcept,
                     queryAnchorCount: (resolvedQueryPlan?.anchors ?? []).length,
-                    pathFocusTargetSymbols: extractPathFocusTargetSymbols(
-                      initialPathUpdate,
-                      nodeMap,
-                    ),
+                    pathFocusTargetSymbols: initialPathFocusTargets,
                     pathConnectedAcrossAnchors: Boolean(initialPathUpdate?.connectedAcrossAnchors),
                     unresolvedAnchorPairCount: initialPathUpdate?.unresolvedAnchorPairs?.length ?? 0,
+                    selectionIntent: selectionIntentSnapshot,
                     enrichmentLinksByNodeId,
                   }),
                   supplementalEvidence,
                 );
-                brief = mergePathFocusIntoBrief(brief, initialPathFocus);
+                brief = mergePathFocusIntoBrief(
+                  brief,
+                  initialPathFocus,
+                  initialPathFocusMergeOptions,
+                );
                 {
                   const arbitrationTimeoutMs = boundedStageTimeoutMs(startedAt, 8_000, {
                     reserveMs: 18_000,
@@ -7337,10 +12383,25 @@ export async function GET(request: NextRequest) {
                     });
                   }
                 }
+                brief = await applyBiomedicalMechanismGateToBrief(
+                  brief,
+                  initialPathFocus,
+                  16_000,
+                );
 
                 const emitBriefSnapshot = (
                   snapshot: ReturnType<typeof generateBriefSections>,
                 ) => {
+                  const explainabilitySnapshot = buildLiveExplainabilitySnapshot({
+                    brief: snapshot,
+                    sourceHealth,
+                    pathSummary: latestPathUpdate?.summary ?? snapshot.threadCandidates[0]?.summary,
+                    provisional: false,
+                  });
+                  emit("brief_section", {
+                    section: "explainability",
+                    data: explainabilitySnapshot,
+                  });
                   emit("brief_section", {
                     section: "final_brief",
                     data: snapshot,
@@ -7407,6 +12468,7 @@ export async function GET(request: NextRequest) {
                     remainingRunBudgetMs(startedAt, 12_000),
                   );
                   let lastSynthesisPct = 94;
+                  let lastSynthesisNarrationAt = 0;
                   const synthesisHeartbeat = setInterval(() => {
                     if (streamState.closed || streamAbort.signal.aborted) return;
                     const elapsed = Math.max(0, Date.now() - synthesisStartedAt);
@@ -7429,16 +12491,17 @@ export async function GET(request: NextRequest) {
                       pct = 98;
                     }
                     lastSynthesisPct = pct;
+                    const statusMessage =
+                      remainingBudgetMs <= 35_000
+                        ? "Finalizing answer and citations within run budget"
+                        : ratio >= 0.82
+                          ? "Validating synthesis consistency and inline citations"
+                          : ratio >= 0.45
+                            ? "Refining mechanism narrative and ranking evidence support"
+                            : "Synthesizing answer from the active evidence graph";
                     emit("status", {
                       phase: "P6",
-                      message:
-                        remainingBudgetMs <= 35_000
-                          ? "Finalizing answer and citations within run budget"
-                          : ratio >= 0.82
-                            ? "Validating synthesis consistency and inline citations"
-                            : ratio >= 0.45
-                              ? "Refining mechanism narrative and ranking evidence support"
-                              : "Synthesizing answer from the active evidence graph",
+                      message: statusMessage,
                       pct,
                       elapsedMs: Date.now() - startedAt,
                       partial: true,
@@ -7448,6 +12511,19 @@ export async function GET(request: NextRequest) {
                       },
                       sourceHealth,
                     });
+                    if (elapsed - lastSynthesisNarrationAt >= SYNTHESIS_NARRATION_INTERVAL_MS) {
+                      lastSynthesisNarrationAt = elapsed;
+                      emit("narration_delta", {
+                        id: `run-${runId}-synthesis-heartbeat-${elapsed}`,
+                        ts: new Date().toISOString(),
+                        kind: "phase",
+                        title: "Scientific synthesis in progress",
+                        detail: statusMessage,
+                        source: "agent",
+                        pathState: "active",
+                        entities: [],
+                      });
+                    }
                   }, 3000);
 
                   try {
@@ -7458,13 +12534,14 @@ export async function GET(request: NextRequest) {
                         (discovererTimeoutMs || DISCOVERER_TIMEOUT_CEILING_MS) - 5_000,
                       ),
                       {
-                        reserveMs: 24_000,
-                        minMs: 25_000,
+                        reserveMs: 20_000,
+                        minMs: 30_000,
                       },
                     );
                     const discovererWaitMs = Math.min(
                       MAX_DISCOVERER_FINAL_WAIT_MS,
                       discovererWaitBudgetMs,
+                      SYNTHESIS_DISCOVERER_WAIT_CAP_MS,
                     );
                     const final =
                       discovererWaitMs > 0
@@ -7492,27 +12569,39 @@ export async function GET(request: NextRequest) {
                       pathUpdate: finalPathUpdate,
                       nodeMap,
                     });
+                    const finalPathFocusTargets = extractPathFocusTargetSymbols(
+                      finalPathUpdate,
+                      nodeMap,
+                    );
+                    const finalPathFocusMergeOptions = buildPathFocusMergeOptions({
+                      selectionIntent: selectionIntentSnapshot,
+                      pathFocusTargetSymbols: finalPathFocusTargets,
+                    });
                     brief = mergeSupplementalEvidenceIntoBrief(
                       generateBriefSections({
                         ranking,
+                        queryText: query,
                         nodeMap,
                         edgeMap,
                         sourceHealth,
                         semanticConceptMentions,
+                        semanticPhenotypeMentions,
                         semanticTargetSymbols,
                         hasInterventionConcept,
                         queryAnchorCount: (resolvedQueryPlan?.anchors ?? []).length,
-                        pathFocusTargetSymbols: extractPathFocusTargetSymbols(
-                          finalPathUpdate,
-                          nodeMap,
-                        ),
+                        pathFocusTargetSymbols: finalPathFocusTargets,
                         pathConnectedAcrossAnchors: Boolean(finalPathUpdate?.connectedAcrossAnchors),
                         unresolvedAnchorPairCount: finalPathUpdate?.unresolvedAnchorPairs?.length ?? 0,
+                        selectionIntent: selectionIntentSnapshot,
                         enrichmentLinksByNodeId,
                       }),
                       supplementalEvidence,
                     );
-                    brief = mergePathFocusIntoBrief(brief, finalPathFocus);
+                    brief = mergePathFocusIntoBrief(
+                      brief,
+                      finalPathFocus,
+                      finalPathFocusMergeOptions,
+                    );
                     {
                       const arbitrationTimeoutMs = boundedStageTimeoutMs(startedAt, 8_000, {
                         reserveMs: 14_000,
@@ -7527,15 +12616,23 @@ export async function GET(request: NextRequest) {
                         });
                       }
                     }
+                    brief = await applyBiomedicalMechanismGateToBrief(
+                      brief,
+                      finalPathFocus,
+                      12_000,
+                    );
                     emitBriefSnapshot(brief);
 
                     if (!final) {
                       const fallbackTimeoutMs = boundedStageTimeoutMs(
                         startedAt,
-                        FALLBACK_SYNTHESIS_TIMEOUT_MS,
+                        Math.min(
+                          FALLBACK_SYNTHESIS_TIMEOUT_MS,
+                          FALLBACK_SYNTHESIS_STAGE_CAP_MS,
+                        ),
                         {
-                          reserveMs: 14_000,
-                          minMs: 18_000,
+                          reserveMs: 12_000,
+                          minMs: 22_000,
                         },
                       );
                       const fallbackFinal =
@@ -7556,6 +12653,9 @@ export async function GET(request: NextRequest) {
                           alignFinalFocusThreadToPath(
                             fallbackFinal,
                             finalPathFocus,
+                            {
+                              allowedTargets: buildPathAlignmentAllowedTargets({ brief }),
+                            },
                           ),
                           finalPathFocus,
                           sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
@@ -7571,10 +12671,8 @@ export async function GET(request: NextRequest) {
                         if (!discovererAnswerEmitted) {
                           emit("answer_delta", {
                             text: discovererFinal.answer.trim(),
-                            final: true,
+                            final: false,
                           });
-                          emit("final_answer", discovererFinal);
-                          discovererAnswerEmitted = true;
                         }
                         emit("narration_delta", {
                           id: `run-${runId}-fallback-synthesis`,
@@ -7588,11 +12686,28 @@ export async function GET(request: NextRequest) {
                           entities: [],
                         });
                       } else {
-                        emit("run_error", {
-                          phase: "agent_discoverer",
-                          message:
-                            "Final synthesis exceeded runtime budget; closing with baseline evidence summary.",
-                          recoverable: true,
+                        discovererFinal = buildDeterministicFinalFromBrief({
+                          query,
+                          selectedDiseaseName: chosen.selected.name,
+                          activePathSummary:
+                            sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+                          brief,
+                          pathFocus: finalPathFocus,
+                        });
+                        emitRecoverableWarning(
+                          "agent_discoverer",
+                          "Final synthesis exceeded runtime budget; deterministic evidence-based final answer was generated.",
+                        );
+                        emit("narration_delta", {
+                          id: `run-${runId}-deterministic-fallback`,
+                          ts: new Date().toISOString(),
+                          kind: "warning",
+                          title: "Deterministic final synthesis applied",
+                          detail:
+                            "Primary synthesis timed out; final answer was generated from ranked evidence and mechanism threads.",
+                          source: "agent",
+                          pathState: "candidate",
+                          entities: [],
                         });
                       }
                     }
@@ -7602,6 +12717,9 @@ export async function GET(request: NextRequest) {
                         alignFinalFocusThreadToPath(
                           discovererFinal,
                           finalPathFocus,
+                          {
+                            allowedTargets: buildPathAlignmentAllowedTargets({ brief }),
+                          },
                         ),
                         finalPathFocus,
                         sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
@@ -7609,7 +12727,10 @@ export async function GET(request: NextRequest) {
                       );
                       const groundingTimeoutMs = boundedStageTimeoutMs(
                         startedAt,
-                        FINAL_GROUNDING_TIMEOUT_MS,
+                        Math.min(
+                          FINAL_GROUNDING_TIMEOUT_MS,
+                          FINAL_GROUNDING_STAGE_CAP_MS,
+                        ),
                         {
                           reserveMs: 8_000,
                           minMs: 12_000,
@@ -7647,6 +12768,132 @@ export async function GET(request: NextRequest) {
                           brief.citations ?? [],
                         ),
                       };
+                      const claimGateTimeoutMs = boundedStageTimeoutMs(
+                        startedAt,
+                        Math.max(12_000, Math.min(FINAL_GROUNDING_TIMEOUT_MS, 28_000)),
+                        {
+                          reserveMs: 7_000,
+                          minMs: 12_000,
+                        },
+                      );
+                      if (claimGateTimeoutMs > 0) {
+                        const claimGate = await runFinalClaimGate({
+                          query,
+                          answer: discovererFinal.answer,
+                          brief,
+                          pathFocus: finalPathFocus,
+                          queryPlan: resolvedQueryPlan,
+                          allowedEntityLabels: collectAllowedEntityLabels(nodeMap, 220),
+                          approvedDrugEvidence: collectApprovedDrugEvidence({
+                            nodeMap,
+                            edgeMap,
+                            limit: 18,
+                          }),
+                          timeoutMs: claimGateTimeoutMs,
+                        }).catch(() => null);
+                        if (claimGate) {
+                          discovererFinal = {
+                            ...discovererFinal,
+                            answer: ensureInlineCitations(
+                              claimGate.answer,
+                              brief.citations ?? [],
+                            ),
+                          };
+                          emit("brief_section", {
+                            section: "quality_gate",
+                            data: {
+                              stage: "final_claim_gate",
+                              ...claimGate.gate,
+                            },
+                          });
+                          if (!claimGate.gate.pass || claimGate.gate.majorMismatch) {
+                            emitRecoverableWarning(
+                              "final_claim_gate",
+                              "Final answer required claim-safety revisions before release.",
+                            );
+                          }
+                        }
+                      }
+                      const graphNarrativeGateTimeoutMs = boundedStageTimeoutMs(
+                        startedAt,
+                        Math.max(10_000, Math.min(FINAL_GROUNDING_TIMEOUT_MS, 24_000)),
+                        {
+                          reserveMs: 6_000,
+                          minMs: 10_000,
+                        },
+                      );
+                      if (graphNarrativeGateTimeoutMs > 0) {
+                        emit("narration_delta", {
+                          id: `run-${runId}-graph-narrative-gate-start`,
+                          ts: new Date().toISOString(),
+                          kind: "phase",
+                          title: "Graph-narrative validation",
+                          detail:
+                            "Validating that final written claims align with explicit graph nodes and edges.",
+                          source: "agent",
+                          pathState: "active",
+                          entities: [],
+                        });
+                        const graphNarrativeGate = await runGraphNarrativeAgreementGate({
+                          query,
+                          answer: discovererFinal.answer,
+                          brief,
+                          nodeMap,
+                          edgeMap,
+                          queryPlan: resolvedQueryPlan,
+                          pathFocus: finalPathFocus,
+                          timeoutMs: graphNarrativeGateTimeoutMs,
+                        }).catch(() => null);
+                        if (graphNarrativeGate) {
+                          emit("narration_delta", {
+                            id: `run-${runId}-graph-narrative-gate-result`,
+                            ts: new Date().toISOString(),
+                            kind: graphNarrativeGate.gate.pass ? "insight" : "warning",
+                            title: graphNarrativeGate.gate.pass
+                              ? "Graph-narrative validation passed"
+                              : "Graph-narrative validation revised answer",
+                            detail: graphNarrativeGate.gate.rationale,
+                            source: "agent",
+                            pathState: graphNarrativeGate.gate.pass ? "active" : "candidate",
+                            entities: [],
+                          });
+                          discovererFinal = {
+                            ...discovererFinal,
+                            answer: ensureInlineCitations(
+                              graphNarrativeGate.answer,
+                              brief.citations ?? [],
+                            ),
+                          };
+                          emit("brief_section", {
+                            section: "quality_gate",
+                            data: {
+                              stage: "graph_narrative_gate",
+                              pass: graphNarrativeGate.gate.pass,
+                              confidence: graphNarrativeGate.gate.confidence,
+                              majorMismatch: graphNarrativeGate.gate.majorMismatch,
+                              unsupportedClaims: graphNarrativeGate.gate.unsupportedClaims,
+                              approvedDrugClaimIssues: [
+                                ...graphNarrativeGate.gate.missingGraphEntities,
+                                ...graphNarrativeGate.gate.missingGraphRelations,
+                              ].slice(0, 8),
+                              rationale: graphNarrativeGate.gate.rationale,
+                            },
+                          });
+                          if (
+                            !graphNarrativeGate.gate.pass ||
+                            graphNarrativeGate.gate.majorMismatch
+                          ) {
+                            emitRecoverableWarning(
+                              "graph_narrative_gate",
+                              "Final answer required graph-narrative consistency revisions before release.",
+                            );
+                          }
+                        }
+                      }
+                      discovererFinal = reconcileFinalFocusThreadFromBrief(
+                        discovererFinal,
+                        brief,
+                      );
                       if (!discovererAnswerEmitted && groundedFinal.answer.trim().length > 0) {
                         emit("answer_delta", {
                           text: discovererFinal.answer.trim(),
@@ -7744,12 +12991,10 @@ export async function GET(request: NextRequest) {
           !completionEmitted
         ) {
           if (!internalDoneReceived) {
-            emit("run_error", {
-              phase: "stream_graph",
-              message:
-                "Baseline stream ended before terminal done event; finalizing from accumulated evidence.",
-              recoverable: true,
-            });
+            emitRecoverableWarning(
+              "stream_graph",
+              "Baseline stream ended before terminal done event; finalizing from accumulated evidence.",
+            );
             warnRequestLog(log, "run_case.done_missing", {
               nodeCount: nodeMap.size,
               edgeCount: edgeMap.size,
@@ -7759,6 +13004,13 @@ export async function GET(request: NextRequest) {
           const semanticTargetSymbols = (resolvedQueryPlan?.anchors ?? [])
             .filter((anchor) => anchor.entityType === "target")
             .map((anchor) => anchor.name);
+          const semanticPhenotypeMentions = (resolvedQueryPlan?.anchors ?? [])
+            .filter((anchor) =>
+              anchor.requestedType === "effect" ||
+              anchor.requestedType === "phenotype" ||
+              anchor.requestedType === "anatomy",
+            )
+            .map((anchor) => anchor.mention);
           const semanticConceptMentions = [
             ...(resolvedQueryPlan?.anchors ?? []).map((anchor) => anchor.mention),
             ...llmRelationMentions,
@@ -7780,28 +13032,40 @@ export async function GET(request: NextRequest) {
             pathUpdate: finalPathUpdate,
             nodeMap,
           });
+          const finalPathFocusTargets = extractPathFocusTargetSymbols(
+            finalPathUpdate,
+            nodeMap,
+          );
+          const finalPathFocusMergeOptions = buildPathFocusMergeOptions({
+            selectionIntent: selectionIntentSnapshot,
+            pathFocusTargetSymbols: finalPathFocusTargets,
+          });
 
           let brief = mergeSupplementalEvidenceIntoBrief(
             generateBriefSections({
               ranking,
+              queryText: query,
               nodeMap,
               edgeMap,
               sourceHealth,
               semanticConceptMentions,
+              semanticPhenotypeMentions,
               semanticTargetSymbols,
               hasInterventionConcept,
               queryAnchorCount: (resolvedQueryPlan?.anchors ?? []).length,
-              pathFocusTargetSymbols: extractPathFocusTargetSymbols(
-                finalPathUpdate,
-                nodeMap,
-              ),
+              pathFocusTargetSymbols: finalPathFocusTargets,
               pathConnectedAcrossAnchors: Boolean(finalPathUpdate?.connectedAcrossAnchors),
               unresolvedAnchorPairCount: finalPathUpdate?.unresolvedAnchorPairs?.length ?? 0,
+              selectionIntent: selectionIntentSnapshot,
               enrichmentLinksByNodeId,
             }),
             supplementalEvidence,
           );
-          brief = mergePathFocusIntoBrief(brief, finalPathFocus);
+          brief = mergePathFocusIntoBrief(
+            brief,
+            finalPathFocus,
+            finalPathFocusMergeOptions,
+          );
           {
             const arbitrationTimeoutMs = boundedStageTimeoutMs(startedAt, 8_000, {
               reserveMs: 12_000,
@@ -7816,7 +13080,21 @@ export async function GET(request: NextRequest) {
               });
             }
           }
+          brief = await applyBiomedicalMechanismGateToBrief(
+            brief,
+            finalPathFocus,
+            10_000,
+          );
 
+          emit("brief_section", {
+            section: "explainability",
+            data: buildLiveExplainabilitySnapshot({
+              brief,
+              sourceHealth,
+              pathSummary: finalPathUpdate?.summary ?? finalPathFocus?.summary,
+              provisional: false,
+            }),
+          });
           emit("brief_section", {
             section: "final_brief",
             data: brief,
@@ -7834,10 +13112,10 @@ export async function GET(request: NextRequest) {
           if (!discovererFinal && discovererPromise) {
             const lateDiscovererWaitMs = boundedStageTimeoutMs(
               startedAt,
-              MAX_DISCOVERER_FINAL_WAIT_MS,
+              Math.min(MAX_DISCOVERER_FINAL_WAIT_MS, LATE_DISCOVERER_WAIT_CAP_MS),
               {
-                reserveMs: 18_000,
-                minMs: 20_000,
+                reserveMs: 15_000,
+                minMs: 16_000,
               },
             );
             if (lateDiscovererWaitMs > 0) {
@@ -7858,10 +13136,13 @@ export async function GET(request: NextRequest) {
           if (!discovererFinal) {
             const fallbackTimeoutMs = boundedStageTimeoutMs(
               startedAt,
-              FALLBACK_SYNTHESIS_TIMEOUT_MS,
+              Math.min(
+                FALLBACK_SYNTHESIS_TIMEOUT_MS,
+                FALLBACK_SYNTHESIS_STAGE_CAP_MS,
+              ),
               {
-                reserveMs: 10_000,
-                minMs: 15_000,
+                reserveMs: 8_000,
+                minMs: 18_000,
               },
             );
             if (fallbackTimeoutMs > 0) {
@@ -7880,6 +13161,9 @@ export async function GET(request: NextRequest) {
                   alignFinalFocusThreadToPath(
                     fallbackFinal,
                     finalPathFocus,
+                    {
+                      allowedTargets: buildPathAlignmentAllowedTargets({ brief }),
+                    },
                   ),
                   finalPathFocus,
                   sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
@@ -7889,11 +13173,40 @@ export async function GET(request: NextRequest) {
             }
           }
 
+          if (!discovererFinal) {
+            discovererFinal = buildDeterministicFinalFromBrief({
+              query,
+              selectedDiseaseName: chosen.selected.name,
+              activePathSummary:
+                sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
+              brief,
+              pathFocus: finalPathFocus,
+            });
+            emitRecoverableWarning(
+              "agent_discoverer",
+              "Final synthesis exceeded runtime budget; deterministic evidence-based final answer was generated.",
+            );
+            emit("narration_delta", {
+              id: `run-${runId}-deterministic-fallback-finalize`,
+              ts: new Date().toISOString(),
+              kind: "warning",
+              title: "Deterministic final synthesis applied",
+              detail:
+                "Primary synthesis timed out; final answer was generated from ranked evidence and mechanism threads.",
+              source: "agent",
+              pathState: "candidate",
+              entities: [],
+            });
+          }
+
           if (discovererFinal?.answer?.trim()) {
             const alignedDraft = alignKeyFindingsToPath(
               alignFinalFocusThreadToPath(
                 discovererFinal,
                 finalPathFocus,
+                {
+                  allowedTargets: buildPathAlignmentAllowedTargets({ brief }),
+                },
               ),
               finalPathFocus,
               sanitizePathSummaryForNarrative(finalPathUpdate?.summary ?? null) || null,
@@ -7901,10 +13214,13 @@ export async function GET(request: NextRequest) {
             );
             const groundingTimeoutMs = boundedStageTimeoutMs(
               startedAt,
-              FINAL_GROUNDING_TIMEOUT_MS,
+              Math.min(
+                FINAL_GROUNDING_TIMEOUT_MS,
+                FINAL_GROUNDING_STAGE_CAP_MS,
+              ),
               {
-                reserveMs: 4_000,
-                minMs: 10_000,
+                reserveMs: 6_000,
+                minMs: 12_000,
               },
             );
             discovererFinal =
@@ -7933,6 +13249,129 @@ export async function GET(request: NextRequest) {
                 brief.citations ?? [],
               ),
             };
+            const claimGateTimeoutMs = boundedStageTimeoutMs(
+              startedAt,
+              Math.max(12_000, Math.min(FINAL_GROUNDING_TIMEOUT_MS, 28_000)),
+              {
+                reserveMs: 6_000,
+                minMs: 12_000,
+              },
+            );
+            if (claimGateTimeoutMs > 0) {
+              const claimGate = await runFinalClaimGate({
+                query,
+                answer: discovererFinal.answer,
+                brief,
+                pathFocus: finalPathFocus,
+                queryPlan: resolvedQueryPlan,
+                allowedEntityLabels: collectAllowedEntityLabels(nodeMap, 220),
+                approvedDrugEvidence: collectApprovedDrugEvidence({
+                  nodeMap,
+                  edgeMap,
+                  limit: 18,
+                }),
+                timeoutMs: claimGateTimeoutMs,
+              }).catch(() => null);
+              if (claimGate) {
+                discovererFinal = {
+                  ...discovererFinal,
+                  answer: ensureInlineCitations(
+                    claimGate.answer,
+                    brief.citations ?? [],
+                  ),
+                };
+                emit("brief_section", {
+                  section: "quality_gate",
+                  data: {
+                    stage: "final_claim_gate",
+                    ...claimGate.gate,
+                  },
+                });
+                if (!claimGate.gate.pass || claimGate.gate.majorMismatch) {
+                  emitRecoverableWarning(
+                    "final_claim_gate",
+                    "Final answer required claim-safety revisions before release.",
+                  );
+                }
+              }
+            }
+            const graphNarrativeGateTimeoutMs = boundedStageTimeoutMs(
+              startedAt,
+              Math.max(10_000, Math.min(FINAL_GROUNDING_TIMEOUT_MS, 24_000)),
+              {
+                reserveMs: 6_000,
+                minMs: 10_000,
+              },
+            );
+            if (graphNarrativeGateTimeoutMs > 0) {
+              emit("narration_delta", {
+                id: `run-${runId}-graph-narrative-gate-start-fallback`,
+                ts: new Date().toISOString(),
+                kind: "phase",
+                title: "Graph-narrative validation",
+                detail:
+                  "Validating that final written claims align with explicit graph nodes and edges.",
+                source: "agent",
+                pathState: "active",
+                entities: [],
+              });
+              const graphNarrativeGate = await runGraphNarrativeAgreementGate({
+                query,
+                answer: discovererFinal.answer,
+                brief,
+                nodeMap,
+                edgeMap,
+                queryPlan: resolvedQueryPlan,
+                pathFocus: finalPathFocus,
+                timeoutMs: graphNarrativeGateTimeoutMs,
+              }).catch(() => null);
+              if (graphNarrativeGate) {
+                emit("narration_delta", {
+                  id: `run-${runId}-graph-narrative-gate-result-fallback`,
+                  ts: new Date().toISOString(),
+                  kind: graphNarrativeGate.gate.pass ? "insight" : "warning",
+                  title: graphNarrativeGate.gate.pass
+                    ? "Graph-narrative validation passed"
+                    : "Graph-narrative validation revised answer",
+                  detail: graphNarrativeGate.gate.rationale,
+                  source: "agent",
+                  pathState: graphNarrativeGate.gate.pass ? "active" : "candidate",
+                  entities: [],
+                });
+                discovererFinal = {
+                  ...discovererFinal,
+                  answer: ensureInlineCitations(
+                    graphNarrativeGate.answer,
+                    brief.citations ?? [],
+                  ),
+                };
+                emit("brief_section", {
+                  section: "quality_gate",
+                  data: {
+                    stage: "graph_narrative_gate",
+                    pass: graphNarrativeGate.gate.pass,
+                    confidence: graphNarrativeGate.gate.confidence,
+                    majorMismatch: graphNarrativeGate.gate.majorMismatch,
+                    unsupportedClaims: graphNarrativeGate.gate.unsupportedClaims,
+                    approvedDrugClaimIssues: [
+                      ...graphNarrativeGate.gate.missingGraphEntities,
+                      ...graphNarrativeGate.gate.missingGraphRelations,
+                    ].slice(0, 8),
+                    rationale: graphNarrativeGate.gate.rationale,
+                  },
+                });
+                if (!graphNarrativeGate.gate.pass || graphNarrativeGate.gate.majorMismatch) {
+                  emitRecoverableWarning(
+                    "graph_narrative_gate",
+                    "Final answer required graph-narrative consistency revisions before release.",
+                  );
+                }
+              }
+            }
+            discovererFinal = reconcileFinalFocusThreadFromBrief(
+              discovererFinal,
+              brief,
+            );
 
             if (!discovererAnswerEmitted) {
               emit("answer_delta", {
@@ -8062,12 +13501,16 @@ export async function GET(request: NextRequest) {
     },
     cancel() {
       streamState.closed = true;
-      streamAbort.abort("client disconnected");
-      cleanupSessionRun();
+      if (!streamAbort.signal.aborted) {
+        streamAbort.abort("execution stream canceled");
+      }
+      cleanupSessionRun("interrupted", "execution stream canceled");
     },
   });
 
-  return new Response(stream, {
+  void stream;
+
+  return new Response(createRunSubscriberStream(activeRun), {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
@@ -8089,11 +13532,11 @@ export async function POST(request: NextRequest) {
 
   if (action === "interrupt") {
     const active = activeSessionRuns.get(sessionKey);
-    if (!active) {
+    if (!active || active.status !== "running") {
       return Response.json({ ok: true, interrupted: false });
     }
     active.abortController.abort("interrupted by user");
-    activeSessionRuns.delete(sessionKey);
+    markSessionRunStatus(active, "interrupted", "interrupted by user");
     return Response.json({ ok: true, interrupted: true });
   }
 

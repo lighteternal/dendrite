@@ -133,6 +133,11 @@ export function LandingPage() {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [isPersistingKey, setIsPersistingKey] = useState(false);
+  const [activeSessionRun, setActiveSessionRun] = useState<{
+    runId: string;
+    query: string;
+    startedAt: string | null;
+  } | null>(null);
   const [selectedExampleId, setSelectedExampleId] = useState(
     EXAMPLE_REPLAY_OPTIONS[0]?.id ?? "",
   );
@@ -279,6 +284,50 @@ export function LandingPage() {
     return generated;
   };
 
+  useEffect(() => {
+    let canceled = false;
+    const loadActiveRun = async () => {
+      const sessionId = resolveSessionId();
+      const response = await fetch(
+        `/api/runCaseStream?action=status&sessionId=${encodeURIComponent(sessionId)}`,
+        {
+          method: "GET",
+          cache: "no-store",
+        },
+      ).catch(() => null);
+      if (!response?.ok || canceled) return;
+
+      const payload = (await response.json()) as {
+        active?: boolean;
+        runId?: string | null;
+        query?: string | null;
+        startedAt?: string | null;
+      };
+      if (canceled) return;
+      if (payload.active && payload.runId && payload.query) {
+        setActiveSessionRun({
+          runId: payload.runId,
+          query: payload.query,
+          startedAt:
+            typeof payload.startedAt === "string" && payload.startedAt.trim().length > 0
+              ? payload.startedAt
+              : null,
+        });
+        return;
+      }
+      setActiveSessionRun(null);
+    };
+
+    void loadActiveRun();
+    const timer = window.setInterval(() => {
+      void loadActiveRun();
+    }, 20_000);
+    return () => {
+      canceled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const persistSessionApiKey = async () => {
     const sessionId = resolveSessionId();
     const trimmed = apiKey.trim();
@@ -349,6 +398,11 @@ export function LandingPage() {
       allowEmptyKey: true,
       replayId: selectedExample.id,
     });
+  };
+
+  const resumeActiveRun = () => {
+    if (!activeSessionRun) return;
+    router.push(`/brief?query=${encodeURIComponent(activeSessionRun.query)}`);
   };
 
   return (
@@ -475,6 +529,26 @@ export function LandingPage() {
                 </Button>
               </div>
               {apiKeyError ? <div className="text-[11px] text-[#c03b52]">{apiKeyError}</div> : null}
+              {activeSessionRun ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#d5e4f3] bg-[#f4f9ff] px-3 py-2 text-[11px] text-[#4f6f95]">
+                  <div>
+                    <div className="font-semibold text-[#365f89]">Active query in progress</div>
+                    <div className="mt-0.5">
+                      {activeSessionRun.query}
+                      {activeSessionRun.startedAt
+                        ? ` • started ${new Date(activeSessionRun.startedAt).toLocaleTimeString()}`
+                        : ""}
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="h-8 bg-[#245f8f] text-white hover:bg-[#1d4e76]"
+                    onClick={resumeActiveRun}
+                  >
+                    Resume run
+                  </Button>
+                </div>
+              ) : null}
               <div className="text-[11px] text-[#5c7599]">
                 Long runs can take 5-12 minutes. The graph stays live while synthesis finishes.
               </div>

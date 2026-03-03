@@ -290,7 +290,7 @@ function lexicalFallback(query: string, candidates: DiseaseCandidate[]): {
   return {
     selected: best.item,
     score: best.score,
-    rationale: "Selected via lexical disease-intent matching.",
+    rationale: "Selected via deterministic disease ranking fallback.",
   };
 }
 
@@ -381,29 +381,23 @@ export async function chooseBestDiseaseCandidate(
       rationale?: string;
     };
 
-    const selected =
-      candidates.find((item) => item.id === parsed.selectedId) ?? fallback.selected;
-    const selectedScore = scoreCandidate(extractDiseaseIntent(query), selected);
-
-    if (fallback.score - selectedScore > 1.8) {
-      return {
-        selected: fallback.selected,
-        rationale: `${fallback.rationale} Semantic resolver output was deprioritized by lexical score guardrail.`,
-      };
-    }
+    const selected = candidates.find((item) => item.id === parsed.selectedId) ?? fallback.selected;
+    const usedFallbackSelection = !candidates.some((item) => item.id === parsed.selectedId);
 
     return {
       selected,
       rationale:
         typeof parsed.rationale === "string" && parsed.rationale.trim().length > 0
           ? parsed.rationale.trim()
-          : "Selected via semantic resolver.",
+          : usedFallbackSelection
+            ? "Semantic resolver returned an ambiguous disease selection; used deterministic fallback."
+            : "Selected via semantic resolver.",
     };
   } catch (error) {
     handleOpenAiRateLimit(error);
     return {
       selected: fallback.selected,
-      rationale: "Semantic resolver unavailable; used lexical disease-intent fallback.",
+      rationale: "Semantic resolver unavailable; used deterministic disease ranking fallback.",
     };
   }
 }
@@ -434,23 +428,14 @@ function buildResolutionLoopFallback(
   const rankedById = new Map<string, DiseaseCandidate>(
     rankedCandidates.map((item) => [item.id, item]),
   );
-  const scoreById = new Map(ranked.map((item) => [item.id, item.score]));
   const primary = rankedCandidates[0]!;
-  const primaryScore = scoreById.get(primary.id) ?? 0;
-  const minSupportScore = Math.max(0.9, primaryScore - 1.2);
   const keepIds = planDiseaseAnchors
     .map((anchor) => anchor.id)
     .filter((id) => rankedById.has(id))
-    .filter((id) => (scoreById.get(id) ?? -Infinity) >= minSupportScore)
     .slice(0, 3);
   const alternativeIds = [
     ...keepIds.filter((id) => id !== primary.id),
-    ...ranked
-      .filter(
-        (candidate) =>
-          candidate.id !== primary.id && (scoreById.get(candidate.id) ?? -Infinity) >= minSupportScore,
-      )
-      .map((candidate) => candidate.id),
+    ...ranked.filter((candidate) => candidate.id !== primary.id).map((candidate) => candidate.id),
   ]
     .filter((id, index, all) => all.indexOf(id) === index)
     .slice(0, Math.max(0, maxOptions - 1));
@@ -465,7 +450,7 @@ function buildResolutionLoopFallback(
     primary,
     alternatives,
     mustKeep,
-    rationale: "Selected via lexical disease-intent ranking fallback.",
+    rationale: "Selected via deterministic disease ranking fallback.",
   };
 }
 
@@ -514,7 +499,6 @@ export async function resolveDiseaseAlternativesLoop(input: {
       },
     ]),
   );
-  const lexicalScoreById = new Map(shortlist.map((item) => [item.id, item.lexicalScore]));
 
   const schema = {
     type: "object",
@@ -588,45 +572,37 @@ export async function resolveDiseaseAlternativesLoop(input: {
       mustKeepIds?: string[];
       rationale?: string;
     };
+    const normalizeCandidateId = (value: unknown): string =>
+      String(value ?? "").trim();
+    const parsedPrimaryId = normalizeCandidateId(parsed.primaryId);
 
     const primary =
-      (typeof parsed.primaryId === "string" ? shortlistById.get(parsed.primaryId) : null) ??
+      (parsedPrimaryId ? shortlistById.get(parsedPrimaryId) : null) ??
       fallback.primary;
-    const primaryScore = lexicalScoreById.get(primary.id) ?? lexicalScoreById.get(fallback.primary.id) ?? 0;
-    const minSupportScore = Math.max(0.9, primaryScore - 1.15);
     const mustKeepIds = [
-      ...((Array.isArray(parsed.mustKeepIds) ? parsed.mustKeepIds : []).filter(
-        (id) =>
-          shortlistById.has(id) && (lexicalScoreById.get(id) ?? -Infinity) >= minSupportScore,
-      )),
+      ...((Array.isArray(parsed.mustKeepIds) ? parsed.mustKeepIds : [])
+        .map((value) => normalizeCandidateId(value))
+        .filter((id) => shortlistById.has(id))),
     ]
       .filter((id, index, all) => all.indexOf(id) === index)
       .slice(0, 3);
     const alternativeIds = [
-      ...(Array.isArray(parsed.alternativeIds) ? parsed.alternativeIds : []),
+      ...(Array.isArray(parsed.alternativeIds) ? parsed.alternativeIds : []).map((value) =>
+        normalizeCandidateId(value),
+      ),
       ...mustKeepIds,
       ...shortlist.map((item) => item.id),
     ]
       .filter(
         (id) =>
           id !== primary.id &&
-          shortlistById.has(id) &&
-          (lexicalScoreById.get(id) ?? -Infinity) >= minSupportScore,
+          shortlistById.has(id),
       )
       .filter((id, index, all) => all.indexOf(id) === index)
       .slice(0, Math.max(0, maxOptions - 1));
 
-    const lexicalTopId = shortlist[0]?.id ?? fallback.primary.id;
-    const lexicalTopScore = lexicalScoreById.get(lexicalTopId) ?? -Infinity;
-    const selectedScore = lexicalScoreById.get(primary.id) ?? -Infinity;
-    const preservePrimary = mustKeepIds.includes(primary.id);
-    const guardedPrimary =
-      !preservePrimary && lexicalTopScore - selectedScore > 1.25
-        ? fallback.primary
-        : primary;
-
     return {
-      primary: guardedPrimary,
+      primary,
       alternatives: alternativeIds
         .map((id) => shortlistById.get(id))
         .filter((item): item is DiseaseCandidate => Boolean(item)),

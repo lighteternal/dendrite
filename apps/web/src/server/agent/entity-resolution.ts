@@ -120,6 +120,133 @@ function alnumCompact(value: string): string {
   return value.replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
+function mentionHasSurfaceSupport(query: string, mention: string): boolean {
+  const mentionDisplay = sanitizeMention(mention);
+  if (!mentionDisplay) return false;
+
+  const queryNorm = normalize(query);
+  const mentionNorm = normalize(mentionDisplay);
+  if (!queryNorm || !mentionNorm) return false;
+  if (queryNorm.includes(mentionNorm)) return true;
+
+  const queryCompact = alnumCompact(queryNorm);
+  const mentionCompact = alnumCompact(mentionNorm);
+  if (mentionCompact && queryCompact.includes(mentionCompact)) return true;
+
+  const queryTokens = queryNorm.split(/\s+/).filter(Boolean);
+  const mentionTokens = mentionNorm.split(/\s+/).filter(Boolean);
+  if (mentionTokens.length !== 1) return false;
+  const mentionToken = mentionTokens[0] ?? "";
+  if (!mentionToken) return false;
+
+  return queryTokens.some(
+    (token) =>
+      token === mentionToken ||
+      token.startsWith(mentionToken) ||
+      mentionToken.startsWith(token),
+  );
+}
+
+function anchorHasDirectQuerySupport(
+  query: string,
+  mention: string,
+  name: string,
+): boolean {
+  return mentionHasSurfaceSupport(query, mention) || mentionHasSurfaceSupport(query, name);
+}
+
+function diseaseAcronymFromName(name: string): string {
+  const stopTokens = new Set(["and", "of", "the", "with", "without", "in", "on", "to"]);
+  const tokens = tokenize(name).filter((token) => !stopTokens.has(token));
+  if (tokens.length < 2 || tokens.length > 8) return "";
+  return tokens
+    .map((token) => alnumCompact(token))
+    .filter((token) => token.length > 0)
+    .map((token) => token[0] ?? "")
+    .join("")
+    .toLowerCase();
+}
+
+function mentionAppearsInMeasurementContext(query: string, mention: string): boolean {
+  const mentionNorm = normalize(mention);
+  if (!mentionNorm) return false;
+  const mentionTokens = mentionNorm.split(/\s+/).filter(Boolean);
+  if (mentionTokens.length !== 1) return false;
+  const mentionToken = mentionTokens[0] ?? "";
+  if (!mentionToken) return false;
+
+  const queryNorm = normalize(query);
+  if (!queryNorm) return false;
+  const escapedMention = escapeRegex(mentionToken);
+  const contextualPattern = new RegExp(
+    `\\b(?:elevated|reduced|increased|decreased|high|low|serum|plasma|level|levels|activity|activities)\\b[^.]{0,48}\\b${escapedMention}\\b`,
+    "i",
+  );
+  const slashPairPattern = new RegExp(
+    `\\b${escapedMention}\\s*\\/\\s*[a-z0-9]{2,8}\\b|\\b[a-z0-9]{2,8}\\s*\\/\\s*${escapedMention}\\b`,
+    "i",
+  );
+  return contextualPattern.test(queryNorm) || slashPairPattern.test(queryNorm);
+}
+
+function shouldRetainAnchorForQueryContext(
+  query: string,
+  anchor: QueryPlanAnchor,
+): boolean {
+  if (anchor.entityType === "disease") {
+    if (anchorHasDirectQuerySupport(query, anchor.mention, anchor.name)) return true;
+    const queryCompact = alnumCompact(query);
+    const diseaseAcronym = diseaseAcronymFromName(anchor.name);
+    return Boolean(
+      diseaseAcronym &&
+        diseaseAcronym.length >= 3 &&
+        queryCompact.includes(diseaseAcronym),
+    );
+  }
+  if (anchor.entityType === "unknown") return true;
+  if (
+    anchor.requestedType === "unknown" &&
+    isGenericMechanismMention(anchor.mention) &&
+    !isLikelySymbolMention(anchor.mention)
+  ) {
+    return false;
+  }
+  if (anchor.entityType === "target") {
+    const mentionCompact = alnumCompact(anchor.mention);
+    const shortAlphaToken =
+      mentionCompact.length > 0 &&
+      mentionCompact.length <= 5 &&
+      !/[0-9]/.test(mentionCompact);
+    const queryHasExplicitMoleculeLexeme =
+      /\b(?:gene|genes|protein|proteins|receptor|receptors|kinase|kinases|enzyme|enzymes|target|targets)\b/i.test(
+        query,
+      );
+    if (
+      shortAlphaToken &&
+      mentionAppearsInMeasurementContext(query, anchor.mention) &&
+      !queryHasExplicitMoleculeLexeme
+    ) {
+      return false;
+    }
+  }
+  if (anchorHasDirectQuerySupport(query, anchor.mention, anchor.name)) return true;
+
+  if (anchor.entityType === "target") {
+    const symbolBacked =
+      isLikelySymbolMention(anchor.mention) || isLikelySymbolMention(anchor.name);
+    if (
+      symbolBacked &&
+      (anchor.requestedType === "target" ||
+        anchor.requestedType === "protein" ||
+        anchor.requestedType === "molecule")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -210,6 +337,8 @@ function isGenericMechanismMention(mention: string): boolean {
   if (hasDiseaseCue(normalizedMention)) return false;
   const hasSymbolLikeToken = tokens.some((token) => /^[a-z]{1,6}\d{1,3}[a-z]?$/i.test(token.replace(/-/g, "")));
   if (hasSymbolLikeToken) return false;
+  if (/\bcell\s+death\b/i.test(normalizedMention)) return true;
+  if (/\b(?:apoptosis|necroptosis|ferroptosis|pyroptosis)\b/i.test(normalizedMention)) return true;
   const genericTokens = tokens.filter((token) =>
     /^(?:inflammatory|immune|metabolic|cellular|molecular|inflammation|signaling|signal|pathway|pathways|mechanism|mechanistic|network|cascade|axis|events?)$/i.test(
       token,
@@ -466,6 +595,7 @@ function mergeQueryPlans(
     constraints: [...constraints.values()].slice(0, 10),
     unresolvedMentions,
     followups: [...followups.values()].slice(0, 10),
+    dynamicStrategy: augment.dynamicStrategy ?? base.dynamicStrategy,
     rationale: `${base.rationale} ${augment.rationale}`.trim(),
   };
 }
@@ -475,16 +605,31 @@ function keepDiseaseAnchor(anchor: QueryPlanAnchor): boolean {
   const mention = sanitizeMention(anchor.mention);
   if (!mention) return true;
   const mentionSimilarity = similarity(mention, anchor.name);
+  const mentionCompact = alnumCompact(mention);
+  const diseaseAcronym = diseaseAcronymFromName(anchor.name);
+  const acronymMatch = Boolean(
+    diseaseAcronym &&
+      mentionCompact &&
+      mentionCompact.length <= 8 &&
+      mentionCompact === diseaseAcronym,
+  );
   const hasDirectDiseaseCue = /\b(?:disease|disorder|syndrome|cancer|carcinoma|tumou?r|diabetes|obesity|lupus|arthritis|sclerosis|colitis|asthma|fibrosis|infection)\b/i.test(
     mention,
   );
+  if (!hasDirectDiseaseCue && !acronymMatch && mentionSimilarity < 0.32) return false;
+  const mentionTokenCount = mention.split(/\s+/).filter(Boolean).length;
+  const shortAbbreviationLike =
+    mentionTokenCount <= 2 &&
+    mentionCompact.length > 0 &&
+    mentionCompact.length <= 8 &&
+    !/[0-9]/.test(mentionCompact);
+  if (shortAbbreviationLike && !hasDirectDiseaseCue && !acronymMatch) return false;
   if (mentionSimilarity >= 0.45 || hasDirectDiseaseCue) return true;
   const mechanisticPhrase = /\b(signaling|signal|pathway|pathways|mechanism|mechanistic|network|axis|cascade|events?)\b/i.test(
     mention,
   );
   if (mechanisticPhrase) return false;
-  const tokenCount = mention.split(/\s+/).filter(Boolean).length;
-  if (tokenCount <= 2 && anchor.confidence < 0.72) return false;
+  if (mentionTokenCount <= 2 && anchor.confidence < 0.72) return false;
   return true;
 }
 
@@ -1077,39 +1222,10 @@ function fallbackBundle(query: string, mentions: string[], rows: MentionCandidat
   };
 }
 
-function shouldSkipSemanticResolution(query: string, rows: MentionCandidate[]): boolean {
+function shouldSkipSemanticResolution(_query: string, rows: MentionCandidate[]): boolean {
   const openai = getOpenAiClient();
   if (!openai || isOpenAiRateLimited()) return true;
   if (rows.length === 0) return true;
-  const diseaseCandidates = diseaseCandidatesFromRows(query, rows);
-  const relationIntent = /\b(and|between|vs|versus|connection|relationship|related|relates|link|overlap|compare|compared|associated|correlated)\b/i.test(
-    query,
-  );
-  const tokenCount = tokenize(query).length;
-  const hasNonDiseaseCandidates = rows.some((row) => row.entityType !== "disease");
-
-  const groupedByMention = new Map<string, number>();
-  for (const row of rows) {
-    groupedByMention.set(row.mention, (groupedByMention.get(row.mention) ?? 0) + 1);
-  }
-  const ambiguousMentionCount = [...groupedByMention.values()].filter((count) => count > 1).length;
-
-  const topDisease = diseaseCandidates[0];
-  const singleHighConfidenceDisease =
-    diseaseCandidates.length === 1 && Boolean(topDisease && topDisease.score >= 3.2);
-  const simpleSingleDiseaseQuery =
-    singleHighConfidenceDisease &&
-    ambiguousMentionCount === 0 &&
-    !relationIntent &&
-    !hasNonDiseaseCandidates &&
-    tokenCount <= 4;
-
-  if (simpleSingleDiseaseQuery) {
-    return true;
-  }
-  if (rows.length <= 3 && diseaseCandidates.length <= 1 && !hasNonDiseaseCandidates) {
-    return true;
-  }
   return false;
 }
 
@@ -1229,7 +1345,7 @@ async function runModelResolution(
           },
         },
       }),
-      6_500,
+      9_000,
     );
 
     const parsed = JSON.parse(response.output_text) as ResolutionModelResult;
@@ -1329,13 +1445,14 @@ export async function resolveQueryEntitiesBundle(query: string): Promise<QueryEn
   const cached = bundleCache.get(cacheKey);
   if (cached) return cached;
 
-  const semanticPlan = await withTimeout(planQuery(trimmed), 14_000).catch(() => null);
+  const semanticPlan = await withTimeout(planQuery(trimmed), 24_000).catch(() => null);
   const llmRelationMentions = (await extractRelationMentionsFast(trimmed, {
     maxMentions: 6,
     timeoutMs: 1_800,
   }).catch(() => []))
     .map((item) => normalizeRelationMention(item) || sanitizeMention(item))
     .filter((item) => item.length >= 3)
+    .filter((item) => mentionHasSurfaceSupport(trimmed, item))
     .filter((item) => !isGenericMechanismMention(item));
   const mentions = (() => {
     const fromPlan = mentionsFromQueryPlan(trimmed, semanticPlan);
@@ -1424,6 +1541,7 @@ export async function resolveQueryEntitiesBundle(query: string): Promise<QueryEn
       dedupeAnchorsSemantically(
         canonicalAnchors
           .filter((anchor): anchor is QueryPlanAnchor => Boolean(anchor))
+          .filter((anchor) => shouldRetainAnchorForQueryContext(trimmed, anchor))
           .filter((anchor) => keepDiseaseAnchor(anchor)),
       ),
     ),

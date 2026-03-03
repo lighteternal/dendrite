@@ -53,6 +53,45 @@ export type QueryPlanFollowup = {
   seedEntityIds: string[];
 };
 
+export type QueryPlanDynamicChainStep = {
+  id: string;
+  goal: string;
+  evidenceFocus: Array<
+    | "disease_context"
+    | "mechanism"
+    | "interaction_network"
+    | "pathway"
+    | "drug_target"
+    | "population_safety"
+    | "clinical_translation"
+    | "literature_validation"
+  >;
+  preferredSubagent:
+    | "pathway_mapper"
+    | "translational_scout"
+    | "bridge_hunter"
+    | "literature_scout";
+  priority: number;
+};
+
+export type QueryPlanDynamicStrategy = {
+  objective:
+    | "mechanism_explanation"
+    | "target_nomination"
+    | "drug_prioritization"
+    | "safety_constrained_selection"
+    | "biomarker_hypothesis"
+    | "comparative_analysis"
+    | "mixed_discovery";
+  reasoningStyle: "exploratory" | "balanced" | "conservative";
+  populationFocus: string[];
+  constraintsSummary: string[];
+  rankingAxes: string[];
+  chain: QueryPlanDynamicChainStep[];
+  finalChecks: string[];
+  rationale: string;
+};
+
 export type ResolvedQueryPlan = {
   query: string;
   intent: string;
@@ -60,6 +99,7 @@ export type ResolvedQueryPlan = {
   constraints: QueryPlanConstraint[];
   unresolvedMentions: string[];
   followups: QueryPlanFollowup[];
+  dynamicStrategy?: QueryPlanDynamicStrategy;
   rationale: string;
 };
 
@@ -228,6 +268,8 @@ function isGenericMechanismMention(mention: string): boolean {
   if (hasDiseaseCue(normalizedMention)) return false;
   const hasSymbolLikeToken = tokens.some((token) => /^[a-z]{1,6}\d{1,3}[a-z]?$/i.test(token.replace(/-/g, "")));
   if (hasSymbolLikeToken) return false;
+  if (/\bcell\s+death\b/i.test(normalizedMention)) return true;
+  if (/\b(?:apoptosis|necroptosis|ferroptosis|pyroptosis)\b/i.test(normalizedMention)) return true;
   const genericTokens = tokens.filter((token) =>
     /^(?:inflammatory|immune|metabolic|cellular|molecular|inflammation|signaling|signal|pathway|pathways|mechanism|mechanistic|network|cascade|axis|events?)$/i.test(
       token,
@@ -243,15 +285,68 @@ function isGenericMechanismMention(mention: string): boolean {
 }
 
 function hasDiseaseCue(mention: string): boolean {
-  return /\b(?:disease|disorder|syndrome|cancer|carcinoma|tumou?r|diabetes|obesity|lupus|arthritis|sclerosis|colitis|asthma|fibrosis|infection|infarction|failure|insufficienc(?:y|ies)|nephropathy|neuropathy|pregnancy|mesothelioma)\b/i.test(
-    mention,
-  );
+  const text = clean(mention);
+  if (!text) return false;
+  const normalized = normalize(text);
+  if (!normalized) return false;
+  if (
+    /\b(?:disease|disorder|syndrome|cancer|carcinoma|tumou?r|neoplasm|infection|inflammation|fibrosis|injury|failure|insufficienc(?:y|ies)|deficiency|toxicity|pregnan(?:cy|t))\b/i.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (
+    tokens.some((token) =>
+      /(?:itis|osis|oma|pathy|pathies|emia|uria|algia|lupathy|sclerosis|hepatitis|nephritis)$/.test(
+        token,
+      ),
+    )
+  ) {
+    return true;
+  }
+  if (/\b[A-Z]{3,6}\b/.test(text) && /\b(?:model|cohort|patients?|cases?)\b/i.test(mention)) {
+    return true;
+  }
+  return false;
+}
+
+function extractDiseaseCueMentions(query: string): string[] {
+  const normalized = query
+    .replace(/[\n\r\t]+/g, " ")
+    .replace(fallbackBoundaryPattern, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return [];
+  const rawTokens = normalized.split(" ").filter(Boolean);
+  if (rawTokens.length === 0) return [];
+
+  const diseaseCueAt = (token: string): boolean => hasDiseaseCue(token.replace(/[^a-z0-9-']/gi, ""));
+  const stopRight = /^(?:model|models|showing|with|and|or|in|on|for|from|via|through|treated|treatment)$/i;
+  const out = new Set<string>();
+
+  for (let i = 0; i < rawTokens.length; i += 1) {
+    const token = rawTokens[i] ?? "";
+    if (!diseaseCueAt(token)) continue;
+    const leftStarts = [Math.max(0, i - 2), Math.max(0, i - 1), i];
+    for (const start of leftStarts) {
+      let end = i + 1;
+      if (end < rawTokens.length && !stopRight.test(rawTokens[end] ?? "")) {
+        end += 1;
+      }
+      const mention = sanitizeFallbackMention(rawTokens.slice(start, end).join(" "));
+      if (mention.length >= 3) out.add(mention);
+    }
+  }
+  return [...out].slice(0, 8);
 }
 
 function inferMentionTypeFromLexical(mention: string): MentionType {
   const normalizedMention = clean(mention);
   if (!normalizedMention) return "unknown";
   if (hasDiseaseCue(normalizedMention)) return "disease";
+  if (mentionLooksLikeCompositeSymbolList(normalizedMention)) return "target";
   if (
     /\b(bbb|blood[-\s]*brain barrier|brain|cns|central nervous system|blood[-\s]*brain|endothelial|vascular|liver|kidney|lung|heart|gut|intestine|synapse|hippocampus)\b/i.test(
       normalizedMention,
@@ -496,6 +591,34 @@ function sanitizeFallbackMention(value: string): string {
   return normalize(value).replace(/\s+/g, " ").trim();
 }
 
+function splitCompositeMentionParts(value: string): string[] {
+  const raw = clean(value);
+  if (!raw) return [];
+  if (!/[\/+&]/.test(raw)) return [raw];
+  if (/https?:\/\//i.test(raw)) return [raw];
+
+  const parts = raw
+    .split(/\s*(?:\/|\+|&)\s*/g)
+    .map((part) =>
+      part
+        .replace(/\b(?:pathway|pathways|signaling|signal|axis|cascade|network|events?)\b.*$/i, "")
+        .replace(/^[^a-z0-9]+|[^a-z0-9-]+$/gi, "")
+        .trim(),
+    )
+    .filter(Boolean);
+
+  if (parts.length < 2) return [raw];
+  const bounded = parts.filter((part) => part.length >= 2 && part.length <= 40);
+  return bounded.length >= 2 ? bounded : [raw];
+}
+
+function mentionLooksLikeCompositeSymbolList(value: string): boolean {
+  const parts = splitCompositeMentionParts(value);
+  if (parts.length < 2) return false;
+  const symbolLikeCount = parts.filter((part) => isLikelySymbolMention(part)).length;
+  return symbolLikeCount >= Math.max(2, parts.length - 1);
+}
+
 function shouldPreserveSingleTokenMention(mention: string): boolean {
   const normalized = clean(mention);
   if (!normalized) return false;
@@ -557,11 +680,27 @@ function extractStructuredMentions(query: string): string[] {
   if (!cleaned) return [];
 
   const mentions = new Set<string>();
+  const splitAtomicMentions = (value: string): string[] => {
+    const segments = String(value ?? "")
+      .split(/\s*,\s*|\s+(?:and)\s+/i)
+      .map((item) => clean(item))
+      .filter(Boolean);
+    if (segments.length === 0) return [];
+
+    const expanded: string[] = [];
+    for (const segment of segments) {
+      if (mentionLooksLikeCompositeSymbolList(segment)) {
+        expanded.push(...splitCompositeMentionParts(segment));
+      } else {
+        expanded.push(segment);
+      }
+    }
+    return expanded.length > 0 ? expanded : segments;
+  };
   const normalizeMentionParts = (value: string): string[] => {
     const raw = String(value ?? "").trim();
     if (!raw) return [];
-    const parts = raw
-      .split(/\s*,\s*|\s+(?:and|&)\s+/i)
+    const parts = splitAtomicMentions(raw)
       .map((item) => normalizeRelationMention(item))
       .filter(Boolean);
     if (parts.length > 1) return parts;
@@ -649,9 +788,20 @@ function splitFallbackMentions(query: string): Array<{ mention: string; type: Me
   for (const mention of extractStructuredMentions(textRaw)) {
     mentionSet.add(mention);
   }
+  for (const mention of extractDiseaseCueMentions(textRaw)) {
+    mentionSet.add(mention);
+  }
 
   const originalTokens = textRaw.split(/\s+/).filter(Boolean);
   for (const tokenRaw of originalTokens) {
+    if (mentionLooksLikeCompositeSymbolList(tokenRaw)) {
+      for (const compositePart of splitCompositeMentionParts(tokenRaw)) {
+        const normalizedPart = sanitizeFallbackMention(compositePart);
+        if (normalizedPart.length >= 2) {
+          mentionSet.add(normalizedPart);
+        }
+      }
+    }
     const token = clean(tokenRaw);
     const compactToken = alnumCompact(token);
     if (compactToken.length < 3 || compactToken.length > 18) continue;
@@ -721,6 +871,9 @@ function rescueFallbackMentions(query: string): Array<{ mention: string; type: M
   if (tokens.length === 0) return [];
 
   const mentions = new Set<string>(extractStructuredMentions(query));
+  for (const mention of extractDiseaseCueMentions(query)) {
+    mentions.add(mention);
+  }
   const tailToken = tokens[tokens.length - 1] ?? "";
   if (tailToken.length >= 4) {
     mentions.add(tailToken);
@@ -872,7 +1025,7 @@ async function extractMentions(query: string): Promise<{
           },
         },
       }),
-      4_200,
+      8_000,
     );
 
     const parsed = JSON.parse(response.output_text) as {
@@ -941,6 +1094,12 @@ function baseMentionVariants(mention: string): string[] {
   if (!cleanMention) return [];
   const variants = new Set<string>([cleanMention]);
   const compactMention = cleanMention.replace(/\s+/g, "");
+
+  if (mentionLooksLikeCompositeSymbolList(cleanMention)) {
+    for (const part of splitCompositeMentionParts(cleanMention)) {
+      variants.add(part);
+    }
+  }
 
   if (/^[A-Za-z]{2,8}[0-9]{1,3}$/.test(compactMention)) {
     const splitPoint = compactMention.search(/[0-9]/);
@@ -1162,8 +1321,22 @@ async function resolveMentionCandidates(
     }
   }
 
+  if (
+    requestedType === "unknown" &&
+    isGenericMechanismMention(query) &&
+    !hasDiseaseCue(query) &&
+    !isLikelySymbolMention(query)
+  ) {
+    return [];
+  }
+
   const mentionTokens = query.split(/\s+/).filter(Boolean);
   const variantSet = new Set<string>([query, ...searchQueries]);
+  if (mentionLooksLikeCompositeSymbolList(query)) {
+    for (const part of splitCompositeMentionParts(query)) {
+      variantSet.add(part);
+    }
+  }
   const maxTailVariants = mentionTokens.length <= 2 ? mentionTokens.length : 2;
   for (let size = 1; size <= maxTailVariants; size += 1) {
     const tail = mentionTokens.slice(-size).join(" ").trim();
@@ -1431,6 +1604,417 @@ function deriveFollowups(anchors: QueryPlanAnchor[], constraints: QueryPlanConst
   return followups.slice(0, 8);
 }
 
+const DYNAMIC_STRATEGY_FALLBACK: QueryPlanDynamicStrategy = {
+  objective: "mixed_discovery",
+  reasoningStyle: "balanced",
+  populationFocus: [],
+  constraintsSummary: [],
+  rankingAxes: [
+    "disease_context_fit",
+    "mechanistic_plausibility",
+    "cross_source_evidence",
+    "intervention_readiness",
+    "population_safety_when_relevant",
+  ],
+  chain: [
+    {
+      id: "anchor_context",
+      goal: "Resolve the disease and principal query anchors into coherent biomedical context.",
+      evidenceFocus: ["disease_context", "literature_validation"],
+      preferredSubagent: "bridge_hunter",
+      priority: 1,
+    },
+    {
+      id: "mechanism_mapping",
+      goal: "Map mechanistic mediator links across targets, pathways, and interaction network evidence.",
+      evidenceFocus: ["mechanism", "interaction_network", "pathway"],
+      preferredSubagent: "pathway_mapper",
+      priority: 2,
+    },
+    {
+      id: "intervention_mapping",
+      goal: "Map intervention and target-drug evidence around the strongest mechanism branches.",
+      evidenceFocus: ["drug_target", "clinical_translation"],
+      preferredSubagent: "translational_scout",
+      priority: 3,
+    },
+    {
+      id: "triangulation",
+      goal: "Triangulate across literature and translational signals, then retain uncertainty where evidence is weak.",
+      evidenceFocus: ["literature_validation", "clinical_translation"],
+      preferredSubagent: "literature_scout",
+      priority: 4,
+    },
+  ],
+  finalChecks: [
+    "Recommendations remain in disease context.",
+    "Mechanism language does not exceed available evidence directionality.",
+    "Population constraints are explicitly reflected in caveats when relevant.",
+  ],
+  rationale: "Fallback dynamic strategy applied.",
+};
+
+function clampPriority(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(1, Math.min(6, Math.round(numeric)));
+}
+
+function uniqueCleanStrings(values: unknown[], limit: number): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const text = clean(String(value ?? ""));
+    if (!text) continue;
+    const key = normalize(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(compact(text, 140));
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function normalizeDynamicChainStep(
+  raw: unknown,
+  fallbackPriority: number,
+): QueryPlanDynamicChainStep | null {
+  if (!raw || typeof raw !== "object") return null;
+  const row = raw as Record<string, unknown>;
+  const goal = compact(clean(String(row.goal ?? "")), 180);
+  if (!goal) return null;
+  const preferredRaw = clean(String(row.preferredSubagent ?? ""));
+  const preferredSubagent: QueryPlanDynamicChainStep["preferredSubagent"] =
+    preferredRaw === "pathway_mapper" ||
+    preferredRaw === "translational_scout" ||
+    preferredRaw === "bridge_hunter" ||
+    preferredRaw === "literature_scout"
+      ? preferredRaw
+      : fallbackPriority % 2 === 0
+        ? "pathway_mapper"
+        : "translational_scout";
+  const focus = Array.isArray(row.evidenceFocus)
+    ? uniqueCleanStrings(row.evidenceFocus, 4)
+        .map((item) => item.toLowerCase().replace(/\s+/g, "_"))
+        .map((item) => {
+          if (item.includes("disease")) return "disease_context";
+          if (item.includes("mechan")) return "mechanism";
+          if (item.includes("interact")) return "interaction_network";
+          if (item.includes("pathway")) return "pathway";
+          if (item.includes("drug")) return "drug_target";
+          if (item.includes("safety") || item.includes("pregnan") || item.includes("population")) {
+            return "population_safety";
+          }
+          if (item.includes("clinic") || item.includes("translat")) return "clinical_translation";
+          return "literature_validation";
+        })
+    : [];
+  const evidenceFocus = [...new Set(focus)].slice(0, 4) as QueryPlanDynamicChainStep["evidenceFocus"];
+  const idRaw = clean(String(row.id ?? ""));
+  return {
+    id: idRaw ? slugify(idRaw, 32) : slugify(goal, 32),
+    goal,
+    evidenceFocus: evidenceFocus.length > 0 ? evidenceFocus : ["mechanism", "literature_validation"],
+    preferredSubagent,
+    priority: clampPriority(row.priority, fallbackPriority),
+  };
+}
+
+function buildFallbackDynamicStrategy(input: {
+  query: string;
+  intent: string;
+  anchors: QueryPlanAnchor[];
+  constraints: QueryPlanConstraint[];
+  followups: QueryPlanFollowup[];
+}): QueryPlanDynamicStrategy {
+  const objective: QueryPlanDynamicStrategy["objective"] = (() => {
+    const loweredIntent = normalize(input.intent);
+    if (/\bbiomarker\b/.test(loweredIntent)) return "biomarker_hypothesis";
+    if (/\bcompar|versus|vs|shared|overlap\b/.test(loweredIntent)) return "comparative_analysis";
+    if (/\bmechan|explain|causal\b/.test(loweredIntent)) return "mechanism_explanation";
+    if (/\bdrug|intervention|therapy|repurpos\b/.test(loweredIntent)) return "drug_prioritization";
+    if (/\btarget|nominat|prioriti[sz]e\b/.test(loweredIntent)) return "target_nomination";
+    return "mixed_discovery";
+  })();
+  const populationFocus = uniqueCleanStrings(
+    input.constraints
+      .map((row) => row.text)
+      .filter((text) => /\bpregnan|pediatric|elderly|renal|hepatic|lactation|contraind/i.test(text)),
+    4,
+  );
+  const constrainedSafety = /\bpregnan|lactation|contraind|safety\b/i.test(input.query) ||
+    populationFocus.length > 0;
+  const rankingAxes = [
+    "disease_context_fit",
+    "mechanistic_plausibility",
+    "cross_source_evidence",
+    "intervention_readiness",
+    constrainedSafety ? "population_safety" : "population_safety_when_relevant",
+  ];
+  const chainBase = DYNAMIC_STRATEGY_FALLBACK.chain.map((step, index) => ({
+    ...step,
+    priority: index + 1,
+  }));
+  const chain =
+    constrainedSafety
+      ? [
+          ...chainBase.slice(0, 3),
+          {
+            id: "population_safety",
+            goal: "Check population-specific safety and contraindication evidence before final ranking.",
+            evidenceFocus: ["population_safety", "clinical_translation"] as QueryPlanDynamicChainStep["evidenceFocus"],
+            preferredSubagent: "literature_scout" as const,
+            priority: 4,
+          },
+          chainBase[3]!,
+        ].map((row, index) => ({ ...row, priority: index + 1 }))
+      : chainBase;
+  return {
+    objective,
+    reasoningStyle: "balanced",
+    populationFocus,
+    constraintsSummary: uniqueCleanStrings(input.constraints.map((row) => row.text), 6),
+    rankingAxes,
+    chain: chain.slice(0, 6),
+    finalChecks: DYNAMIC_STRATEGY_FALLBACK.finalChecks,
+    rationale:
+      input.followups.length > 0
+        ? "Dynamic strategy fallback inferred from resolved anchors, constraints, and follow-up opportunities."
+        : DYNAMIC_STRATEGY_FALLBACK.rationale,
+  };
+}
+
+async function inferDynamicStrategy(input: {
+  query: string;
+  intent: string;
+  mentions: ExtractedMention[];
+  anchors: QueryPlanAnchor[];
+  constraints: QueryPlanConstraint[];
+  followups: QueryPlanFollowup[];
+}): Promise<QueryPlanDynamicStrategy> {
+  const fallback = buildFallbackDynamicStrategy(input);
+  const openai = getOpenAiClient();
+  if (!openai || isOpenAiRateLimited()) return fallback;
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      objective: {
+        type: "string",
+        enum: [
+          "mechanism_explanation",
+          "target_nomination",
+          "drug_prioritization",
+          "safety_constrained_selection",
+          "biomarker_hypothesis",
+          "comparative_analysis",
+          "mixed_discovery",
+        ],
+      },
+      reasoningStyle: {
+        type: "string",
+        enum: ["exploratory", "balanced", "conservative"],
+      },
+      populationFocus: {
+        type: "array",
+        items: { type: "string" },
+      },
+      constraintsSummary: {
+        type: "array",
+        items: { type: "string" },
+      },
+      rankingAxes: {
+        type: "array",
+        items: { type: "string" },
+      },
+      chain: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            id: { type: "string" },
+            goal: { type: "string" },
+            evidenceFocus: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: [
+                  "disease_context",
+                  "mechanism",
+                  "interaction_network",
+                  "pathway",
+                  "drug_target",
+                  "population_safety",
+                  "clinical_translation",
+                  "literature_validation",
+                ],
+              },
+            },
+            preferredSubagent: {
+              type: "string",
+              enum: [
+                "pathway_mapper",
+                "translational_scout",
+                "bridge_hunter",
+                "literature_scout",
+              ],
+            },
+            priority: { type: "number" },
+          },
+          required: ["id", "goal", "evidenceFocus", "preferredSubagent", "priority"],
+        },
+      },
+      finalChecks: {
+        type: "array",
+        items: { type: "string" },
+      },
+      rationale: { type: "string" },
+    },
+    required: [
+      "objective",
+      "reasoningStyle",
+      "populationFocus",
+      "constraintsSummary",
+      "rankingAxes",
+      "chain",
+      "finalChecks",
+      "rationale",
+    ],
+  } as const;
+
+  try {
+    const response = await withTimeout(
+      openai.responses.create({
+        model: appConfig.openai.smallModel,
+        max_output_tokens: 700,
+        reasoning: { effort: "minimal" },
+        input: [
+          {
+            role: "system",
+            content: [
+              {
+                type: "input_text",
+                text: [
+                  "Synthesize a dynamic biomedical discovery chain plan for this exact query.",
+                  "Do not use static templates; choose steps based on query intent, anchors, and constraints.",
+                  "Steps must generalize to broad biomedical prompts and may include population safety when relevant.",
+                  "The objective should reflect what the user asks for, not generic disease analysis.",
+                  "Return JSON only.",
+                ].join(" "),
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: JSON.stringify(
+                  {
+                    query: input.query,
+                    intent: input.intent,
+                    mentions: input.mentions.slice(0, 10),
+                    anchors: input.anchors.slice(0, 10).map((anchor) => ({
+                      mention: anchor.mention,
+                      requestedType: anchor.requestedType,
+                      entityType: anchor.entityType,
+                      id: anchor.id,
+                      name: anchor.name,
+                    })),
+                    constraints: input.constraints.slice(0, 8),
+                    followups: input.followups.slice(0, 6).map((row) => row.question),
+                    outputContract: {
+                      objective:
+                        "mechanism_explanation|target_nomination|drug_prioritization|safety_constrained_selection|biomarker_hypothesis|comparative_analysis|mixed_discovery",
+                      reasoningStyle: "exploratory|balanced|conservative",
+                      populationFocus: "string[]",
+                      constraintsSummary: "string[]",
+                      rankingAxes: "string[]",
+                      chain: [
+                        {
+                          id: "string",
+                          goal: "string",
+                          evidenceFocus:
+                            "disease_context|mechanism|interaction_network|pathway|drug_target|population_safety|clinical_translation|literature_validation",
+                          preferredSubagent:
+                            "pathway_mapper|translational_scout|bridge_hunter|literature_scout",
+                          priority: "number",
+                        },
+                      ],
+                      finalChecks: "string[]",
+                      rationale: "string",
+                    },
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "dynamic_query_strategy",
+            schema,
+            strict: true,
+          },
+        },
+      }),
+      8_000,
+    );
+
+    const parsed = JSON.parse(response.output_text) as {
+      objective?: QueryPlanDynamicStrategy["objective"];
+      reasoningStyle?: QueryPlanDynamicStrategy["reasoningStyle"];
+      populationFocus?: unknown[];
+      constraintsSummary?: unknown[];
+      rankingAxes?: unknown[];
+      chain?: unknown[];
+      finalChecks?: unknown[];
+      rationale?: string;
+    };
+
+    const objective =
+      parsed.objective ?? fallback.objective;
+    const reasoningStyle =
+      parsed.reasoningStyle ?? fallback.reasoningStyle;
+    const chain = (Array.isArray(parsed.chain) ? parsed.chain : [])
+      .map((row, index) => normalizeDynamicChainStep(row, index + 1))
+      .filter((row): row is QueryPlanDynamicChainStep => Boolean(row))
+      .sort((left, right) => left.priority - right.priority)
+      .slice(0, 6);
+
+    return {
+      objective,
+      reasoningStyle,
+      populationFocus: uniqueCleanStrings(
+        Array.isArray(parsed.populationFocus) ? parsed.populationFocus : [],
+        6,
+      ),
+      constraintsSummary: uniqueCleanStrings(
+        Array.isArray(parsed.constraintsSummary) ? parsed.constraintsSummary : [],
+        8,
+      ),
+      rankingAxes: uniqueCleanStrings(
+        Array.isArray(parsed.rankingAxes) ? parsed.rankingAxes : [],
+        8,
+      ),
+      chain: chain.length > 0 ? chain : fallback.chain,
+      finalChecks: uniqueCleanStrings(
+        Array.isArray(parsed.finalChecks) ? parsed.finalChecks : [],
+        6,
+      ),
+      rationale: compact(clean(String(parsed.rationale ?? "")) || fallback.rationale, 220),
+    };
+  } catch (error) {
+    handleOpenAiRateLimit(error);
+    return fallback;
+  }
+}
+
 export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
   const normalizedQuery = query.trim();
   const cacheKey = normalize(normalizedQuery);
@@ -1669,6 +2253,14 @@ export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
     [...unresolvedMentions],
     mentionDisambiguatedAnchors,
   );
+  const dynamicStrategy = await inferDynamicStrategy({
+    query: normalizedQuery,
+    intent: extracted.intent || "multihop-discovery",
+    mentions,
+    anchors: mentionDisambiguatedAnchors,
+    constraints: extracted.constraints.slice(0, 10),
+    followups,
+  });
 
   const plan: ResolvedQueryPlan = {
     query: normalizedQuery,
@@ -1677,6 +2269,7 @@ export async function planQuery(query: string): Promise<ResolvedQueryPlan> {
     constraints: extracted.constraints.slice(0, 10),
     unresolvedMentions: filteredUnresolvedMentions.slice(0, 8),
     followups,
+    dynamicStrategy,
     rationale: extracted.rationale,
   };
 

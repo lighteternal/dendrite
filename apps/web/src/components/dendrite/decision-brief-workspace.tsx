@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
@@ -108,6 +108,64 @@ function pathSignature(path: PathUpdate | null): string {
   return `${path.nodeIds.slice().sort().join("|")}::${path.edgeIds.slice().sort().join("|")}`;
 }
 
+type PathTrailState = {
+  activePath: PathUpdate | null;
+  candidatePaths: PathUpdate[];
+  washedPaths: PathUpdate[];
+};
+
+type PathTrailAction =
+  | { type: "reset" }
+  | {
+      type: "ingest";
+      path: PathUpdate;
+    };
+
+function prependUniquePath(paths: PathUpdate[], value: PathUpdate, limit: number): PathUpdate[] {
+  const signature = pathSignature(value);
+  const next = [value, ...paths.filter((item) => pathSignature(item) !== signature)];
+  return next.slice(0, limit);
+}
+
+function reducePathTrailState(state: PathTrailState, action: PathTrailAction): PathTrailState {
+  if (action.type === "reset") {
+    return {
+      activePath: null,
+      candidatePaths: [],
+      washedPaths: [],
+    };
+  }
+  const incoming = action.path;
+  const incomingSignature = pathSignature(incoming);
+  const previous = state.activePath;
+  const previousSignature = pathSignature(previous);
+  if (incomingSignature === previousSignature) return state;
+
+  const pathState = incoming.pathState ?? "active";
+  if (pathState === "discarded") {
+    return {
+      ...state,
+      washedPaths: prependUniquePath(state.washedPaths, incoming, 8),
+    };
+  }
+  if (pathState === "candidate") {
+    return {
+      ...state,
+      candidatePaths: prependUniquePath(state.candidatePaths, incoming, 6),
+    };
+  }
+
+  const nextWashedPaths =
+    previous && previous.edgeIds.length > 0
+      ? prependUniquePath(state.washedPaths, previous, 8)
+      : state.washedPaths;
+  return {
+    activePath: incoming,
+    candidatePaths: state.candidatePaths.filter((item) => pathSignature(item) !== incomingSignature),
+    washedPaths: nextWashedPaths,
+  };
+}
+
 function compact(value: string, max = 148): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max - 1)}…`;
@@ -128,6 +186,16 @@ function formatUsd(value: number | null | undefined): string {
   if (value >= 1) return `$${value.toFixed(2)}`;
   if (value >= 0.1) return `$${value.toFixed(3)}`;
   return `$${value.toFixed(4)}`;
+}
+
+function SynthWave() {
+  return (
+    <div className="tg-wave">
+      {Array.from({ length: 5 }).map((_, index) => (
+        <span key={index} className="tg-wave-bar" />
+      ))}
+    </div>
+  );
 }
 
 function narrationKey(value: string): string {
@@ -507,24 +575,24 @@ export function DecisionBriefWorkspace({
   const [showPathwayContext, setShowPathwayContext] = useState(true);
   const [showDrugContext, setShowDrugContext] = useState(true);
   const [showInteractionContext, setShowInteractionContext] = useState(false);
-  const [answerTab, setAnswerTab] = useState<"answer" | "log">("answer");
+  const [answerTab, setAnswerTab] = useState<"answer" | "log">("log");
   const [showSidePanel, setShowSidePanel] = useState(true);
   const [referencesOpen, setReferencesOpen] = useState(false);
   const [splitRatio, setSplitRatio] = useState(68);
   const [splitTouched, setSplitTouched] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
 
-  const [activePath, setActivePath] = useState<PathUpdate | null>(null);
-  const [candidatePaths, setCandidatePaths] = useState<PathUpdate[]>([]);
-  const [washedPaths, setWashedPaths] = useState<PathUpdate[]>([]);
+  const [pathTrailState, dispatchPathTrail] = useReducer(reducePathTrailState, {
+    activePath: null,
+    candidatePaths: [],
+    washedPaths: [],
+  });
   const [bridgeAnalysis, setBridgeAnalysis] = useState<BridgeAnalysis | null>(null);
   const agentFinalReadout: AgentFinalAnswer | null = stream.agentFinal;
   const discoverEntries: JourneyEntry[] = stream.journeyEntries;
   const discoverStatusMessage = stream.journeyStatusMessage;
   const discoverElapsedMs = stream.journeyElapsedMs;
   const discoverIsRunning = stream.journeyIsRunning;
-  const activePathRef = useRef<PathUpdate | null>(null);
-  const runWasActiveRef = useRef(false);
   const lastNarrationAtRef = useRef<number>(0);
   const [secondsSinceNarration, setSecondsSinceNarration] = useState(0);
   const [liveNowMs, setLiveNowMs] = useState(() => Date.now());
@@ -534,17 +602,6 @@ export function DecisionBriefWorkspace({
   useEffect(() => {
     lastNarrationAtRef.current = Date.now();
   }, []);
-
-  useEffect(() => {
-    const running = stream.isRunning || discoverIsRunning;
-    if (running && !runWasActiveRef.current) {
-      setAnswerTab("log");
-    }
-    if (!running && runWasActiveRef.current) {
-      setAnswerTab((current) => (current === "log" ? "answer" : current));
-    }
-    runWasActiveRef.current = running;
-  }, [discoverIsRunning, stream.isRunning]);
 
   useEffect(() => {
     const autoStartSignature = [
@@ -565,7 +622,7 @@ export function DecisionBriefWorkspace({
       replayId: initialReplayId ?? null,
     });
 
-    return () => stopStream();
+    return () => stopStream(false);
   }, [
     initialDiseaseId,
     initialDiseaseName,
@@ -577,46 +634,13 @@ export function DecisionBriefWorkspace({
   ]);
 
   useEffect(() => {
-    activePathRef.current = null;
-    setActivePath(null);
-    setCandidatePaths([]);
-    setWashedPaths([]);
+    dispatchPathTrail({ type: "reset" });
   }, [runSessionId]);
 
   useEffect(() => {
     const incoming = stream.pathUpdate;
     if (!incoming) return;
-    const incomingSignature = pathSignature(incoming);
-    const previous = activePathRef.current;
-    const previousSignature = pathSignature(previous);
-    if (incomingSignature === previousSignature) return;
-
-    const pathState = incoming.pathState ?? "active";
-    if (pathState === "discarded") {
-      setWashedPaths((prev) => {
-        const next = [incoming, ...prev.filter((item) => pathSignature(item) !== incomingSignature)];
-        return next.slice(0, 8);
-      });
-      return;
-    }
-    if (pathState === "candidate") {
-      setCandidatePaths((prev) => {
-        const next = [incoming, ...prev.filter((item) => pathSignature(item) !== incomingSignature)];
-        return next.slice(0, 6);
-      });
-      return;
-    }
-
-    if (previous && previous.edgeIds.length > 0) {
-      setWashedPaths((prev) => {
-        const next = [previous, ...prev.filter((item) => pathSignature(item) !== previousSignature)];
-        return next.slice(0, 8);
-      });
-    }
-
-    activePathRef.current = incoming;
-    setActivePath(incoming);
-    setCandidatePaths((prev) => prev.filter((item) => pathSignature(item) !== incomingSignature));
+    dispatchPathTrail({ type: "ingest", path: incoming });
   }, [stream.pathUpdate]);
 
   const activeSourceHealth = (stream.status?.sourceHealth ?? {}) as SourceHealth;
@@ -776,6 +800,8 @@ export function DecisionBriefWorkspace({
         kind: entry.kind,
         count: 1,
         pathState: entry.pathState,
+        nodeDelta: entry.graphPatch?.nodes?.length ?? 0,
+        edgeDelta: entry.graphPatch?.edges?.length ?? 0,
       }));
     const fromPipeline = executionNarration.slice(-8).map((entry) => ({
       id: `pipeline:${entry.id}`,
@@ -785,6 +811,8 @@ export function DecisionBriefWorkspace({
       kind: "pipeline" as const,
       count: entry.count,
       pathState: undefined as NarrationPathState,
+      nodeDelta: 0,
+      edgeDelta: 0,
     }));
     const merged = fromAgentTrail.length > 0 ? fromAgentTrail : fromPipeline;
     const bySemantic = new Map<string, number>();
@@ -796,6 +824,8 @@ export function DecisionBriefWorkspace({
       kind: JourneyEntry["kind"] | "pipeline";
       count: number;
       pathState: NarrationPathState;
+      nodeDelta: number;
+      edgeDelta: number;
     }> = [];
     for (const entry of merged) {
       const semantic = `${narrationKey(entry.title)}::${narrationKey(entry.detail)}`;
@@ -810,6 +840,8 @@ export function DecisionBriefWorkspace({
         existing.detail = entry.detail;
         existing.kind = entry.kind;
         existing.count += 1;
+        existing.nodeDelta += entry.nodeDelta;
+        existing.edgeDelta += entry.edgeDelta;
         if (entry.pathState) {
           existing.pathState = entry.pathState;
         }
@@ -867,10 +899,15 @@ export function DecisionBriefWorkspace({
   }, [discoverEntries, journeySignals.toolCalls, journeySignals.toolResults, mergedLiveNarration]);
 
   const recommendation = stream.finalBrief?.recommendation ?? stream.recommendation;
+  const liveExplainability = stream.liveExplainability;
+  const selectionDiagnostics =
+    stream.finalBrief?.selectionDiagnostics ?? liveExplainability?.selectionDiagnostics;
+  const queryAlignment =
+    stream.finalBrief?.queryAlignment ?? liveExplainability?.queryAlignment;
   const recommendationIsProvisional = Boolean(
     !stream.finalBrief?.recommendation && stream.recommendation?.provisional,
   );
-  const graphPath = activePath ?? stream.pathUpdate;
+  const graphPath = pathTrailState.activePath ?? stream.pathUpdate;
   const liveTargetFallback = useMemo(() => {
     const diseaseNode = graphNodes.find((node) => node.type === "disease");
     if (!diseaseNode) return null;
@@ -1028,6 +1065,9 @@ export function DecisionBriefWorkspace({
   const rawProgressPct = Math.max(0, Math.min(100, Math.round(stream.status?.pct ?? 0)));
   const progressPct = rawProgressPct;
   const progressBarPct = Math.max(4, progressPct);
+  const effectiveAnswerTab: "answer" | "log" =
+    stream.isRunning || discoverIsRunning ? "log" : answerTab;
+  const effectiveReferencesOpen = !stream.isRunning && referencesOpen;
   const runElapsedMs = useMemo(() => {
     const reported = discoverElapsedMs ?? 0;
     const startedAt = stream.journeyStartedAtMs;
@@ -1051,12 +1091,6 @@ export function DecisionBriefWorkspace({
     [verdictCitations],
   );
 
-  useEffect(() => {
-    if (stream.isRunning) {
-      setReferencesOpen(false);
-    }
-  }, [stream.isRunning]);
-
   const verdictTarget = recommendation?.target ?? liveTargetFallback ?? "not resolved";
   const verdictPathway = recommendation?.pathway ?? "not provided";
   const verdictHeadingTarget = queryMode === "bridge" ? queryAnchorsSummary : verdictTarget;
@@ -1066,14 +1100,7 @@ export function DecisionBriefWorkspace({
     (progressPct >= 95 || stream.status?.phase === "P6");
   const preferredGraphRatio =
     stream.isRunning || discoverIsRunning ? 70 : finalVerdictReady ? 56 : 64;
-
-  const SynthWave = () => (
-    <div className="tg-wave">
-      {Array.from({ length: 5 }).map((_, index) => (
-        <span key={index} className="tg-wave-bar" />
-      ))}
-    </div>
-  );
+  const effectiveSplitRatio = splitTouched ? splitRatio : preferredGraphRatio;
 
   const renderAnswerBlock = (variant: "compact" | "focus") => {
     const isFocus = variant === "focus";
@@ -1098,6 +1125,28 @@ export function DecisionBriefWorkspace({
               Current phase: {phaseSummaryMap[stream.status?.phase ?? ""] ?? "Streaming evidence"} ({progressPct}
               %)
             </div>
+            {liveExplainability ? (
+              <div className="mt-2 rounded-md border border-[#ddd9fb] bg-white px-2.5 py-2 text-[11px] text-[#576597]">
+                <div className="font-semibold text-[#45568f]">
+                  Live explainability
+                </div>
+                <div className="mt-1">
+                  Lead thread: {liveExplainability.leadTarget} ({liveExplainability.leadScore.toFixed(3)})
+                </div>
+                <div className="mt-1">
+                  Path summary: {compact(liveExplainability.pathSummary, 160)}
+                </div>
+                <div className="mt-1">
+                  Query alignment: {liveExplainability.queryAlignment.status} •{" "}
+                  {compact(liveExplainability.queryAlignment.note, 160)}
+                </div>
+                {liveExplainability.degradedSources.length > 0 ? (
+                  <div className="mt-1">
+                    Degraded sources: {liveExplainability.degradedSources.join(", ")}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {isLongtail ? (
               <div className="mt-2 flex items-center gap-2 text-[11px] text-[#5a65a1]">
                 <SynthWave />
@@ -1145,14 +1194,42 @@ export function DecisionBriefWorkspace({
             ))}
           </div>
         ) : null}
+        {selectionDiagnostics ? (
+          <div className={`rounded-lg border border-[#ddd9fb] bg-white ${isFocus ? "px-3 py-2.5" : "px-2.5 py-2"} text-[11px] text-[#4f5d8b]`}>
+            <div className="font-semibold text-[#47558e]">Selection diagnostics</div>
+            <div className="mt-1 grid grid-cols-2 gap-1.5">
+              <div>Anchor coverage {(selectionDiagnostics.anchorCoverageScore * 100).toFixed(0)}%</div>
+              <div>Anchor match {(selectionDiagnostics.recommendationAnchorMatchScore * 100).toFixed(0)}%</div>
+              <div>Drug-mediator fit {(selectionDiagnostics.recommendationDrugMediatorConsistency * 100).toFixed(0)}%</div>
+              <div>Novelty {(selectionDiagnostics.recommendationNoveltyScore * 100).toFixed(0)}%</div>
+            </div>
+            <div className="mt-1 text-[10px] text-[#6372a1]">
+              Path-focus {selectionDiagnostics.pathFocusApplied ? "applied" : "not applied"} • Generic hub penalty{" "}
+              {selectionDiagnostics.genericHubPenaltyApplied ? "applied" : "not applied"}
+            </div>
+            {selectionDiagnostics.upstreamMediatorModeApplied ? (
+              <div className="mt-1 text-[10px] text-[#6372a1]">Upstream-mediator mode applied</div>
+            ) : null}
+            {selectionDiagnostics.anchorMentions.length > 0 ? (
+              <div className="mt-1 text-[10px] text-[#6372a1]">
+                Anchors: {selectionDiagnostics.anchorMentions.slice(0, 4).join(", ")}
+              </div>
+            ) : null}
+            {selectionDiagnostics.endpointAnchorTargets?.length ? (
+              <div className="mt-1 text-[10px] text-[#6372a1]">
+                Endpoint readouts: {selectionDiagnostics.endpointAnchorTargets.slice(0, 4).join(", ")}
+              </div>
+            ) : null}
+            {queryAlignment ? (
+              <div className="mt-1 text-[10px] text-[#6372a1]">
+                Query alignment: {queryAlignment.status} • {compact(queryAlignment.note, 160)}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </>
     );
   };
-
-  useEffect(() => {
-    if (!showSidePanel || splitTouched) return;
-    setSplitRatio(preferredGraphRatio);
-  }, [preferredGraphRatio, showSidePanel, splitTouched]);
 
   useEffect(() => {
     if (!isResizing) return;
@@ -1206,9 +1283,7 @@ export function DecisionBriefWorkspace({
 
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
-    setActivePath(null);
-    activePathRef.current = null;
-    setWashedPaths([]);
+    dispatchPathTrail({ type: "reset" });
     setBridgeAnalysis(null);
     setSubmittedQuery(trimmed);
 
@@ -1224,7 +1299,7 @@ export function DecisionBriefWorkspace({
     event.preventDefault();
     setSplitTouched(true);
     setIsResizing(true);
-    dragRef.current = { startX: event.clientX, startRatio: splitRatio };
+    dragRef.current = { startX: event.clientX, startRatio: effectiveSplitRatio };
   };
 
   const resetSplitLayout = () => {
@@ -1319,7 +1394,7 @@ export function DecisionBriefWorkspace({
   }, [buildPathForTargetSymbol, stream.finalBrief]);
 
   const candidatePathsMerged = useMemo(() => {
-    const all = [...candidatePaths, ...shortlistPaths, ...alternativePaths];
+    const all = [...pathTrailState.candidatePaths, ...shortlistPaths, ...alternativePaths];
     const seen = new Set<string>();
     const merged: PathUpdate[] = [];
     for (const path of all) {
@@ -1330,17 +1405,17 @@ export function DecisionBriefWorkspace({
       if (merged.length >= 8) break;
     }
     return merged;
-  }, [alternativePaths, candidatePaths, shortlistPaths]);
+  }, [alternativePaths, pathTrailState.candidatePaths, shortlistPaths]);
 
   const mergedWashedPaths = useMemo(() => {
-    const activeSignature = pathSignature(activePath);
+    const activeSignature = pathSignature(pathTrailState.activePath);
     const candidateSignatures = new Set(
       candidatePathsMerged.map((path) => pathSignature(path)),
     );
     const seen = new Set<string>();
     const merged: PathUpdate[] = [];
 
-    for (const item of washedPaths) {
+    for (const item of pathTrailState.washedPaths) {
       const signature = pathSignature(item);
       if (
         !signature ||
@@ -1356,7 +1431,7 @@ export function DecisionBriefWorkspace({
     }
 
     return merged;
-  }, [activePath, candidatePathsMerged, washedPaths]);
+  }, [candidatePathsMerged, pathTrailState.activePath, pathTrailState.washedPaths]);
 
   const topStatus = stream.status?.message ?? "Preparing run";
   const runLabel = "Multi-hop search";
@@ -1560,6 +1635,69 @@ export function DecisionBriefWorkspace({
                         <div className="font-semibold text-[#31507f]">{stream.resolverSelection.selected.name}</div>
                         <div className="text-[11px] text-[#6b82a3]">{stream.resolverSelection.selected.id}</div>
                         <div className="mt-1 text-[11px] text-[#6b82a3]">{stream.resolverSelection.rationale}</div>
+                        {stream.resolverSelection.anchorLock ? (
+                          <div className="mt-2 rounded-md border border-[#d7e3f3] bg-white p-2 text-[11px] text-[#5e7596]">
+                            <div className="font-semibold text-[#3c5f89]">
+                              Anchor lock: {stream.resolverSelection.anchorLock.status} (
+                              {(stream.resolverSelection.anchorLock.confidence * 100).toFixed(0)}%)
+                            </div>
+                            <div className="mt-0.5">
+                              {stream.resolverSelection.anchorLock.rationale}
+                            </div>
+                            {stream.resolverSelection.anchorLock.discardIds.length > 0 ? (
+                              <div className="mt-0.5">
+                                Discarded candidates: {stream.resolverSelection.anchorLock.discardIds.slice(0, 6).join(", ")}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        {stream.resolverSelection.anchorContextFilter ? (
+                          <div className="mt-2 rounded-md border border-[#d7e3f3] bg-white p-2 text-[11px] text-[#5e7596]">
+                            <div className="font-semibold text-[#3c5f89]">
+                              Anchor context filter: {stream.resolverSelection.anchorContextFilter.status} (
+                              {(stream.resolverSelection.anchorContextFilter.confidence * 100).toFixed(0)}%)
+                            </div>
+                            <div className="mt-0.5">
+                              {stream.resolverSelection.anchorContextFilter.rationale}
+                            </div>
+                            {stream.resolverSelection.anchorContextFilter.discardKeys.length > 0 ? (
+                              <div className="mt-0.5">
+                                Pruned non-disease anchors: {stream.resolverSelection.anchorContextFilter.discardKeys.length}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        {stream.resolverSelection.selectionIntent ? (
+                          <div className="mt-2 rounded-md border border-[#d7e3f3] bg-white p-2 text-[11px] text-[#5e7596]">
+                            <div className="font-semibold text-[#3c5f89]">
+                              Selection intent ({(stream.resolverSelection.selectionIntent.confidence * 100).toFixed(0)}%)
+                            </div>
+                            <div className="mt-0.5">
+                              {stream.resolverSelection.selectionIntent.rationale}
+                            </div>
+                            <div className="mt-1">
+                              Mediator priority: {stream.resolverSelection.selectionIntent.prioritizeMediatorDiscovery ? "yes" : "no"} • Intervention priority: {stream.resolverSelection.selectionIntent.prioritizeInterventionReadiness ? "yes" : "no"} • Connected evidence required: {stream.resolverSelection.selectionIntent.requireConnectedAnchorEvidence ? "yes" : "no"}
+                            </div>
+                            <div className="mt-0.5">
+                              Objective: {stream.resolverSelection.selectionIntent.objective.replace(/_/g, " ")} • Reasoning: {stream.resolverSelection.selectionIntent.reasoningStyle}
+                            </div>
+                            {stream.resolverSelection.selectionIntent.rankingAxes.length > 0 ? (
+                              <div className="mt-0.5">
+                                Ranking axes: {stream.resolverSelection.selectionIntent.rankingAxes.slice(0, 5).join(", ")}
+                              </div>
+                            ) : null}
+                            {stream.resolverSelection.selectionIntent.chainSummary.length > 0 ? (
+                              <div className="mt-0.5">
+                                Dynamic chain: {stream.resolverSelection.selectionIntent.chainSummary.slice(0, 3).join(" | ")}
+                              </div>
+                            ) : null}
+                            {stream.resolverSelection.selectionIntent.endpointTargetSymbols.length > 0 ? (
+                              <div className="mt-0.5">
+                                Endpoint/readout anchors: {stream.resolverSelection.selectionIntent.endpointTargetSymbols.slice(0, 6).join(", ")}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
                       </div>
                     ) : (
                       <div className="rounded-lg border border-[#dbe4f2] bg-[#f7faff] p-2 text-[#6c84a4]">
@@ -1588,6 +1726,54 @@ export function DecisionBriefWorkspace({
                         ))}
                       </div>
                     ) : null}
+                  </CardContent>
+                </Card>
+
+                <Card className="border-[#dbe4f2] bg-white">
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm text-[#2a456f]">Claim Gate</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {stream.qualityGate ? (
+                      <div className="rounded-lg border border-[#dbe4f2] bg-[#f7faff] p-2 text-[11px] text-[#607a9d]">
+                        <div className="mb-0.5 text-[10px] uppercase tracking-[0.08em] text-[#5d7095]">
+                          {stream.qualityGate.stage === "biomedical_mechanism_gate"
+                            ? "Biomedical mechanism gate"
+                            : stream.qualityGate.stage === "graph_narrative_gate"
+                              ? "Graph-narrative gate"
+                              : "Final claim gate"}
+                        </div>
+                        <div className="font-semibold text-[#31507f]">
+                          {stream.qualityGate.pass ? "Pass" : "Adjusted"} •{" "}
+                          {(stream.qualityGate.confidence * 100).toFixed(0)}% confidence
+                        </div>
+                        <div className="mt-0.5">{stream.qualityGate.rationale}</div>
+                        {stream.qualityGate.unsupportedClaims.length > 0 ? (
+                          <div className="mt-1">
+                            {stream.qualityGate.stage === "biomedical_mechanism_gate"
+                              ? "Context issues:"
+                              : stream.qualityGate.stage === "graph_narrative_gate"
+                                ? "Narrative mentions outside graph:"
+                              : "Unsupported claims fixed:"}{" "}
+                            {stream.qualityGate.unsupportedClaims.slice(0, 3).join(" | ")}
+                          </div>
+                        ) : null}
+                        {stream.qualityGate.approvedDrugClaimIssues.length > 0 ? (
+                          <div className="mt-1">
+                            {stream.qualityGate.stage === "biomedical_mechanism_gate"
+                              ? "Evidence gaps:"
+                              : stream.qualityGate.stage === "graph_narrative_gate"
+                                ? "Missing graph entities/relations:"
+                              : "Drug claim downgrades:"}{" "}
+                            {stream.qualityGate.approvedDrugClaimIssues.slice(0, 3).join(" | ")}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border border-[#dbe4f2] bg-[#f7faff] p-2 text-[#6c84a4]">
+                        Claim verification appears during final synthesis.
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
 
@@ -1759,7 +1945,7 @@ export function DecisionBriefWorkspace({
           style={
             showSidePanel
               ? {
-                  gridTemplateColumns: `minmax(0, ${splitRatio}%) 12px minmax(0, ${100 - splitRatio}%)`,
+                  gridTemplateColumns: `minmax(0, ${effectiveSplitRatio}%) 12px minmax(0, ${100 - effectiveSplitRatio}%)`,
                 }
               : undefined
           }
@@ -1868,7 +2054,7 @@ export function DecisionBriefWorkspace({
             <div className="space-y-2.5">
             <Card className="border-[#e0e6f4] bg-white shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
               <Tabs
-                value={answerTab}
+                value={effectiveAnswerTab}
                 onValueChange={(value) => setAnswerTab(value as "answer" | "log")}
                 className="h-full"
               >
@@ -2011,6 +2197,9 @@ export function DecisionBriefWorkspace({
                   </div>
                 ) : null}
 
+                <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#5b56a8]">
+                  Live Narration
+                </div>
                 <div className="max-h-[260px] space-y-1.5 overflow-y-auto pr-1">
                   {mergedLiveNarration.length > 0 ? (
                     mergedLiveNarration.map((entry) => (
@@ -2037,6 +2226,11 @@ export function DecisionBriefWorkspace({
                                 {entry.count}x
                               </span>
                             ) : null}
+                            {entry.nodeDelta > 0 || entry.edgeDelta > 0 ? (
+                              <span className="rounded-full border border-[#d8d4f8] bg-white px-1.5 py-0.5 text-[10px] text-[#676ca8]">
+                                +{entry.nodeDelta}n / +{entry.edgeDelta}e
+                              </span>
+                            ) : null}
                           </div>
                         </div>
                         <div className="text-[11px] text-[#6369a1]">{entry.detail}</div>
@@ -2059,7 +2253,7 @@ export function DecisionBriefWorkspace({
       </section>
 
       <section className="px-3 pt-3 md:px-6">
-        <Sheet open={referencesOpen} onOpenChange={setReferencesOpen}>
+        <Sheet open={effectiveReferencesOpen} onOpenChange={setReferencesOpen}>
           <Card className="border-[#e0e6f4] bg-white shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
             <CardContent className="flex flex-wrap items-center justify-between gap-3 py-2">
               <div>

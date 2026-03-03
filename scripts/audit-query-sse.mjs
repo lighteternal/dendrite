@@ -72,6 +72,11 @@ const summary = {
   leadTarget: null,
   decision: null,
   score: null,
+  liveExplainabilityUpdateCount: 0,
+  liveExplainability: null,
+  selectionDiagnostics: null,
+  anchorFidelity: null,
+  threadCandidateSummary: [],
   finalNodeCount: null,
   finalEdgeCount: null,
   graphPatchCount: 0,
@@ -231,11 +236,83 @@ try {
         }
       }
 
+      if (event === "brief_section" && data?.section === "explainability" && data?.data) {
+        summary.liveExplainabilityUpdateCount += 1;
+        summary.liveExplainability = {
+          leadTarget: data.data.leadTarget ?? null,
+          leadScore:
+            typeof data.data.leadScore === "number"
+              ? Number(data.data.leadScore.toFixed(4))
+              : null,
+          mechanismThread: data.data.mechanismThread ?? null,
+          pathSummary: data.data.pathSummary ?? null,
+          provisional: Boolean(data.data.provisional),
+          queryAlignmentStatus: data.data.queryAlignment?.status ?? null,
+          degradedSources: Array.isArray(data.data.degradedSources)
+            ? data.data.degradedSources.slice(0, 8)
+            : [],
+        };
+      }
+
       if (event === "brief_section" && data?.section === "final_brief" && data?.data) {
         const recommendation = data.data.recommendation ?? null;
         summary.leadTarget = recommendation?.target ?? null;
         summary.decision = recommendation?.decision ?? null;
         summary.score = recommendation?.score ?? null;
+        const diagnostics = data.data.selectionDiagnostics ?? null;
+        if (diagnostics && typeof diagnostics === "object") {
+          summary.selectionDiagnostics = {
+            anchorCoverageScore:
+              typeof diagnostics.anchorCoverageScore === "number"
+                ? Number(diagnostics.anchorCoverageScore.toFixed(4))
+                : null,
+            recommendationAnchorMatchScore:
+              typeof diagnostics.recommendationAnchorMatchScore === "number"
+                ? Number(diagnostics.recommendationAnchorMatchScore.toFixed(4))
+                : null,
+            recommendationDrugMediatorConsistency:
+              typeof diagnostics.recommendationDrugMediatorConsistency === "number"
+                ? Number(diagnostics.recommendationDrugMediatorConsistency.toFixed(4))
+                : null,
+            recommendationNoveltyScore:
+              typeof diagnostics.recommendationNoveltyScore === "number"
+                ? Number(diagnostics.recommendationNoveltyScore.toFixed(4))
+                : null,
+            genericHubPenaltyApplied: Boolean(diagnostics.genericHubPenaltyApplied),
+            upstreamMediatorModeApplied: Boolean(diagnostics.upstreamMediatorModeApplied),
+            endpointAnchorTargets: Array.isArray(diagnostics.endpointAnchorTargets)
+              ? diagnostics.endpointAnchorTargets.slice(0, 8)
+              : [],
+            anchorMatchedByRecommendation: Boolean(diagnostics.anchorMatchedByRecommendation),
+            anchorMentions: Array.isArray(diagnostics.anchorMentions)
+              ? diagnostics.anchorMentions.slice(0, 8)
+              : [],
+          };
+          summary.anchorFidelity = {
+            hasDiagnostics: true,
+            anchorMatchedByRecommendation: Boolean(diagnostics.anchorMatchedByRecommendation),
+            anchorCoverageScore:
+              typeof diagnostics.anchorCoverageScore === "number"
+                ? Number(diagnostics.anchorCoverageScore.toFixed(4))
+                : null,
+            recommendationAnchorMatchScore:
+              typeof diagnostics.recommendationAnchorMatchScore === "number"
+                ? Number(diagnostics.recommendationAnchorMatchScore.toFixed(4))
+                : null,
+          };
+        }
+        const threadCandidates = Array.isArray(data.data.threadCandidates) ? data.data.threadCandidates : [];
+        summary.threadCandidateSummary = threadCandidates.slice(0, 3).map((item) => ({
+          target: item.target ?? null,
+          supportScore: typeof item.supportScore === "number" ? Number(item.supportScore.toFixed(4)) : null,
+          compositeScore: typeof item.compositeScore === "number" ? Number(item.compositeScore.toFixed(4)) : null,
+          anchorMatchScore: typeof item.anchorMatchScore === "number" ? Number(item.anchorMatchScore.toFixed(4)) : null,
+          noveltyScore: typeof item.noveltyScore === "number" ? Number(item.noveltyScore.toFixed(4)) : null,
+          mediatorDrugConsistency:
+            typeof item.mediatorDrugConsistency === "number"
+              ? Number(item.mediatorDrugConsistency.toFixed(4))
+              : null,
+        }));
       }
 
       if (event === "done") {

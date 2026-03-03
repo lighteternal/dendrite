@@ -16,6 +16,40 @@ export type ResolverSelection = {
   selected: ResolverCandidate;
   rationale: string;
   candidates: ResolverCandidate[];
+  anchorLock?: {
+    status: "locked" | "soft" | "failed";
+    confidence: number;
+    primaryId?: string | null;
+    keepIds: string[];
+    discardIds: string[];
+    rationale: string;
+  };
+  anchorContextFilter?: {
+    status: "kept_all" | "filtered" | "degraded";
+    confidence: number;
+    keepKeys: string[];
+    discardKeys: string[];
+    rationale: string;
+  } | null;
+  selectionIntent?: {
+    prioritizeMediatorDiscovery: boolean;
+    prioritizeInterventionReadiness: boolean;
+    requireConnectedAnchorEvidence: boolean;
+    endpointTargetSymbols: string[];
+    objective:
+      | "mechanism_explanation"
+      | "target_nomination"
+      | "drug_prioritization"
+      | "safety_constrained_selection"
+      | "biomarker_hypothesis"
+      | "comparative_analysis"
+      | "mixed_discovery";
+    reasoningStyle: "exploratory" | "balanced" | "conservative";
+    rankingAxes: string[];
+    chainSummary: string[];
+    confidence: number;
+    rationale: string;
+  } | null;
 };
 
 export type AgentStep = {
@@ -64,6 +98,33 @@ export type QueryPlan = {
     reason: string;
     seedEntityIds: string[];
   }>;
+  dynamicStrategy?: {
+    objective:
+      | "mechanism_explanation"
+      | "target_nomination"
+      | "drug_prioritization"
+      | "safety_constrained_selection"
+      | "biomarker_hypothesis"
+      | "comparative_analysis"
+      | "mixed_discovery";
+    reasoningStyle: "exploratory" | "balanced" | "conservative";
+    populationFocus: string[];
+    constraintsSummary: string[];
+    rankingAxes: string[];
+    chain: Array<{
+      id: string;
+      goal: string;
+      evidenceFocus: string[];
+      preferredSubagent:
+        | "pathway_mapper"
+        | "translational_scout"
+        | "bridge_hunter"
+        | "literature_scout";
+      priority: number;
+    }>;
+    finalChecks: string[];
+    rationale: string;
+  };
   rationale: string;
 };
 
@@ -115,7 +176,27 @@ export type FinalBriefSection = {
     edgeIds: string[];
     supportScore: number;
     connectedAcrossAnchors?: boolean;
+    anchorMatchScore?: number;
+    noveltyScore?: number;
+    mediatorDrugConsistency?: number;
+    genericHubPenalty?: number;
+    compositeScore?: number;
+    matchedAnchors?: string[];
   }>;
+  selectionDiagnostics?: {
+    anchorCoverageScore: number;
+    pathFocusConfidence: number;
+    pathFocusApplied: boolean;
+    anchorMentionCount: number;
+    anchorMentions: string[];
+    endpointAnchorTargets?: string[];
+    upstreamMediatorModeApplied?: boolean;
+    anchorMatchedByRecommendation: boolean;
+    recommendationAnchorMatchScore: number;
+    recommendationDrugMediatorConsistency: number;
+    recommendationNoveltyScore: number;
+    genericHubPenaltyApplied: boolean;
+  };
   caveats: string[];
   nextActions: string[];
   queryAlignment?: {
@@ -126,6 +207,27 @@ export type FinalBriefSection = {
     baselineTop?: string;
     note: string;
   };
+};
+
+export type LiveExplainability = {
+  provisional: boolean;
+  leadTarget: string;
+  leadScore: number;
+  mechanismThread: string;
+  pathSummary: string;
+  selectionDiagnostics: NonNullable<FinalBriefSection["selectionDiagnostics"]>;
+  queryAlignment: NonNullable<FinalBriefSection["queryAlignment"]>;
+  degradedSources: string[];
+};
+
+export type QualityGateSection = {
+  stage: "final_claim_gate" | "biomedical_mechanism_gate" | "graph_narrative_gate";
+  pass: boolean;
+  confidence: number;
+  majorMismatch: boolean;
+  unsupportedClaims: string[];
+  approvedDrugClaimIssues: string[];
+  rationale: string;
 };
 
 export type StatusUpdate = {
@@ -265,6 +367,7 @@ type StartOptions = {
   diseaseId?: string | null;
   diseaseName?: string | null;
   replayId?: string | null;
+  runId?: string | null;
   mode?: RunMode;
 };
 
@@ -311,6 +414,8 @@ export function useCaseRunStream() {
   const [edgeMap, setEdgeMap] = useState<Map<string, GraphEdge>>(new Map());
   const [recommendation, setRecommendation] = useState<RecommendationSection | null>(null);
   const [finalBrief, setFinalBrief] = useState<FinalBriefSection | null>(null);
+  const [liveExplainability, setLiveExplainability] = useState<LiveExplainability | null>(null);
+  const [qualityGate, setQualityGate] = useState<QualityGateSection | null>(null);
   const [journeyEntries, setJourneyEntries] = useState<JourneyEntry[]>([]);
   const [journeyStatusMessage, setJourneyStatusMessage] = useState<string | null>(null);
   const [journeyStartedAtMs, setJourneyStartedAtMs] = useState<number | null>(null);
@@ -338,6 +443,8 @@ export function useCaseRunStream() {
     setEdgeMap(new Map());
     setRecommendation(null);
     setFinalBrief(null);
+    setLiveExplainability(null);
+    setQualityGate(null);
     setJourneyEntries([]);
     setJourneyStatusMessage(null);
     setJourneyStartedAtMs(null);
@@ -387,7 +494,7 @@ export function useCaseRunStream() {
   }, [stop]);
 
   const start = useCallback(
-    ({ query, diseaseId, diseaseName, replayId, mode = "multihop" }: StartOptions) => {
+    ({ query, diseaseId, diseaseName, replayId, runId: runIdHint, mode = "multihop" }: StartOptions) => {
       const trimmed = query.trim();
       if (!trimmed) return;
       if (isRunningRef.current) {
@@ -402,10 +509,6 @@ export function useCaseRunStream() {
       }
 
       const sessionId = sessionIdRef.current ?? runSessionId;
-      const runId =
-        typeof window !== "undefined" && typeof window.crypto?.randomUUID === "function"
-          ? window.crypto.randomUUID()
-          : `run-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
       pendingStartRef.current = true;
 
       void (async () => {
@@ -421,20 +524,51 @@ export function useCaseRunStream() {
             if (!response?.ok) return { active: false };
             return (await response.json()) as {
               active?: boolean;
+              runId?: string | null;
+              query?: string | null;
+              status?: "running" | "completed" | "interrupted" | "errored" | null;
             };
           };
 
+          const normalizeQuery = (value: string) =>
+            value
+              .trim()
+              .toLowerCase()
+              .replace(/\s+/g, " ");
+
+          let runId = runIdHint?.trim() || null;
+          let resumeExistingRun = false;
           const firstStatus = await readActiveStatus();
-          if (firstStatus.active) {
+          if (firstStatus.active && firstStatus.runId && firstStatus.query) {
+            const sameQuery =
+              normalizeQuery(firstStatus.query) === normalizeQuery(trimmed);
+            if (sameQuery) {
+              runId = firstStatus.runId;
+              resumeExistingRun = true;
+            }
+          }
+          if (firstStatus.active && !resumeExistingRun) {
             await delay(700);
             const secondStatus = await readActiveStatus();
-            if (secondStatus.active) {
+            const secondMatchesQuery =
+              Boolean(secondStatus.active && secondStatus.runId && secondStatus.query) &&
+              normalizeQuery(secondStatus.query ?? "") === normalizeQuery(trimmed);
+            if (secondMatchesQuery) {
+              runId = secondStatus.runId ?? runId;
+              resumeExistingRun = true;
+            } else if (secondStatus.active) {
               setErrors((prev) => [
                 ...prev,
                 "Another active query exists for this session. Interrupt it first.",
               ]);
               return;
             }
+          }
+          if (!runId) {
+            runId =
+              typeof window !== "undefined" && typeof window.crypto?.randomUUID === "function"
+                ? window.crypto.randomUUID()
+                : `run-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
           }
 
           stop(false);
@@ -460,6 +594,9 @@ export function useCaseRunStream() {
           }
           if (replayId?.trim()) {
             params.set("replay", replayId.trim());
+          }
+          if (resumeExistingRun) {
+            params.set("resume", "1");
           }
 
           const source = new EventSource(`/api/runCaseStream?${params.toString()}`);
@@ -718,8 +855,16 @@ export function useCaseRunStream() {
                 setRecommendation(payload.data as RecommendationSection);
               }
 
+              if (payload.section === "explainability") {
+                setLiveExplainability(payload.data as LiveExplainability);
+              }
+
               if (payload.section === "final_brief") {
                 setFinalBrief(payload.data as FinalBriefSection);
+              }
+
+              if (payload.section === "quality_gate") {
+                setQualityGate(payload.data as QualityGateSection);
               }
             } catch {
               // ignore parse errors
@@ -928,6 +1073,8 @@ export function useCaseRunStream() {
       edges: [...edgeMap.values()],
       recommendation,
       finalBrief,
+      liveExplainability,
+      qualityGate,
       journeyEntries,
       journeyStatusMessage,
       journeyStartedAtMs,
@@ -964,6 +1111,8 @@ export function useCaseRunStream() {
       queryPlan,
       recommendation,
       runSessionId,
+      liveExplainability,
+      qualityGate,
       resolverCandidates,
       resolverSelection,
       reset,

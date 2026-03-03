@@ -1,4 +1,11 @@
-import { createAgent, tool } from "langchain";
+import {
+  createAgent,
+  modelCallLimitMiddleware,
+  modelRetryMiddleware,
+  tool,
+  toolCallLimitMiddleware,
+  toolRetryMiddleware,
+} from "langchain";
 import { ChatOpenAI } from "@langchain/openai";
 import { z } from "zod";
 import type { GraphEdge, GraphNode } from "@/lib/contracts";
@@ -28,7 +35,10 @@ import { findPathwaysByGene } from "@/server/mcp/reactome";
 import { getInteractionNetwork } from "@/server/mcp/stringdb";
 import { collectMedicalEvidence } from "@/server/mcp/medical";
 import { appConfig } from "@/server/config";
-import { getOpenAiApiKeyFromContext } from "@/server/openai/client";
+import {
+  createTrackedOpenAIClient,
+  getOpenAiApiKeyFromContext,
+} from "@/server/openai/client";
 import {
   handleOpenAiRateLimit,
   isOpenAiRateLimited,
@@ -289,6 +299,11 @@ const SUBAGENT_TIMEOUT_MS = clampTimeout(
   25_000,
   270_000,
 );
+const SUBAGENT_MODEL_CALL_RUN_LIMIT = 9;
+const SUBAGENT_TOOL_CALL_RUN_LIMIT = 24;
+const SYNTHESIS_MODEL_CALL_RUN_LIMIT = 4;
+const RETRYABLE_AGENT_ERROR_RE =
+  /\b(timeout|timed out|rate limit|429|503|socket|network|econnreset|eai_again|enotfound|fetch failed|temporarily unavailable|overloaded)\b/i;
 
 const coordinatorPlanSchema = z.object({
   strategy: z.string().max(320),
@@ -308,6 +323,101 @@ const coordinatorPlanSchema = z.object({
     )
     .max(6),
 });
+
+const plannerAgentTaskSchema = z.object({
+  subagent: z.enum([
+    "pathway_mapper",
+    "translational_scout",
+    "bridge_hunter",
+    "literature_scout",
+  ]),
+  objective: z.string(),
+  seedEntities: z.array(z.string()),
+});
+
+const plannerAgentSchema = z.object({
+  strategy: z.string(),
+  chains: z
+    .array(
+      z.object({
+        id: z.string(),
+        summary: z.string(),
+        confidence: z.number().min(0).max(1),
+        seedEntities: z.array(z.string()),
+        tasks: z.array(plannerAgentTaskSchema).min(1),
+        rejectionChecks: z.array(z.string()),
+      }),
+    )
+    .min(1),
+  pubmedSubqueries: z.array(z.string()),
+});
+
+type PlannerAgentPlan = z.infer<typeof plannerAgentSchema>;
+const plannerAgentResponseJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    strategy: { type: "string" },
+    chains: {
+      type: "array",
+      minItems: 1,
+      maxItems: 4,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+          summary: { type: "string" },
+          confidence: { type: "number" },
+          seedEntities: {
+            type: "array",
+            maxItems: 6,
+            items: { type: "string" },
+          },
+          tasks: {
+            type: "array",
+            minItems: 1,
+            maxItems: 3,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                subagent: {
+                  type: "string",
+                  enum: [
+                    "pathway_mapper",
+                    "translational_scout",
+                    "bridge_hunter",
+                    "literature_scout",
+                  ],
+                },
+                objective: { type: "string" },
+                seedEntities: {
+                  type: "array",
+                  maxItems: 6,
+                  items: { type: "string" },
+                },
+              },
+              required: ["subagent", "objective", "seedEntities"],
+            },
+          },
+          rejectionChecks: {
+            type: "array",
+            maxItems: 3,
+            items: { type: "string" },
+          },
+        },
+        required: ["id", "summary", "confidence", "seedEntities", "tasks", "rejectionChecks"],
+      },
+    },
+    pubmedSubqueries: {
+      type: "array",
+      maxItems: MAX_PUBMED_SUBQUERIES,
+      items: { type: "string" },
+    },
+  },
+  required: ["strategy", "chains", "pubmedSubqueries"],
+} as const;
 
 const subagentReportSchema = z.object({
   summary: z.string().max(560),
@@ -339,6 +449,11 @@ const subagentReportSchema = z.object({
     )
     .max(12),
 });
+
+function isRetryableAgentError(error: Error): boolean {
+  const message = `${error.name} ${error.message}`.toLowerCase();
+  return RETRYABLE_AGENT_ERROR_RE.test(message);
+}
 
 function toGraphNodeType(entityType: DiscoverEntity["type"]): GraphNode["type"] {
   if (entityType === "disease") return "disease";
@@ -1928,8 +2043,130 @@ export async function runDeepDiscoverer({
     source: DiscoverJourneyEntry["source"],
     entities: DiscoverEntity[] = [],
     pathState?: DiscoverJourneyEntry["pathState"],
-    includeGraphPatch = kind === "tool_result" || kind === "followup" || kind === "branch" || kind === "insight",
+    includeGraphPatch =
+      kind === "tool_start" ||
+      kind === "tool_result" ||
+      kind === "followup" ||
+      kind === "branch" ||
+      kind === "insight",
   ) => {
+    if ((kind === "tool_start" || kind === "tool_result") && entities.length > 0) {
+      const targetKeys: string[] = [];
+      const pathwayKeys: string[] = [];
+      const drugKeys: string[] = [];
+      const diseaseKeys: string[] = [];
+      const edgeScore = kind === "tool_result" ? 0.26 : 0.18;
+
+      for (const entity of entities) {
+        const label = clean(entity.label);
+        if (!label) continue;
+        const primaryId = clean(entity.primaryId ?? "") || `QUERY_${slugify(label, 56)}`;
+        const normalizedEntity: DiscoverEntity = {
+          ...entity,
+          label,
+          primaryId,
+        };
+        const nodeKey = upsertNode(state, normalizedEntity);
+        if (entity.type === "disease") {
+          diseaseKeys.push(nodeKey);
+          if (!state.diseaseById.has(primaryId)) {
+            state.diseaseById.set(primaryId, {
+              id: primaryId,
+              name: label,
+            });
+          }
+          continue;
+        }
+        if (entity.type === "target" || entity.type === "protein") {
+          targetKeys.push(nodeKey);
+          if (!state.targetById.has(primaryId)) {
+            state.targetById.set(primaryId, {
+              id: primaryId,
+              symbol: label,
+              name: label,
+              score: 0.28,
+            });
+          }
+          continue;
+        }
+        if (entity.type === "pathway") {
+          pathwayKeys.push(nodeKey);
+          if (!state.pathwayById.has(primaryId)) {
+            state.pathwayById.set(primaryId, {
+              id: primaryId,
+              name: label,
+            });
+          }
+          continue;
+        }
+        if (entity.type === "drug") {
+          drugKeys.push(nodeKey);
+          if (!state.drugById.has(primaryId)) {
+            state.drugById.set(primaryId, {
+              id: primaryId,
+              name: label,
+              source: source === "chembl" ? "chembl" : "opentargets",
+            });
+          }
+        }
+      }
+
+      if (diseaseKeys.length === 0 && state.diseaseById.size > 0) {
+        const fallbackDisease = [...state.diseaseById.values()][0];
+        if (fallbackDisease) {
+          diseaseKeys.push(
+            upsertNode(state, {
+              type: "disease",
+              label: fallbackDisease.name,
+              primaryId: fallbackDisease.id,
+            }),
+          );
+        }
+      }
+
+      for (const diseaseKey of diseaseKeys.slice(0, 2)) {
+        for (const targetKey of targetKeys.slice(0, 5)) {
+          if (diseaseKey === targetKey) continue;
+          upsertEdge(state, {
+            sourceKey: diseaseKey,
+            targetKey,
+            relation: "disease_target",
+            source,
+            score: edgeScore,
+            note: `${title}: tool-linked target context`,
+          });
+        }
+      }
+
+      for (const targetKey of targetKeys.slice(0, 5)) {
+        for (const pathwayKey of pathwayKeys.slice(0, 5)) {
+          if (targetKey === pathwayKey) continue;
+          upsertEdge(state, {
+            sourceKey: targetKey,
+            targetKey: pathwayKey,
+            relation: "target_pathway",
+            source,
+            score: edgeScore,
+            note: `${title}: tool-linked pathway context`,
+          });
+        }
+      }
+
+      for (const targetKey of targetKeys.slice(0, 5)) {
+        for (const drugKey of drugKeys.slice(0, 5)) {
+          if (targetKey === drugKey) continue;
+          upsertEdge(state, {
+            sourceKey: targetKey,
+            targetKey: drugKey,
+            relation: "target_drug",
+            source,
+            score: edgeScore,
+            note: `${title}: tool-linked drug context`,
+          });
+        }
+      }
+    }
+
     entryCounter += 1;
     emitJourney({
       id: `discover-${entryCounter}`,
@@ -3760,7 +3997,11 @@ export async function runDeepDiscoverer({
     modelDecision.tier === "full"
       ? appConfig.openai.smallModel
       : appConfig.openai.nanoModel;
+  const plannerModelName = appConfig.openai.smallModel;
+  const plannerMaxOutputTokens = modelDecision.tier === "full" ? 3200 : 2000;
   const activeOpenAiApiKey = getOpenAiApiKeyFromContext();
+  const startedDuringOpenAiCooldown = isOpenAiRateLimited();
+  const openai = createTrackedOpenAIClient(activeOpenAiApiKey);
 
   const usageCallback = createLangChainUsageCallback({
     source: "langchain.chatopenai",
@@ -3808,14 +4049,72 @@ export async function runDeepDiscoverer({
     ),
   });
 
+  const subagentMiddleware = [
+    modelRetryMiddleware({
+      maxRetries: 1,
+      retryOn: isRetryableAgentError,
+      onFailure: "error",
+      initialDelayMs: 700,
+      maxDelayMs: 2_600,
+      backoffFactor: 1.7,
+      jitter: true,
+    }),
+    toolRetryMiddleware({
+      maxRetries: 2,
+      retryOn: isRetryableAgentError,
+      onFailure: "continue",
+      initialDelayMs: 500,
+      maxDelayMs: 2_800,
+      backoffFactor: 1.6,
+      jitter: true,
+    }),
+    modelCallLimitMiddleware({
+      runLimit: SUBAGENT_MODEL_CALL_RUN_LIMIT,
+      exitBehavior: "end",
+    }),
+    toolCallLimitMiddleware({
+      runLimit: SUBAGENT_TOOL_CALL_RUN_LIMIT,
+      exitBehavior: "continue",
+    }),
+  ];
+  const synthesisMiddleware = [
+    modelRetryMiddleware({
+      maxRetries: 1,
+      retryOn: isRetryableAgentError,
+      onFailure: "error",
+      initialDelayMs: 650,
+      maxDelayMs: 2_400,
+      backoffFactor: 1.6,
+      jitter: true,
+    }),
+    modelCallLimitMiddleware({
+      runLimit: SYNTHESIS_MODEL_CALL_RUN_LIMIT,
+      exitBehavior: "end",
+    }),
+  ];
+  const coordinatorPlanner = coordinatorModel.withStructuredOutput(coordinatorPlanSchema);
+  const plannerAgentInstructions = [
+    "You are planner_agent for biomedical multihop discovery.",
+    "Your job is to propose dynamic mechanistic chains for this exact query and convert them into subagent tasks.",
+    "Do not use static templates or fixed chain ordering.",
+    "You may propose any chain structure if biologically coherent and query-aligned.",
+    "Return concise JSON; keep each field short and specific.",
+    "For each chain, include at least one falsification/rejection check.",
+    "Prioritize disease-context fidelity and requested phenotype/readout anchors.",
+    "When evidence may be associative only, keep language associative and include a rejection check.",
+    "Return JSON only, matching the schema.",
+  ].join(" ");
+
   push(
     "phase",
     "Model routing",
     [
       `Strategic reasoning: ${strategicModelName} (coordinator planning, subquery strategy, final synthesis).`,
+      `Dynamic chain planner: ${plannerModelName} (strict json-schema chain/task proposals).`,
       `Tool-heavy subagents: ${subagentModelName} (MCP interaction + branch exploration).`,
       `Utility summarization: ${utilityModelName} (compress subagent findings).`,
       `Complexity signal: ${modelDecision.reason}.`,
+      `LangGraph guardrails: model/tool retries + model/tool call limits enabled for subagents and synthesis.`,
     ].join(" "),
     "agent",
     [],
@@ -3865,7 +4164,285 @@ export async function runDeepDiscoverer({
     diseaseQuery || normalizedQuestion,
     diseaseIdHint,
   );
+  if (state.queryPlan?.dynamicStrategy) {
+    const plan = state.queryPlan.dynamicStrategy;
+    const chainPreview = (plan.chain ?? [])
+      .slice(0, 4)
+      .map((step) => `${step.priority}. ${step.goal}`)
+      .join(" | ");
+    push(
+      "phase",
+      "Dynamic chain synthesized",
+      [
+        `Objective: ${plan.objective.replace(/_/g, " ")}.`,
+        `Reasoning style: ${plan.reasoningStyle}.`,
+        chainPreview ? `Chain: ${chainPreview}` : "",
+        plan.rationale ? `Rationale: ${compact(plan.rationale, 160)}` : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
+      "planner",
+      [],
+      "active",
+    );
+  }
   state.anchorEntities = [...(state.queryPlan?.anchors ?? [])];
+
+  const dedupePlannerSeeds = (items: string[], limit = 8): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of items) {
+      const seed = clean(raw);
+      if (!seed) continue;
+      const key = seed.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(seed);
+      if (out.length >= limit) break;
+    }
+    return out;
+  };
+
+  const plannerTaskKey = (task: CoordinatorTask): string =>
+    `${task.subagent}::${clean(task.objective).toLowerCase()}::${dedupePlannerSeeds(task.seedEntities, 8)
+      .map((seed) => seed.toLowerCase())
+      .join("|")}`;
+  const plannerSuggestedTasks: CoordinatorTask[] = [];
+  let plannerSuggestedSubqueries: string[] = [];
+  const plannerSuggestedChains: Array<{
+    id: string;
+    summary: string;
+    confidence: number;
+    rejectionChecks: string[];
+  }> = [];
+  const plannerComplexity = {
+    anchors:
+      state.anchorEntities.length > 0
+        ? state.anchorEntities.length
+        : state.queryPlan?.anchors.length ?? 0,
+    unresolved: state.queryPlan?.unresolvedMentions.length ?? 0,
+    constraints: state.queryPlan?.constraints.length ?? 0,
+    followups: state.queryPlan?.followups.length ?? 0,
+  };
+
+  const plannerAgentSeedEntities = dedupePlannerSeeds(
+    state.anchorEntities.length > 0
+      ? state.anchorEntities.map((anchor) => anchor.name)
+      : (state.queryPlan?.anchors ?? []).map((anchor) => anchor.name),
+    8,
+  );
+  const buildPlannerPayload = (mode: "full" | "compact") => {
+    const compactMode = mode === "compact";
+    const anchorCap = compactMode ? 4 : 8;
+    const constraintCap = compactMode ? 3 : 6;
+    const followupCap = compactMode ? 2 : 4;
+    const unresolvedCap = compactMode ? 4 : 6;
+    const chainCap = compactMode ? 3 : 5;
+    const finalCheckCap = compactMode ? 2 : 4;
+    const contextTermCap = compactMode ? 3 : 4;
+    const maxChains = compactMode ? 3 : 4;
+    const maxTasksPerChain = compactMode ? 2 : 3;
+    return {
+      query: normalizedQuestion,
+      diseaseHint: diseaseQuery,
+      plannerComplexity,
+      mode,
+      queryPlan: state.queryPlan
+        ? {
+            intent: state.queryPlan.intent,
+            anchors: state.queryPlan.anchors.slice(0, anchorCap).map((anchor) => ({
+              mention: anchor.mention,
+              entityType: anchor.entityType,
+              requestedType: anchor.requestedType,
+              id: anchor.id,
+              name: anchor.name,
+              confidence: anchor.confidence,
+            })),
+            constraints: state.queryPlan.constraints.slice(0, constraintCap),
+            followups: state.queryPlan.followups.slice(0, followupCap).map((row) => row.question),
+            unresolvedMentions: state.queryPlan.unresolvedMentions.slice(0, unresolvedCap),
+            dynamicStrategy: state.queryPlan.dynamicStrategy
+              ? {
+                  objective: state.queryPlan.dynamicStrategy.objective,
+                  reasoningStyle: state.queryPlan.dynamicStrategy.reasoningStyle,
+                  rankingAxes: state.queryPlan.dynamicStrategy.rankingAxes.slice(
+                    0,
+                    compactMode ? 4 : 6,
+                  ),
+                  chain: state.queryPlan.dynamicStrategy.chain.slice(0, chainCap),
+                  finalChecks: state.queryPlan.dynamicStrategy.finalChecks.slice(0, finalCheckCap),
+                }
+              : null,
+          }
+        : null,
+      seedEntities: plannerAgentSeedEntities,
+      contextTerms: plannerAgentSeedEntities.slice(0, contextTermCap),
+      outputNotes: {
+        maxChains,
+        maxTasksPerChain,
+        maxPubmedSubqueries: MAX_PUBMED_SUBQUERIES,
+      },
+    };
+  };
+  if (activeOpenAiApiKey && !startedDuringOpenAiCooldown && hasTimeBudget(45_000)) {
+    push(
+      "phase",
+      "Planner agent",
+      "Synthesizing dynamic mechanism chains and candidate task routes.",
+      "planner",
+      [],
+      "active",
+    );
+    try {
+      const invokePlanner = async (
+        mode: "full" | "compact",
+        timeoutMs: number,
+      ): Promise<PlannerAgentPlan | undefined> => {
+        if (!openai) {
+          throw new Error("planner agent unavailable: OpenAI client missing");
+        }
+        const response = await withOpenAiOperationContext("deep_discover.planner_agent", () =>
+          withTimeout(
+            openai.responses.create({
+              model: plannerModelName,
+              max_output_tokens: plannerMaxOutputTokens,
+              reasoning: { effort: "minimal" },
+              input: [
+                {
+                  role: "system",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: `${plannerAgentInstructions} Keep output compact and return strictly valid JSON only.`,
+                    },
+                  ],
+                },
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: JSON.stringify(buildPlannerPayload(mode), null, 2),
+                    },
+                  ],
+                },
+              ],
+              text: {
+                format: {
+                  type: "json_schema",
+                  name: `deep_discover_planner_${mode}`,
+                  schema: plannerAgentResponseJsonSchema,
+                  strict: true,
+                },
+              },
+            }),
+            timeoutMs,
+            `planner agent (${mode})`,
+          ),
+        );
+        const parsed = JSON.parse(response.output_text || "{}");
+        const validated = plannerAgentSchema.safeParse(parsed);
+        if (!validated.success) {
+          const issue = validated.error.issues[0];
+          throw new Error(
+            `planner agent (${mode}) schema validation failed: ${issue?.path?.join(".") || "unknown"} ${issue?.message || ""}`.trim(),
+          );
+        }
+        return validated.data;
+      };
+
+      let plannerPlan: PlannerAgentPlan | undefined;
+      const plannerFullTimeout = boundedTimeout(Math.min(COORDINATOR_TIMEOUT_MS, 60_000), 20_000);
+      try {
+        plannerPlan = await invokePlanner("full", plannerFullTimeout);
+      } catch (fullError) {
+        const fullMessage = fullError instanceof Error ? fullError.message : String(fullError);
+        const canRetryCompact = hasTimeBudget(24_000);
+        if (canRetryCompact) {
+          push(
+            "insight",
+            "Planner compact retry",
+            `Full planner call timed out/degraded (${compact(fullMessage, 120)}). Retrying with compact context.`,
+            "planner",
+            [],
+            "candidate",
+          );
+          const compactTimeout = boundedTimeout(35_000, 12_000);
+          plannerPlan = await invokePlanner("compact", compactTimeout);
+        } else {
+          throw fullError;
+        }
+      }
+
+      if (plannerPlan) {
+        const taskSeen = new Set<string>();
+        for (const chain of plannerPlan.chains.slice(0, 5)) {
+          const chainSeeds = dedupePlannerSeeds(chain.seedEntities, 8);
+          const chainSummary = clean(chain.summary) || `Mechanism chain ${clean(chain.id) || "candidate"}`;
+          plannerSuggestedChains.push({
+            id: clean(chain.id) || "chain",
+            summary: chainSummary,
+            confidence: clamp(chain.confidence, 0, 1),
+            rejectionChecks: chain.rejectionChecks.map((row) => clean(row)).filter(Boolean).slice(0, 3),
+          });
+          for (const task of chain.tasks) {
+            const normalizedTask: CoordinatorTask = {
+              subagent: task.subagent,
+              objective: clean(task.objective) || `Investigate ${clean(chain.summary) || "planner chain"}`,
+              seedEntities: dedupePlannerSeeds(
+                [...task.seedEntities, ...chainSeeds, ...plannerAgentSeedEntities],
+                8,
+              ),
+            };
+            const key = plannerTaskKey(normalizedTask);
+            if (taskSeen.has(key)) continue;
+            taskSeen.add(key);
+            plannerSuggestedTasks.push(normalizedTask);
+            if (plannerSuggestedTasks.length >= 6) break;
+          }
+          if (plannerSuggestedTasks.length >= 6) break;
+        }
+        plannerSuggestedSubqueries = dedupePlannerSeeds(
+          plannerPlan.pubmedSubqueries,
+          MAX_PUBMED_SUBQUERIES,
+        );
+
+        if (plannerSuggestedChains.length > 0) {
+          push(
+            "handoff",
+            "Planner agent suggested chains",
+            `${plannerSuggestedChains.length} chains proposed. Strategy: ${compact(plannerPlan.strategy, 140)}`,
+            "planner",
+            [],
+            "active",
+          );
+          for (const chain of plannerSuggestedChains.slice(0, 3)) {
+            const rejectionText = chain.rejectionChecks.length
+              ? `Reject if: ${chain.rejectionChecks.join(" | ")}`
+              : "Reject if evidence context diverges from query anchors.";
+            push(
+              "branch",
+              `Chain candidate ${chain.id}`,
+              `${compact(chain.summary, 180)} (confidence ${chain.confidence.toFixed(2)}). ${compact(rejectionText, 200)}`,
+              "planner",
+              [],
+              "candidate",
+            );
+          }
+        }
+      }
+    } catch (error) {
+      handleOpenAiRateLimit(error);
+      push(
+        "warning",
+        "Planner agent degraded",
+        `Chain planning fallback engaged (${error instanceof Error ? error.message : "unknown"}).`,
+        "planner",
+        [],
+        "candidate",
+      );
+    }
+  }
 
   resolveAnchorNodes();
 
@@ -4068,7 +4645,6 @@ export async function runDeepDiscoverer({
     return buildFallbackSummary(state, normalizedQuestion);
   }
 
-  const startedDuringOpenAiCooldown = isOpenAiRateLimited();
   if (startedDuringOpenAiCooldown) {
     push(
       "warning",
@@ -4088,8 +4664,6 @@ export async function runDeepDiscoverer({
     );
     await deterministicBackfill("openai-rate-limit");
   }
-
-  const coordinatorPlanner = coordinatorModel.withStructuredOutput(coordinatorPlanSchema);
 
   type SubagentHistoryItem = {
     subagent: SubagentId;
@@ -4151,6 +4725,15 @@ export async function runDeepDiscoverer({
             .slice(0, 3)
             .map((row) => row.question),
           unresolvedMentions: state.queryPlan.unresolvedMentions.slice(0, 6),
+          dynamicStrategy: state.queryPlan.dynamicStrategy
+            ? {
+                objective: state.queryPlan.dynamicStrategy.objective,
+                reasoningStyle: state.queryPlan.dynamicStrategy.reasoningStyle,
+                rankingAxes: state.queryPlan.dynamicStrategy.rankingAxes.slice(0, 6),
+                chain: state.queryPlan.dynamicStrategy.chain.slice(0, 5),
+                finalChecks: state.queryPlan.dynamicStrategy.finalChecks.slice(0, 4),
+              }
+            : null,
         }
       : null,
     anchorEntities: state.anchorEntities.slice(0, 8).map((anchor) => ({
@@ -4226,6 +4809,7 @@ export async function runDeepDiscoverer({
     entity_router: createAgent({
       model: subagentModel,
       tools: toolsForSubagent,
+      middleware: subagentMiddleware,
       responseFormat: subagentReportSchema,
       systemPrompt: [
         "You are entity_router.",
@@ -4240,6 +4824,7 @@ export async function runDeepDiscoverer({
     pathway_mapper: createAgent({
       model: subagentModel,
       tools: toolsForSubagent,
+      middleware: subagentMiddleware,
       responseFormat: subagentReportSchema,
       systemPrompt: [
         "You are pathway_mapper.",
@@ -4252,6 +4837,7 @@ export async function runDeepDiscoverer({
     translational_scout: createAgent({
       model: subagentModel,
       tools: toolsForSubagent,
+      middleware: subagentMiddleware,
       responseFormat: subagentReportSchema,
       systemPrompt: [
         "You are translational_scout.",
@@ -4264,6 +4850,7 @@ export async function runDeepDiscoverer({
     bridge_hunter: createAgent({
       model: subagentModel,
       tools: toolsForSubagent,
+      middleware: subagentMiddleware,
       responseFormat: subagentReportSchema,
       systemPrompt: [
         "You are bridge_hunter.",
@@ -4276,6 +4863,7 @@ export async function runDeepDiscoverer({
     literature_scout: createAgent({
       model: subagentModel,
       tools: toolsForSubagent,
+      middleware: subagentMiddleware,
       responseFormat: subagentReportSchema,
       systemPrompt: [
         "You are literature_scout.",
@@ -4662,9 +5250,14 @@ export async function runDeepDiscoverer({
     }
   };
 
+  const plannerSeedEntities = dedupePlannerSeeds((anchorPool ?? []).map((anchor) => anchor.name), 8);
+
   const buildDefaultTasks = (): CoordinatorTask[] => {
-    const fallbackSeeds = (anchorPool ?? []).map((anchor) => anchor.name).slice(0, 6);
+    const fallbackSeeds = plannerSeedEntities.slice(0, 6);
     const hasMultiAnchor = (anchorPool ?? []).length >= 2;
+    if (plannerSuggestedTasks.length > 0) {
+      return plannerSuggestedTasks.slice(0, 4);
+    }
     const defaults: CoordinatorTask[] = [
       {
         subagent: "pathway_mapper",
@@ -4690,15 +5283,6 @@ export async function runDeepDiscoverer({
   let coordinatorTasks: CoordinatorTask[] = [];
   let initialPubmedSubqueries: string[] = [];
   let coordinatorPlanUsed = false;
-  const plannerComplexity = {
-    anchors:
-      state.anchorEntities.length > 0
-        ? state.anchorEntities.length
-        : state.queryPlan?.anchors.length ?? 0,
-    unresolved: state.queryPlan?.unresolvedMentions.length ?? 0,
-    constraints: state.queryPlan?.constraints.length ?? 0,
-    followups: state.queryPlan?.followups.length ?? 0,
-  };
   const forceDefaultPlanner = startedDuringOpenAiCooldown;
 
   push(
@@ -4739,6 +5323,8 @@ export async function runDeepDiscoverer({
                   "You are a coordinator for a multihop biomedical discovery workflow.",
                   "You are the routing authority: order tasks by expected evidence yield and current context, not fixed priority.",
                   "Plan query-specific tasks, do not produce generic disease pipelines.",
+                  "If queryPlan.dynamicStrategy is present, use it as the primary planning prior for task sequencing and evidence focus.",
+                  "Do not force a fixed chain type; adapt to the current query objective and constraints.",
                   "Maintain biological coherence: keep tissue/phenotype context consistent across tasks; use provided contextTerms to sharpen literature queries.",
                   "Re-invoking a subagent is allowed when new entities or gaps appear; do not assume one pass is enough.",
                   "The system has specialized subagents: pathway_mapper, translational_scout, bridge_hunter, literature_scout.",
@@ -4777,16 +5363,38 @@ export async function runDeepDiscoverer({
       );
 
       if (plan) {
-        coordinatorTasks = (plan.tasks ?? []).slice(0, 6);
-        initialPubmedSubqueries = (plan.pubmedSubqueries ?? []).slice(
-          0,
+        const mergedTasks = [...plannerSuggestedTasks, ...(plan.tasks ?? []).slice(0, 6)];
+        const seenMergedTasks = new Set<string>();
+        coordinatorTasks = [];
+        for (const task of mergedTasks) {
+          const normalizedTask: CoordinatorTask = {
+            subagent: task.subagent,
+            objective: clean(task.objective),
+            seedEntities: dedupePlannerSeeds([...task.seedEntities, ...plannerSeedEntities], 8),
+          };
+          if (!normalizedTask.objective || normalizedTask.seedEntities.length === 0) continue;
+          const key = plannerTaskKey(normalizedTask);
+          if (seenMergedTasks.has(key)) continue;
+          seenMergedTasks.add(key);
+          coordinatorTasks.push(normalizedTask);
+          if (coordinatorTasks.length >= 6) break;
+        }
+        initialPubmedSubqueries = dedupePlannerSeeds(
+          [...plannerSuggestedSubqueries, ...(plan.pubmedSubqueries ?? [])],
           MAX_PUBMED_SUBQUERIES,
         );
         coordinatorPlanUsed = coordinatorTasks.length > 0;
         push(
           "handoff",
           "Coordinator plan ready",
-          `${coordinatorTasks.length} tasks planned. Strategy: ${compact(plan.strategy, 140)}`,
+          `${coordinatorTasks.length} tasks planned. Strategy: ${compact(plan.strategy, 140)}${
+            plannerSuggestedChains.length > 0
+              ? ` | Planner chains: ${plannerSuggestedChains
+                  .slice(0, 2)
+                  .map((chain) => `${chain.id}:${chain.confidence.toFixed(2)}`)
+                  .join(", ")}`
+              : ""
+          }`,
           "planner",
           [],
           "active",
@@ -4851,7 +5459,7 @@ export async function runDeepDiscoverer({
       );
     });
 
-    let routed = [...deduped];
+    const routed = [...deduped];
     if (
       mode === "fallback" &&
       coverage.totalPairCount > 0 &&
@@ -4897,10 +5505,14 @@ export async function runDeepDiscoverer({
   }
 
   if (initialPubmedSubqueries.length === 0) {
-    initialPubmedSubqueries = [
-      normalizedQuestion,
-      ...(state.queryPlan?.followups ?? []).map((row) => row.question),
-    ].slice(0, Math.min(2, MAX_PUBMED_SUBQUERIES));
+    initialPubmedSubqueries = dedupePlannerSeeds(
+      [
+        ...plannerSuggestedSubqueries,
+        normalizedQuestion,
+        ...(state.queryPlan?.followups ?? []).map((row) => row.question),
+      ],
+      Math.min(3, MAX_PUBMED_SUBQUERIES),
+    );
   }
 
   for (const subquery of initialPubmedSubqueries.slice(0, MAX_PUBMED_SUBQUERIES)) {
@@ -5259,6 +5871,7 @@ export async function runDeepDiscoverer({
   const synthesisAgent = createAgent({
     model: strategicModel,
     tools: [],
+    middleware: synthesisMiddleware,
     responseFormat: synthesisSchema,
     systemPrompt: [
       "You are a biomedical multihop synthesis agent.",

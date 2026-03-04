@@ -25,59 +25,31 @@ const replayMetaById: Record<
     evidenceReview: ReplayFixture["evidenceReview"];
   }
 > = {
-  "example-obesity-t2d-v1": {
-    durationMs: 75_000,
+  "example-dss-barrier-v2": {
+    durationMs: 95_000,
     evidenceReview: {
-      checkedAt: "2026-02-25",
+      checkedAt: "2026-03-03",
       reviewer: "dendrite-maintainer",
       rationale:
-        "Replay refreshed from a full completed run linking obesity and type 2 diabetes through adiposity-driven insulin resistance and beta-cell compensation limits with explicit evidence/caveat handling.",
+        "Replay captured from a full completed run centered on DSS barrier dysfunction with explicit TEER/CLDN1/OCLN anchoring, mediator ranking, and approved-drug prioritization.",
       sources: [
-        "https://www.niddk.nih.gov/health-information/diabetes/overview/what-is-diabetes/type-2-diabetes",
-        "https://www.nature.com/articles/nature05482",
         "https://reactome.org/PathwayBrowser/",
+        "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10232586/",
+        "https://www.nature.com/articles/s41575-022-00657-7",
       ],
     },
   },
-  "example-als-oxidative-v1": {
-    durationMs: 75_000,
+  "example-nash-lipotoxicity-v2": {
+    durationMs: 95_000,
     evidenceReview: {
-      checkedAt: "2026-02-25",
+      checkedAt: "2026-03-03",
       reviewer: "dendrite-maintainer",
       rationale:
-        "Replay refreshed from a full completed run describing ALS-oxidative-stress coupling via SOD1-centered antioxidant and proteostasis mechanisms with alternative threads and uncertainty notes.",
+        "Replay captured from a completed run in diet-induced NASH with mechanistic mediator ranking and translational drug prioritization aligned to ballooning and ALT/AST context.",
       sources: [
-        "https://www.ninds.nih.gov/health-information/disorders/amyotrophic-lateral-sclerosis-als",
-        "https://reactome.org/PathwayBrowser/#/R-HSA-3299685",
-        "https://pmc.ncbi.nlm.nih.gov/articles/PMC9140622/",
-      ],
-    },
-  },
-  "example-t2d-ckd-v1": {
-    durationMs: 75_000,
-    evidenceReview: {
-      checkedAt: "2026-02-25",
-      reviewer: "dendrite-maintainer",
-      rationale:
-        "Replay refreshed from a full completed run connecting type 2 diabetes and CKD through ACE/renin-angiotensin and vascular injury mechanisms with intervention-oriented next-step framing.",
-      sources: [
-        "https://www.kidney.org/kidney-topics/diabetes-and-chronic-kidney-disease",
-        "https://www.niddk.nih.gov/health-information/diabetes/overview/preventing-problems/kidney-disease-nephropathy",
-        "https://reactome.org/content/detail/R-HSA-202040",
-      ],
-    },
-  },
-  "example-cannabis-anorexia-v1": {
-    durationMs: 75_000,
-    evidenceReview: {
-      checkedAt: "2026-02-25",
-      reviewer: "dendrite-maintainer",
-      rationale:
-        "Replay refreshed from a full completed run mapping cannabis-anorexia evidence to dopaminergic and feeding-circuit hypotheses with explicit uncertainty boundaries.",
-      sources: [
-        "https://www.nature.com/articles/npp2017173",
-        "https://www.ncbi.nlm.nih.gov/books/NBK459145/",
-        "https://reactome.org/content/detail/R-HSA-418457",
+        "https://reactome.org/PathwayBrowser/",
+        "https://www.nature.com/articles/s41575-021-00503-7",
+        "https://pmc.ncbi.nlm.nih.gov/articles/PMC9242987/",
       ],
     },
   },

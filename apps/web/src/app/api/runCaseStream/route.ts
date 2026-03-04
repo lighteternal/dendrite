@@ -3006,7 +3006,6 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
         synthesisClient.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 900,
           input: [
             {
               role: "system",
@@ -3093,7 +3092,6 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
         synthesisClient.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 4200,
           input: [
             {
               role: "system",
@@ -3394,7 +3392,6 @@ async function runBiomedicalMechanismGate(input: {
           client.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 420,
             input: [
               {
                 role: "system",
@@ -3690,7 +3687,6 @@ async function runFinalClaimGate(input: {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 1600,
           input: [
             {
               role: "system",
@@ -3704,6 +3700,7 @@ async function runFinalClaimGate(input: {
                     "When drug claims mention approved status, only allow this if explicitly supported by provided evidence and approvedDrugEvidence entries; otherwise downgrade claim language.",
                     "If unsupported claims exist, produce a revised answer that removes or softens them while preserving utility.",
                     "Keep required markdown heading template unchanged if you revise.",
+                    "Preserve readable markdown emphasis and ensure 3-6 key entities or mechanisms are bolded.",
                     "Return JSON only.",
                   ].join(" "),
                 },
@@ -3947,7 +3944,6 @@ async function runGraphNarrativeAgreementGate(input: {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 1900,
           input: [
             {
               role: "system",
@@ -3960,6 +3956,7 @@ async function runGraphNarrativeAgreementGate(input: {
                     "If the narrative includes unsupported entities or missing recommendation links, revise the answer to align with graph-supported evidence.",
                     "Do not invent new graph nodes or relations.",
                     "Preserve required scientific headings in revisedAnswer.",
+                    "Preserve readable markdown emphasis and ensure 3-6 key entities or mechanisms are bolded.",
                     "Return JSON only.",
                   ].join(" "),
                 },
@@ -4165,7 +4162,6 @@ async function groundFinalAnswerWithInlineCitations(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 4200,
             input: [
               {
                 role: "system",
@@ -4326,7 +4322,6 @@ async function groundFinalAnswerWithInlineCitations(input: {
             synthesisClient.responses.create({
               model: appConfig.openai.smallModel,
               reasoning: { effort: "minimal" },
-              max_output_tokens: 3200,
               input: [
                 {
                   role: "system",
@@ -4501,7 +4496,6 @@ async function synthesizeFallbackFinalAnswer(input: {
           synthesisClient.responses.create({
             model: appConfig.openai.smallModel,
             reasoning: { effort: "minimal" },
-            max_output_tokens: 4200,
             input: [
               {
                 role: "system",
@@ -4959,7 +4953,6 @@ async function lockDiseaseCandidatesToQueryContext(input: {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 450,
           input: [
             {
               role: "system",
@@ -5227,7 +5220,6 @@ async function filterPlanAnchorsByQueryContext(input: {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 320,
           input: [
             {
               role: "system",
@@ -5516,7 +5508,6 @@ async function filterDiseaseCandidatesBySemanticValidation(input: {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 260,
           input: [
             {
               role: "system",
@@ -5619,7 +5610,6 @@ async function suggestDiseaseContextQueries(input: {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 220,
           input: [
             {
               role: "system",
@@ -5692,7 +5682,6 @@ async function inferDiseaseSeedPhrases(query: string): Promise<string[]> {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 220,
           input: [
             {
               role: "system",
@@ -7000,7 +6989,6 @@ async function inferSelectionIntentSemantic(input: {
         client.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 280,
           input: [
             {
               role: "system",
@@ -8610,7 +8598,6 @@ async function arbitratePrimaryThreadCandidate(input: {
         arbitrationClient.responses.create({
           model: appConfig.openai.smallModel,
           reasoning: { effort: "minimal" },
-          max_output_tokens: 260,
           input: [
             {
               role: "system",

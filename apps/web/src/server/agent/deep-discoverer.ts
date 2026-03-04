@@ -5883,6 +5883,7 @@ export async function runDeepDiscoverer({
       "### Biological interpretation",
       "### What to test next",
       "### Residual uncertainty",
+      "Use minimal markdown emphasis: bold 3-6 key entities or mechanisms (especially in Working conclusion). Avoid overuse.",
       "The first sentence must be a direct biomedical answer to the query and include a practical next step.",
       "Write a substantive answer (roughly 600-1200 words), not a one-liner.",
       "Name the query entities and the strongest supported mechanism path.",

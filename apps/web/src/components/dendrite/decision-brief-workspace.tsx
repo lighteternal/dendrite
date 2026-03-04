@@ -575,7 +575,7 @@ export function DecisionBriefWorkspace({
   const [showPathwayContext, setShowPathwayContext] = useState(true);
   const [showDrugContext, setShowDrugContext] = useState(true);
   const [showInteractionContext, setShowInteractionContext] = useState(false);
-  const [answerTab, setAnswerTab] = useState<"answer" | "log">("log");
+  const [answerTab, setAnswerTab] = useState<"answer" | "log">("answer");
   const [showSidePanel, setShowSidePanel] = useState(true);
   const [referencesOpen, setReferencesOpen] = useState(false);
   const [splitRatio, setSplitRatio] = useState(68);
@@ -1286,6 +1286,7 @@ export function DecisionBriefWorkspace({
     dispatchPathTrail({ type: "reset" });
     setBridgeAnalysis(null);
     setSubmittedQuery(trimmed);
+    setAnswerTab("answer");
 
     stream.start({
       query: trimmed,
@@ -2055,7 +2056,10 @@ export function DecisionBriefWorkspace({
             <Card className="border-[#e0e6f4] bg-white shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
               <Tabs
                 value={effectiveAnswerTab}
-                onValueChange={(value) => setAnswerTab(value as "answer" | "log")}
+                onValueChange={(value) => {
+                  if (stream.isRunning || discoverIsRunning) return;
+                  setAnswerTab(value as "answer" | "log");
+                }}
                 className="h-full"
               >
                 <CardHeader className="border-b border-[#edf1fb] bg-[#fafbff] pb-2">

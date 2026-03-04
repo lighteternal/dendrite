@@ -582,7 +582,7 @@ export function LandingPage() {
                         key={item}
                         type="button"
                         onClick={() => setQuery(item)}
-                        className="rounded-full border border-[#d6e5f3] bg-white px-2.5 py-1 text-[11px] text-[#4f698f] hover:bg-[#f2f8ff]"
+                        className="max-w-full whitespace-normal break-words rounded-lg border border-[#d6e5f3] bg-white px-2.5 py-1 text-left text-[11px] leading-[1.25rem] text-[#4f698f] hover:bg-[#f2f8ff]"
                       >
                         {item}
                       </button>
@@ -617,7 +617,11 @@ export function LandingPage() {
                 </SelectTrigger>
                 <SelectContent className="border-[#d0e0f1] bg-white text-[#2e5f8a]">
                   {EXAMPLE_REPLAY_OPTIONS.map((option) => (
-                    <SelectItem key={option.id} value={option.id} className="text-xs">
+                    <SelectItem
+                      key={option.id}
+                      value={option.id}
+                      className="text-xs whitespace-normal leading-snug"
+                    >
                       {option.query}
                     </SelectItem>
                   ))}

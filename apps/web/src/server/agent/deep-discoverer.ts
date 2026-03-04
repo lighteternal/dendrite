@@ -286,8 +286,8 @@ const TOOL_TIMEOUT_MS = Math.min(
 );
 const MAX_PUBMED_SUBQUERIES = appConfig.deepDiscover.maxPubmedSubqueries;
 const SCIENTIFIC_ANSWER_WORD_BUDGET = Math.max(
-  700,
-  Math.min(2200, appConfig.run.scientificAnswerWordBudget),
+  1100,
+  Math.min(4000, appConfig.run.scientificAnswerWordBudget),
 );
 const COORDINATOR_TIMEOUT_MS = clampTimeout(
   Math.min(DISCOVERER_MAX_RUN_MS, 270_000),
@@ -1606,6 +1606,55 @@ function summarizeAnchorCoverage(state: DiscoveryState): {
   };
 }
 
+function summarizeEvidenceCompletion(state: DiscoveryState): {
+  coverageScore: number;
+  coverageSatisfied: boolean;
+  evidenceBreadth: number;
+  citationSignalCount: number;
+  complete: boolean;
+} {
+  const coverage = summarizeAnchorCoverage(state);
+  const coverageSatisfied =
+    coverage.totalPairCount === 0 ? true : coverage.coverageScore >= 0.85;
+  const medicalSnippetCount =
+    state.medicalCounts.literature + state.medicalCounts.drugs + state.medicalCounts.stats;
+  const citationSignalCount =
+    state.pubmedSubqueryHits.reduce((acc, row) => acc + row.articles.length, 0) +
+    state.bioMcpCounts.articles +
+    state.bioMcpCounts.trials +
+    medicalSnippetCount;
+  const evidenceBreadth =
+    Number(state.targetById.size >= 3) +
+    Number(state.pathwayById.size > 0) +
+    Number(state.drugById.size > 0) +
+    Number(state.interactionSymbols.size > 0) +
+    Number(state.pubmedSubqueryHits.length > 0) +
+    Number(state.bioMcpCounts.articles + state.bioMcpCounts.trials > 0) +
+    Number(medicalSnippetCount > 0);
+  const complete =
+    coverageSatisfied &&
+    evidenceBreadth >= 5 &&
+    citationSignalCount >= 6;
+  return {
+    coverageScore: coverage.coverageScore,
+    coverageSatisfied,
+    evidenceBreadth,
+    citationSignalCount,
+    complete,
+  };
+}
+
+function scientificWordBudgetForState(state: DiscoveryState): number {
+  const evidence = summarizeEvidenceCompletion(state);
+  let budget = SCIENTIFIC_ANSWER_WORD_BUDGET;
+  if (evidence.complete || evidence.citationSignalCount >= 18) {
+    budget = Math.max(budget, Math.round(budget * 1.6));
+  } else if (evidence.evidenceBreadth >= 4 || evidence.citationSignalCount >= 10) {
+    budget = Math.max(budget, Math.round(budget * 1.35));
+  }
+  return Math.min(4200, budget);
+}
+
 function bridgePathToSummary(state: DiscoveryState, path: BridgePath | null): string {
   if (!path || path.nodeKeys.length === 0) return "not provided";
   return path.nodeKeys
@@ -1671,7 +1720,7 @@ function buildFallbackSummary(state: DiscoveryState, query: string): DiscovererF
   const answer = capUncertaintyTail(
     clampScientificTemplateWordBudget(
       ensureScientificTemplate(baseAnswer, keyFindings, caveats, nextActions),
-      SCIENTIFIC_ANSWER_WORD_BUDGET,
+      scientificWordBudgetForState(state),
     ),
   );
 
@@ -5528,15 +5577,7 @@ export async function runDeepDiscoverer({
   const primaryTasks = coordinatorTasks.slice(0, 2);
   const secondaryTasks = coordinatorTasks.slice(2);
   const shouldStopExpansion = (): boolean => {
-    const coverage = summarizeAnchorCoverage(state);
-    const evidenceBreadth =
-      Number(state.pathwayById.size > 0) +
-      Number(state.drugById.size > 0) +
-      Number(state.interactionSymbols.size > 0) +
-      Number(state.pubmedSubqueryHits.length > 0) +
-      Number(totalMedicalSnippets() > 0) +
-      Number(state.bioMcpCounts.articles + state.bioMcpCounts.trials > 0);
-    return coverage.totalPairCount > 0 && coverage.coverageScore >= 1 && evidenceBreadth >= 4;
+    return summarizeEvidenceCompletion(state).complete;
   };
 
   const reports: SubagentReport[] = [];
@@ -5777,7 +5818,8 @@ export async function runDeepDiscoverer({
   let followupCount = 0;
   while (taskQueue.length > 0) {
     if (stopAfterPrimary) break;
-    if (!hasTimeBudget(35_000)) {
+    const followupReserveMs = shouldStopExpansion() ? 35_000 : 16_000;
+    if (!hasTimeBudget(followupReserveMs)) {
       emitRunBudgetWarning(
         "Follow-up execution trimmed to preserve synthesis budget.",
       );
@@ -5963,7 +6005,7 @@ export async function runDeepDiscoverer({
           fallback.caveats,
           fallback.nextActions,
         ),
-        SCIENTIFIC_ANSWER_WORD_BUDGET,
+        scientificWordBudgetForState(state),
       ),
     );
 
@@ -5997,6 +6039,24 @@ export async function runDeepDiscoverer({
   };
 
   if (!hasTimeBudget(8_000)) {
+    const completion = summarizeEvidenceCompletion(state);
+    if (!completion.complete) {
+      push(
+        "warning",
+        "Evidence completion not reached",
+        "Deadline approached before full evidence completion; running accelerated closure sweep before finalization.",
+        "agent",
+        [],
+        "candidate",
+      );
+      await ensureCriticalMcpCoverage().catch(() => undefined);
+      if (
+        (state.targetById.size < 2 || state.pubmedSubqueryHits.length === 0) &&
+        hasTimeBudget(2_500)
+      ) {
+        await deterministicBackfill("pre-finalization evidence closure").catch(() => undefined);
+      }
+    }
     emitRunBudgetWarning(
       "Synthesis budget was exhausted; closing with best available synthesis state.",
     );
@@ -6110,7 +6170,7 @@ export async function runDeepDiscoverer({
           structuredCaveats.length > 0 ? structuredCaveats : fallback.caveats,
           structuredNextActions.length > 0 ? structuredNextActions : fallback.nextActions,
         ),
-        SCIENTIFIC_ANSWER_WORD_BUDGET,
+        scientificWordBudgetForState(state),
       ),
     );
 

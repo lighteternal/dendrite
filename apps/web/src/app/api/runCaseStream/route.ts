@@ -125,25 +125,30 @@ const RUN_HARD_BUDGET_MS = Math.max(
 );
 const RUN_EXECUTION_BUDGET_MS = Math.max(
   180_000,
-  Math.min(RUN_HARD_BUDGET_MS, 240_000),
+  RUN_HARD_BUDGET_MS,
 );
-const FINALIZATION_RESERVE_MS = Math.max(
-  60_000,
+const FINALIZATION_RESERVE_FLOOR_MS = 45_000;
+const FINALIZATION_RESERVE_BASE_MS = Math.max(
+  FINALIZATION_RESERVE_FLOOR_MS,
   Math.min(
     appConfig.run.finalizationReserveMs,
-    180_000,
-    Math.max(60_000, RUN_EXECUTION_BUDGET_MS - 30_000),
+    240_000,
+    Math.max(FINALIZATION_RESERVE_FLOOR_MS, Math.floor(RUN_EXECUTION_BUDGET_MS * 0.28)),
   ),
 );
+const FINALIZATION_RESERVE_MAX_MS = Math.max(
+  FINALIZATION_RESERVE_BASE_MS,
+  Math.min(300_000, Math.max(FINALIZATION_RESERVE_BASE_MS + 45_000, Math.floor(RUN_EXECUTION_BUDGET_MS * 0.35))),
+);
 const DISCOVERER_TIMEOUT_CEILING_MS = Math.max(
-  90_000,
-  RUN_EXECUTION_BUDGET_MS - FINALIZATION_RESERVE_MS,
+  120_000,
+  RUN_EXECUTION_BUDGET_MS - FINALIZATION_RESERVE_FLOOR_MS,
 );
 const MAX_DISCOVERER_FINAL_WAIT_MS = Math.max(
-  30_000,
+  60_000,
   Math.min(
     appConfig.run.discovererFinalWaitMs,
-    Math.max(30_000, RUN_EXECUTION_BUDGET_MS - 15_000),
+    Math.max(60_000, RUN_EXECUTION_BUDGET_MS - 20_000),
   ),
 );
 const FALLBACK_SYNTHESIS_TIMEOUT_MS = Math.max(
@@ -154,15 +159,15 @@ const FINAL_GROUNDING_TIMEOUT_MS = Math.max(
   20_000,
   appConfig.run.finalGroundingTimeoutMs,
 );
-const SYNTHESIS_DISCOVERER_WAIT_CAP_MS = 70_000;
-const LATE_DISCOVERER_WAIT_CAP_MS = 32_000;
+const SYNTHESIS_DISCOVERER_WAIT_CAP_MS = 110_000;
+const LATE_DISCOVERER_WAIT_CAP_MS = 55_000;
 const FALLBACK_SYNTHESIS_STAGE_CAP_MS = 42_000;
 const FINAL_GROUNDING_STAGE_CAP_MS = 40_000;
 const INTERNAL_CRITIQUE_STAGE_CAP_MS = 22_000;
 const SYNTHESIS_NARRATION_INTERVAL_MS = 9_000;
 const SCIENTIFIC_ANSWER_WORD_BUDGET = Math.max(
-  700,
-  Math.min(2200, appConfig.run.scientificAnswerWordBudget),
+  1100,
+  Math.min(4000, appConfig.run.scientificAnswerWordBudget),
 );
 
 type BriefSelectionDiagnostics = {
@@ -1208,6 +1213,45 @@ function remainingRunBudgetMs(startedAt: number, reserveMs = 0): number {
   return Math.max(0, RUN_EXECUTION_BUDGET_MS - elapsed - Math.max(0, reserveMs));
 }
 
+function adaptiveFinalizationReserveMs(
+  startedAt: number,
+  options?: {
+    evidenceReady?: boolean;
+  },
+): number {
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  const elapsedRatio = Math.max(0, Math.min(1, elapsedMs / Math.max(1, RUN_EXECUTION_BUDGET_MS)));
+  let reserveMs = FINALIZATION_RESERVE_BASE_MS;
+  if (elapsedRatio < 0.5) {
+    reserveMs = FINALIZATION_RESERVE_FLOOR_MS;
+  } else if (elapsedRatio > 0.88) {
+    reserveMs = Math.min(FINALIZATION_RESERVE_MAX_MS, FINALIZATION_RESERVE_BASE_MS + 30_000);
+  }
+  if (options?.evidenceReady) {
+    reserveMs = Math.max(FINALIZATION_RESERVE_FLOOR_MS, reserveMs - 15_000);
+  }
+  return Math.max(FINALIZATION_RESERVE_FLOOR_MS, Math.min(FINALIZATION_RESERVE_MAX_MS, reserveMs));
+}
+
+function scientificWordBudgetForEvidence(input?: {
+  citationCount?: number;
+  threadCount?: number;
+  pathConnected?: boolean;
+}): number {
+  const citationCount = Math.max(0, input?.citationCount ?? 0);
+  const threadCount = Math.max(0, input?.threadCount ?? 0);
+  let budget = SCIENTIFIC_ANSWER_WORD_BUDGET;
+  if (citationCount >= 30 || threadCount >= 3) {
+    budget = Math.max(budget, Math.round(budget * 1.55));
+  } else if (citationCount >= 18 || threadCount >= 2) {
+    budget = Math.max(budget, Math.round(budget * 1.35));
+  }
+  if (input?.pathConnected) {
+    budget = Math.max(budget, Math.round(budget * 1.1));
+  }
+  return Math.min(4200, budget);
+}
+
 function boundedStageTimeoutMs(
   startedAt: number,
   desiredMs: number,
@@ -2045,7 +2089,9 @@ function ensureInlineCitations(
   const normalized = capUncertaintySection(
     clampScientificTemplateWordBudget(
       enforceScientificTemplate(normalizeAnswerEnding(text), hints),
-      SCIENTIFIC_ANSWER_WORD_BUDGET,
+      scientificWordBudgetForEvidence({
+        citationCount: citations.length,
+      }),
     ),
   );
   if (!normalized) return normalized;
@@ -2991,7 +3037,11 @@ async function internallyCritiqueAndReviseScientificAnswer(input: {
         threadCandidates: input.threadCandidates ?? [],
       }),
     ),
-    SCIENTIFIC_ANSWER_WORD_BUDGET,
+    scientificWordBudgetForEvidence({
+      citationCount: input.citations.length,
+      threadCount: input.threadCandidates?.length ?? 0,
+      pathConnected: Boolean(input.pathFocus?.connectedAcrossAnchors),
+    }),
   );
   if (!synthesisClient) return normalizedAnswer;
   const totalBudgetMs = Math.max(10_000, Math.min(55_000, input.timeoutMs));
@@ -4613,7 +4663,11 @@ async function synthesizeFallbackFinalAnswer(input: {
             normalizeAnswerEnding(String(response.output_text ?? "")),
             templateHints,
           ),
-          SCIENTIFIC_ANSWER_WORD_BUDGET,
+          scientificWordBudgetForEvidence({
+            citationCount: citationCount,
+            threadCount: threadCandidates.length,
+            pathConnected: Boolean(input.pathFocus?.connectedAcrossAnchors),
+          }),
         ),
       ),
       input.brief.citations ?? [],
@@ -10915,7 +10969,7 @@ export async function GET(request: NextRequest) {
           startedAt,
           DISCOVERER_TIMEOUT_CEILING_MS,
           {
-            reserveMs: FINALIZATION_RESERVE_MS,
+            reserveMs: adaptiveFinalizationReserveMs(startedAt),
             minMs: 30_000,
           },
         );
@@ -11507,7 +11561,13 @@ export async function GET(request: NextRequest) {
             await reader.cancel().catch(() => undefined);
             break;
           }
-          if (!internalDoneReceived && remainingRunBudgetMs(startedAt, FINALIZATION_RESERVE_MS) <= 0) {
+          const finalizationReserveMs = adaptiveFinalizationReserveMs(startedAt, {
+            evidenceReady:
+              nodeMap.size >= 150 &&
+              edgeMap.size >= 240 &&
+              Boolean(latestPathUpdate?.summary),
+          });
+          if (!internalDoneReceived && remainingRunBudgetMs(startedAt, finalizationReserveMs) <= 0) {
             emit("agent_step", {
               phase: "A",
               title: "Exploration window complete",
@@ -11516,7 +11576,7 @@ export async function GET(request: NextRequest) {
             });
             warnRequestLog(log, "run_case.exploration_budget_reached", {
               elapsedMs: Date.now() - startedAt,
-              reserveMs: FINALIZATION_RESERVE_MS,
+              reserveMs: finalizationReserveMs,
             });
             await reader.cancel().catch(() => undefined);
             break;

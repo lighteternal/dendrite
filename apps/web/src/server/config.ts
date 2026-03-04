@@ -153,7 +153,7 @@ export const appConfig = {
     ),
     scientificAnswerWordBudget: parseNumber(
       process.env.RUN_SCIENTIFIC_ANSWER_WORD_BUDGET,
-      1200,
+      2200,
     ),
   },
   deepDiscover: {
